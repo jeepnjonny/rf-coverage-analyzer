@@ -10,10 +10,17 @@ WorkingDirectory=/srv/rfanalysis
 
 # gthread worker is required: each SSE analysis stream holds a thread for
 # the duration of the analysis. sync workers would serialize all requests.
-# 2 workers × 4 threads = 8 concurrent streams; adjust threads upward if
-# you expect more simultaneous users.
+#
+# Workers: each worker is an OS process. More workers = more simultaneous
+# users handled without waiting. 4 is a reasonable default; on a 2-core VM
+# reduce to 2. Do NOT use --preload — it would fork the analysis process
+# pool into every worker.
+#
+# The per-analysis parallelism comes from the ProcessPoolExecutor in app.py
+# (_POOL_WORKERS = cpu_count − 1), not from Gunicorn worker count.
+# 4 workers × 4 threads = 16 concurrent SSE streams.
 ExecStart=/srv/rfanalysis/venv/bin/gunicorn \
-    --workers 2 \
+    --workers 4 \
     --worker-class gthread \
     --threads 4 \
     --bind 127.0.0.1:5000 \

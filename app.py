@@ -30,7 +30,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import unquote
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import functools
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -193,7 +194,7 @@ class ElevationTileService:
     # Each tile is stored as raw RGB bytes: 256×256×3 = 196 608 bytes ≈ 192 KB.
     # 500 tiles × 192 KB ≈ 96 MB — a practical ceiling for large courses.
     # Evicted tiles remain on disk and are re-decoded on next access (cheap).
-    TILE_CACHE_MAX = 500
+    TILE_CACHE_MAX = 2048
 
     def __init__(self, tile_dir: Path):
         self.tile_dir = tile_dir
@@ -338,7 +339,12 @@ class ElevationTileService:
         lon_min: float, lon_max: float,
         progress_cb=None,
     ) -> int:
-        """Download & cache all tiles covering the padded bounding box."""
+        """Download & cache all tiles covering the padded bounding box.
+
+        Tiles are fetched in parallel (up to 32 concurrent HTTP requests).
+        The LRU lock is held only for brief dict operations — not during the
+        actual HTTP download or PNG decode — so concurrent fetches are safe.
+        """
         pad = 0.05  # ~5 km margin
         la0, la1 = lat_min - pad, lat_max + pad
         lo0, lo1 = lon_min - pad, lon_max + pad
@@ -351,12 +357,27 @@ class ElevationTileService:
                 for ty in range(y0, y1 + 1):
                     tiles.add((z, tx, ty))
 
-        tile_list = sorted(tiles)   # deterministic order
-        for i, (z, x, y) in enumerate(tile_list):
-            self._load_tile(z, x, y)
+        tile_list  = sorted(tiles)   # deterministic order
+        total      = len(tile_list)
+        if not total:
+            return 0
+
+        done_count = [0]
+        cb_lock    = threading.Lock()
+
+        def _fetch_one(zxy: tuple[int, int, int]) -> None:
+            self._load_tile(*zxy)
             if progress_cb:
-                progress_cb(i + 1, len(tile_list))
-        return len(tile_list)
+                with cb_lock:
+                    done_count[0] += 1
+                    progress_cb(done_count[0], total)
+
+        # Cap at 32 concurrent downloads to avoid overwhelming the tile CDN.
+        max_workers = min(32, total)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_fetch_one, tile_list))
+
+        return total
 
 
 _tiles = ElevationTileService(TILE_DIR)
@@ -712,6 +733,34 @@ def build_terrain_profile(lat1: float, lon1: float, lat2: float, lon2: float) ->
     return profile, total_dist
 
 
+# ---------------------------------------------------------------------------
+# Terrain profile cache
+#
+# Profiles are pure functions of the four endpoint coordinates — identical
+# coordinates always produce identical terrain samples regardless of RF
+# parameters.  Caching eliminates redundant recomputation when:
+#   • The same analysis is re-run with different RF settings
+#   • Two path points round to the same coordinate key
+#   • The same (source, receiver) pair appears in both track and link phases
+#
+# maxsize=8192: each cached entry is ~(350 × 4 floats + metadata) ≈ 12 KB
+# → 8192 entries ≈ 96 MB per process, acceptable on a server.
+# The cache is per-process — pool workers accumulate hits independently.
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=8_192)
+def _terrain_profile_cached(
+    lat1: float, lon1: float, lat2: float, lon2: float,
+) -> tuple[list[ProfileEntry], float]:
+    """Memoized wrapper around build_terrain_profile.
+
+    Arguments must already be rounded to _COORD_DP decimal places so that
+    logically identical paths hash to the same cache key.  The returned
+    profile list is treated as read-only by all callers.
+    """
+    return build_terrain_profile(lat1, lon1, lat2, lon2)
+
+
 def _dominant_obstacle(
     profile: list[ProfileEntry],
     from_total: float,
@@ -887,10 +936,68 @@ VEG_PROFILES: dict[str, dict] = {
 # the path is considered unworkable regardless of the computed RSSI.
 HARD_FAIL_DB = 30.0
 
-# Worker threads for parallel RF analysis.
-# Threads release the GIL during SQLite I/O and tile-LRU lookups; cap below
-# CPU count to avoid excessive contention on the tile-cache lock.
-_ANALYSIS_WORKERS = min(6, max(2, (os.cpu_count() or 2)))
+# ---------------------------------------------------------------------------
+# ProcessPoolExecutor — true multi-core parallelism for RF analysis
+#
+# Each pool worker is a separate OS process with its own GIL, tile LRU cache,
+# and SQLite connection.  This eliminates the GIL bottleneck that limited
+# ThreadPoolExecutor to ~1.3× speedup regardless of core count.
+#
+# _POOL_WORKERS: use all cores minus one (reserved for Gunicorn + nginx).
+# If you run more than 2 Gunicorn workers, reduce this proportionally so
+# total process count ≤ cpu_count.
+# Do NOT start Gunicorn with --preload; that would fork the pool into every
+# worker process.
+# ---------------------------------------------------------------------------
+
+_POOL_WORKERS = max(2, (os.cpu_count() or 4) - 1)
+
+_analysis_pool:      ProcessPoolExecutor | None = None
+_analysis_pool_lock: threading.Lock              = threading.Lock()
+
+
+def _worker_init(tile_dir_str: str, elev_db_str: str) -> None:
+    """Called once in each pool worker process at startup.
+
+    Replaces any fork-inherited SQLite connection with a fresh one (SQLite
+    connections are not fork-safe) and resets the tile LRU so each worker
+    builds its own independent in-memory cache from the shared on-disk store.
+    The terrain-profile lru_cache is inherited from the fork or starts empty
+    on spawn — either way it accumulates hits across requests within the
+    worker's lifetime.
+    """
+    global _tiles, _db_conn, _db_lock
+    _tiles   = ElevationTileService(Path(tile_dir_str))
+    _db_lock = threading.Lock()
+    conn = sqlite3.connect(elev_db_str, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-8192")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS elev_pts (
+            key  TEXT PRIMARY KEY,
+            val  REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    _db_conn = conn
+
+
+def _get_analysis_pool() -> ProcessPoolExecutor:
+    """Return the module-level process pool, creating it lazily on first call."""
+    global _analysis_pool
+    if _analysis_pool is None:
+        with _analysis_pool_lock:
+            if _analysis_pool is None:
+                import atexit
+                pool = ProcessPoolExecutor(
+                    max_workers=_POOL_WORKERS,
+                    initializer=_worker_init,
+                    initargs=(str(TILE_DIR), str(ELEV_DB)),
+                )
+                atexit.register(pool.shutdown, wait=False)
+                _analysis_pool = pool
+    return _analysis_pool
 
 
 def _interp_gamma(veg: dict, freq_mhz: float) -> float:
@@ -1340,7 +1447,7 @@ def terrain_profile():
 
     veg_type = request.args.get("veg_type", "none")
 
-    profile, dist = build_terrain_profile(la1, lo1, la2, lo2)
+    profile, dist = _terrain_profile_cached(la1, lo1, la2, lo2)
 
     e1_ground  = _get_elev(la1, lo1)
     e2_ground  = _get_elev(la2, lo2)
@@ -1379,9 +1486,9 @@ def terrain_profile():
 
 
 # ---------------------------------------------------------------------------
-# Thread-pool task functions for parallel RF analysis
-# Both functions are module-level (not nested) so they are picklable if the
-# caller ever switches to ProcessPoolExecutor.
+# Task functions for parallel RF analysis (ProcessPoolExecutor)
+# Both functions are module-level (not nested) so they are picklable across
+# process boundaries — required for ProcessPoolExecutor on all platforms.
 # ---------------------------------------------------------------------------
 
 def _link_task(args: tuple) -> dict:
@@ -1391,7 +1498,7 @@ def _link_task(args: tuple) -> dict:
     la2 = _rc(float(rx2["latitude"]));  lo2 = _rc(float(rx2["longitude"]))
     e1  = _get_elev(la1, lo1) + float(rx1.get("height_agl_m", 2) or 2)
     e2  = _get_elev(la2, lo2) + float(rx2.get("height_agl_m", 2) or 2)
-    profile, dist = build_terrain_profile(la1, lo1, la2, lo2)
+    profile, dist = _terrain_profile_cached(la1, lo1, la2, lo2)
     diff_loss = deygout_loss_db(profile, e1, e2, dist, freq_mhz)
     veg_loss  = vegetation_loss_db(profile, e1, e2, dist, freq_mhz, veg_type)
     pl        = fspl_db(freq_mhz, dist)
@@ -1439,7 +1546,7 @@ def _point_task(args: tuple) -> dict:
         rx_total  = _get_elev(rxlat, rxlon) + float(rx.get("height_agl_m", 2) or 2)
         rx_gain   = float(rx.get("antenna_gain_dbi", 0) or 0)
 
-        profile, dist = build_terrain_profile(plat, plon, rxlat, rxlon)
+        profile, dist = _terrain_profile_cached(plat, plon, rxlat, rxlon)
         diff_loss = deygout_loss_db(profile, t_total, rx_total, dist, freq_mhz)
         veg_loss  = vegetation_loss_db(profile, t_total, rx_total, dist, freq_mhz, veg_type)
         path_loss = fspl_db(freq_mhz, dist)
@@ -1640,9 +1747,10 @@ def analyze():
                     for j, rx2 in enumerate(receivers)
                     if j > i and str(rx2.get("enabled", "1")).strip() != "0"
                 ]
-                with ThreadPoolExecutor(max_workers=_ANALYSIS_WORKERS) as ex:
-                    for result in ex.map(_link_task, link_args):
-                        yield sse(result)
+                pool = _get_analysis_pool()
+                chunksize = max(1, len(link_args) // (_POOL_WORKERS * 4)) if link_args else 1
+                for result in pool.map(_link_task, link_args, chunksize=chunksize):
+                    yield sse(result)
 
             # ---- Per-path-point RF analysis ----
             if mode in ("track", "both"):
@@ -1654,7 +1762,7 @@ def analyze():
                 ]
                 total_covered = 0
                 total_pts     = len(path_pts)
-                FLUSH         = 5
+                FLUSH         = 20
                 batch: list[dict] = []
 
                 point_args = [
@@ -1664,8 +1772,8 @@ def analyze():
                     for idx, (plat, plon) in enumerate(path_pts)
                 ]
 
-                with ThreadPoolExecutor(max_workers=_ANALYSIS_WORKERS) as ex:
-                    for pt in ex.map(_point_task, point_args):
+                pool = _get_analysis_pool()
+                for pt in pool.map(_point_task, point_args, chunksize=1):
                         if pt["coverage"]:
                             total_covered += 1
                             bx = pt["best_rx_idx"]
