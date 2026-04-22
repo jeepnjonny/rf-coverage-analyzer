@@ -20,7 +20,7 @@ A self-hosted web application for analyzing RF signal coverage along a GPS track
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/YOUR_USERNAME/rf-coverage-analyzer.git
+git clone https://github.com/jeepnjonny/rf-coverage-analyzer.git
 cd rf-coverage-analyzer
 
 # 2. Run the setup script as root
