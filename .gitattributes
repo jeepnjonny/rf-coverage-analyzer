@@ -1,0 +1,25 @@
+# Default: normalize all text files to LF on checkout
+* text=auto eol=lf
+
+# Shell scripts must always be LF — CRLF breaks bash on Linux
+*.sh        text eol=lf
+
+# systemd unit files must be LF
+*.service   text eol=lf
+
+# nginx config — LF
+nginx.conf  text eol=lf
+
+# Python / web sources — LF
+*.py        text eol=lf
+*.js        text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+
+# Binary files — no line-ending conversion
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.gz        binary

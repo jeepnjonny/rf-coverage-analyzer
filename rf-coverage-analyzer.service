@@ -1,0 +1,35 @@
+[Unit]
+Description=RF Coverage Analyzer (Gunicorn/Flask)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/srv/rfanalysis
+
+# gthread worker is required: each SSE analysis stream holds a thread for
+# the duration of the analysis. sync workers would serialize all requests.
+# 2 workers × 4 threads = 8 concurrent streams; adjust threads upward if
+# you expect more simultaneous users.
+ExecStart=/srv/rfanalysis/venv/bin/gunicorn \
+    --workers 2 \
+    --worker-class gthread \
+    --threads 4 \
+    --bind 127.0.0.1:5000 \
+    --timeout 600 \
+    --keep-alive 5 \
+    --log-level info \
+    app:app
+
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Harden the service process
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

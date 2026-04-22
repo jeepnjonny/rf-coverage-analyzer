@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Runtime data — never commit uploads or cached tiles
+uploads/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/settings.json
+
+# Claude Code
+.claude/
+
+# Archive artifacts
+*.tar.gz
+*.zip

@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RF Path Coverage Analyzer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<header class="app-header">
+  <span class="header-title">RF Path Coverage Analyzer</span>
+  <div class="header-right">
+    <label class="ctrl-label" for="basemap-select">Base Map</label>
+    <select id="basemap-select" class="ctrl-select">
+      <option value="usgs-topo">USGS Topo</option>
+      <option value="usgs-sat">USGS Satellite</option>
+      <option value="osm">OSM Street</option>
+    </select>
+  </div>
+</header>
+
+<div class="app-body">
+
+  <!-- ═══════════════════ SIDEBAR ═══════════════════ -->
+  <aside class="sidebar">
+
+    <section class="panel">
+      <h3 class="panel-title">Files</h3>
+      <button class="file-mgr-btn" id="kml-mgr-btn">
+        <div class="fmb-type">KML Track</div>
+        <div class="fmb-name" id="kml-mgr-name">— not loaded —</div>
+      </button>
+      <button class="file-mgr-btn" id="csv-mgr-btn">
+        <div class="fmb-type">Receiver CSV</div>
+        <div class="fmb-name" id="csv-mgr-name">— not loaded —</div>
+      </button>
+      <button class="btn btn-secondary btn-full" id="add-rx-btn">＋ Add Receiver</button>
+      <button class="btn btn-secondary btn-full" id="saved-mgr-btn">📂 Saved Analyses</button>
+    </section>
+
+    <section class="panel">
+      <h3 class="panel-title">RF Parameters</h3>
+
+      <div class="param-group">
+        <label class="param-label">Frequency</label>
+        <select id="freq-select" class="ctrl-select full-width">
+          <option value="144">144 MHz (2m VHF)</option>
+          <option value="433">433 MHz (70cm UHF)</option>
+          <option value="915" selected>915 MHz (33cm UHF)</option>
+        </select>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Vegetation / Clutter</label>
+        <select id="veg-loss" class="ctrl-select full-width">
+          <option value="none" selected>None / rocky</option>
+          <option value="shrubs">Shrubs / low scrub</option>
+          <option value="light">Light trees / open woodland</option>
+          <option value="dense">Dense forest / jungle</option>
+        </select>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label hint-label" title="Additional signal margin required above the receiver sensitivity threshold. A larger fade margin ensures reliable links during signal fading caused by multipath, weather, or antenna misalignment. 10–15 dB is typical for outdoor UHF links.">
+          Fade Margin <span class="hint-icon">?</span>
+        </label>
+        <select id="fade-margin" class="ctrl-select full-width">
+          <option value="0">0 dB — no margin</option>
+          <option value="10">10 dB — light fading</option>
+          <option value="15" selected>15 dB — moderate (recommended)</option>
+          <option value="20">20 dB — heavy / critical links</option>
+        </select>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Tracker Tx Power</label>
+        <div class="param-row">
+          <input type="number" id="tx-power" class="ctrl-input" value="22" step="1" min="-30" max="43" />
+          <span class="param-unit">dBm</span>
+          <span class="param-derived" id="tx-power-w">≈ 158 mW</span>
+        </div>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Tracker Antenna Gain <small>(1.5 m AGL)</small></label>
+        <div class="param-row">
+          <input type="number" id="tx-gain" class="ctrl-input" value="0" step="0.5" min="-3" max="9" />
+          <span class="param-unit">dBi</span>
+        </div>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Receiver Sensitivity</label>
+        <div class="param-row">
+          <input type="number" id="rx-sens" class="ctrl-input" value="-135" step="1" min="-140" max="-50" />
+          <span class="param-unit">dBm</span>
+          <span class="param-derived" id="rx-sens-uv">≈ 0.04 µV</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div style="display:flex;gap:6px">
+        <button id="analyze-track-btn" class="btn btn-primary btn-full" disabled>▶ Track Coverage</button>
+        <button id="analyze-links-btn" class="btn btn-primary btn-full" disabled>▶ Receiver Links</button>
+      </div>
+      <div id="progress-container" class="hidden">
+        <div class="progress-label" id="progress-label">Initializing…</div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progress-bar" style="width:0%"></div>
+        </div>
+      </div>
+      <div id="status-msg" class="status-msg"></div>
+      <!-- Appears after analysis completes successfully -->
+      <div class="save-analysis-row hidden" id="save-analysis-row">
+        <input type="text" id="save-analysis-name" class="ctrl-input save-analysis-input"
+               placeholder="Analysis name…" autocomplete="off" />
+        <button class="btn btn-secondary btn-sm" id="save-analysis-btn">💾 Save</button>
+      </div>
+    </section>
+
+  </aside>
+
+  <!-- ═══════════════════ RIGHT PANE ═══════════════════ -->
+  <div class="right-pane">
+
+    <!-- Map -->
+    <main class="map-wrap">
+      <div id="map"></div>
+
+      <!-- Permanent cursor info bar -->
+      <div class="map-info-bar" id="map-info-bar">
+        <span class="info-group">
+          <span class="info-label">GPS</span>
+          <span id="info-gps">—</span>
+        </span>
+        <span class="info-sep">|</span>
+        <span class="info-group">
+          <span class="info-label">Elev</span>
+          <span id="info-elev">—</span>
+        </span>
+        <span class="info-sep">|</span>
+        <span class="info-group">
+          <span class="info-label">Signal</span>
+          <span id="info-signal">—</span>
+        </span>
+      </div>
+
+      <!-- Download map button -->
+      <button class="map-overlay-btn" id="download-map-btn" title="Download current map view as PNG">⬇ PNG</button>
+
+      <!-- Signal panel — shown on mousemove when path results exist -->
+      <div class="map-signal-panel hidden" id="map-signal-panel"></div>
+    </main>
+
+    <!-- Bottom bar -->
+    <div class="bottom-bar" id="bottom-bar">
+      <div class="bottom-tabs">
+        <button class="tab-btn active" data-tab="coverage">Coverage Results</button>
+        <button class="tab-btn" data-tab="profile">Terrain Profile</button>
+        <span class="tab-sep"></span>
+        <span class="profile-link-label hidden" id="profile-link-label"></span>
+      </div>
+
+      <!-- Coverage results tab -->
+      <div class="tab-pane active" id="tab-coverage">
+        <div class="results-empty" id="results-empty">Run an analysis to see coverage results</div>
+        <div class="results-scroll hidden" id="results-scroll">
+          <table class="results-table" id="results-table">
+            <thead>
+              <tr>
+                <th>Receiver</th>
+                <th>Coverage</th>
+                <th>Avg RSSI</th>
+                <th>Coverage Bar</th>
+              </tr>
+            </thead>
+            <tbody id="results-tbody"></tbody>
+            <tfoot id="results-tfoot"></tfoot>
+          </table>
+        </div>
+      </div>
+
+      <!-- Terrain profile tab -->
+      <div class="tab-pane" id="tab-profile">
+        <div class="profile-empty" id="profile-empty">
+          Click an inter-receiver link on the map to view its terrain profile
+        </div>
+        <div class="profile-rx-sidebar hidden" id="profile-rx-sidebar"></div>
+        <canvas id="profile-canvas" style="display:none"></canvas>
+      </div>
+    </div>
+
+  </div><!-- .right-pane -->
+</div><!-- .app-body -->
+
+<!-- ═══════════════════ ADD RECEIVER DIALOG ═══════════════════ -->
+<div class="modal-backdrop hidden" id="add-rx-modal">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2>Add Receiver</h2>
+      <button class="modal-close" id="add-rx-modal-close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="param-group">
+        <label class="param-label">Name</label>
+        <input id="add-rx-name" class="ctrl-input full-width text-left" type="text" placeholder="RX1" autocomplete="off" />
+      </div>
+      <div class="param-group">
+        <label class="param-label">Latitude</label>
+        <input id="add-rx-lat" class="ctrl-input full-width" type="number" step="0.000001" />
+      </div>
+      <div class="param-group">
+        <label class="param-label">Longitude</label>
+        <input id="add-rx-lon" class="ctrl-input full-width" type="number" step="0.000001" />
+      </div>
+      <div class="param-group">
+        <label class="param-label">Height AGL</label>
+        <div class="param-row">
+          <input id="add-rx-height" class="ctrl-input" type="number" value="5" step="0.5" min="0" max="500" />
+          <span class="param-unit">m</span>
+        </div>
+      </div>
+      <div class="param-group">
+        <label class="param-label">Antenna Gain</label>
+        <div class="param-row">
+          <input id="add-rx-gain" class="ctrl-input" type="number" value="0" step="0.5" min="-3" max="15" />
+          <span class="param-unit">dBi</span>
+        </div>
+      </div>
+      <div class="param-group">
+        <label class="param-label">Tx Power</label>
+        <div class="param-row">
+          <input id="add-rx-power" class="ctrl-input" type="number" value="22" step="1" min="-30" max="43" />
+          <span class="param-unit">dBm</span>
+        </div>
+      </div>
+      <div class="param-group">
+        <label class="param-label">Enabled</label>
+        <div class="param-row">
+          <input id="add-rx-enabled" type="checkbox" checked />
+          <span class="param-unit">include in analysis</span>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary"   id="add-rx-confirm">Add to Map</button>
+      <button class="btn btn-secondary" id="add-rx-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ FILE MANAGER MODAL ═══════════════════ -->
+<div class="modal-backdrop hidden" id="file-mgr-modal">
+  <div class="modal fm-modal">
+    <div class="modal-header">
+      <h2>File Manager</h2>
+      <button class="modal-close" id="fm-modal-close">&times;</button>
+    </div>
+
+    <!-- Tab bar -->
+    <div class="fm-tabs">
+      <button class="fm-tab-btn active" data-fm-tab="kml">KML Track</button>
+      <button class="fm-tab-btn"        data-fm-tab="csv">Receiver CSV</button>
+      <button class="fm-tab-btn"        data-fm-tab="saved">Saved Analyses</button>
+    </div>
+
+    <!-- ── KML pane ── -->
+    <div class="fm-pane active" id="fm-pane-kml">
+      <div class="fm-body">
+        <div class="fm-list-col">
+          <div class="fm-col-header">
+            <span>Stored Files</span>
+            <label class="upload-btn">Upload <input type="file" id="fm-kml-upload" accept=".kml" hidden /></label>
+          </div>
+          <div class="fm-file-list" id="fm-kml-list">
+            <div class="fm-empty">No KML files</div>
+          </div>
+        </div>
+        <div class="fm-detail-col" id="fm-kml-detail">
+          <div class="fm-detail-empty">Select a file to preview</div>
+        </div>
+      </div>
+      <div class="fm-footer">
+        <button class="btn btn-primary"   id="fm-kml-load-btn"      disabled>▶ Load into Map</button>
+        <button class="btn btn-secondary" id="fm-kml-download-btn"  disabled>Download</button>
+        <button class="btn btn-danger"    id="fm-kml-delete-btn"    disabled>Delete</button>
+        <span class="tab-sep"></span>
+        <button class="btn btn-secondary" id="fm-close-kml">Close</button>
+      </div>
+    </div>
+
+    <!-- ── CSV pane ── -->
+    <div class="fm-pane" id="fm-pane-csv">
+      <div class="fm-body">
+        <div class="fm-list-col">
+          <div class="fm-col-header">
+            <span>Stored Files</span>
+            <label class="upload-btn">Upload <input type="file" id="fm-csv-upload" accept=".csv" hidden /></label>
+          </div>
+          <div class="fm-file-list" id="fm-csv-list">
+            <div class="fm-empty">No CSV files</div>
+          </div>
+        </div>
+        <div class="fm-editor-col">
+          <div class="fm-detail-empty" id="fm-csv-editor-empty">Select a file to edit</div>
+          <div class="fm-editor-wrap hidden" id="fm-editor-wrap">
+            <div class="table-scroll">
+              <table class="editor-table" id="fm-editor-table">
+                <thead>
+                  <tr>
+                    <th>Name</th><th>Longitude</th><th>Latitude</th>
+                    <th>Height AGL (m)</th><th>Antenna Gain (dBi)</th><th>Tx Power (dBm)</th>
+                    <th>On</th><th></th>
+                  </tr>
+                </thead>
+                <tbody id="fm-editor-tbody"></tbody>
+              </table>
+            </div>
+            <button class="btn btn-secondary btn-sm" id="fm-add-row-btn">+ Add Row</button>
+          </div>
+        </div>
+      </div>
+      <div class="fm-footer">
+        <button class="btn btn-primary"   id="fm-csv-load-btn"     disabled>▶ Load into Map</button>
+        <button class="btn btn-primary"   id="fm-save-csv-btn"     disabled>Save to Server</button>
+        <button class="btn btn-secondary" id="fm-download-csv-btn" disabled>Download</button>
+        <button class="btn btn-danger"    id="fm-csv-delete-btn"   disabled>Delete</button>
+        <span class="tab-sep"></span>
+        <button class="btn btn-secondary" id="fm-close-csv">Close</button>
+      </div>
+    </div>
+
+    <!-- ── Saved analyses pane ── -->
+    <div class="fm-pane" id="fm-pane-saved">
+      <div class="fm-body">
+        <div class="fm-saved-list-wrap">
+          <div class="fm-saved-list" id="fm-saved-list">
+            <div class="fm-empty">No saved analyses</div>
+          </div>
+        </div>
+      </div>
+      <div class="fm-footer">
+        <button class="btn btn-primary"   id="fm-saved-load-btn"   disabled>▶ Load into Map</button>
+        <button class="btn btn-danger"    id="fm-saved-delete-btn" disabled>Delete</button>
+        <span class="tab-sep"></span>
+        <button class="btn btn-secondary" id="fm-close-saved">Close</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="/static/js/main.js"></script>
+</body>
+</html>
