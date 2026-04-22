@@ -117,33 +117,73 @@ else
 fi
 
 if ss -tlnp 2>/dev/null | grep -q ':80 '; then
-    pass "nginx is listening on port 80"
+    pass "Web server is listening on port 80"
 elif netstat -tlnp 2>/dev/null | grep -q ':80 '; then
-    pass "nginx is listening on port 80"
+    pass "Web server is listening on port 80"
 else
     fail "Nothing is listening on port 80"
 fi
 
-# ── 6. nginx configuration ────────────────────────────────────────────────────
-section "nginx configuration"
+# ── 6. Reverse proxy configuration ───────────────────────────────────────────
+# Auto-detect nginx vs Apache and check whichever is present.
 
-nginx_test=$(nginx -t 2>&1)
-if echo "$nginx_test" | grep -q "test is successful"; then
-    pass "nginx config syntax OK"
+USE_NGINX=false
+USE_APACHE=false
+command -v nginx      &>/dev/null && systemctl is-active nginx      -q 2>/dev/null && USE_NGINX=true
+command -v apache2    &>/dev/null && systemctl is-active apache2    -q 2>/dev/null && USE_APACHE=true
+command -v apache2ctl &>/dev/null && systemctl is-active apache2    -q 2>/dev/null && USE_APACHE=true
+
+if $USE_NGINX && ! $USE_APACHE; then
+    section "nginx configuration"
+
+    nginx_test=$(nginx -t 2>&1)
+    if echo "$nginx_test" | grep -q "test is successful"; then
+        pass "nginx config syntax OK"
+    else
+        fail "nginx config test failed:"
+        echo "$nginx_test" | sed 's/^/         /'
+    fi
+
+    SITES_ENABLED="/etc/nginx/sites-enabled/$SERVICE_NAME"
+    if [ -L "$SITES_ENABLED" ] || [ -f "$SITES_ENABLED" ]; then
+        pass "nginx site enabled: $SITES_ENABLED"
+    else
+        fail "nginx site not in sites-enabled: $SITES_ENABLED"
+    fi
+
+    if [ -e "/etc/nginx/sites-enabled/default" ]; then
+        warn "Default nginx site is still enabled — may intercept requests"
+    fi
+
+elif $USE_APACHE; then
+    section "Apache configuration"
+
+    apache2_test=$(apache2ctl configtest 2>&1)
+    if echo "$apache2_test" | grep -q "Syntax OK"; then
+        pass "Apache config syntax OK"
+    else
+        fail "Apache config test failed:"
+        echo "$apache2_test" | sed 's/^/         /'
+    fi
+
+    APACHE_CONF="/etc/apache2/conf-enabled/$SERVICE_NAME.conf"
+    if [ -L "$APACHE_CONF" ] || [ -f "$APACHE_CONF" ]; then
+        pass "Apache conf enabled: $APACHE_CONF"
+    else
+        fail "Apache conf not in conf-enabled — run: sudo a2enconf $SERVICE_NAME"
+    fi
+
+    for mod in proxy proxy_http alias headers expires; do
+        if apache2ctl -M 2>/dev/null | grep -q "${mod}_module"; then
+            pass "Apache module enabled: $mod"
+        else
+            fail "Apache module missing: $mod  — run: sudo a2enmod $mod"
+        fi
+    done
+
 else
-    fail "nginx config test failed:"
-    echo "$nginx_test" | sed 's/^/         /'
-fi
-
-SITES_ENABLED="/etc/nginx/sites-enabled/$SERVICE_NAME"
-if [ -L "$SITES_ENABLED" ] || [ -f "$SITES_ENABLED" ]; then
-    pass "nginx site enabled: $SITES_ENABLED"
-else
-    fail "nginx site not in sites-enabled: $SITES_ENABLED"
-fi
-
-if [ -e "/etc/nginx/sites-enabled/default" ]; then
-    warn "Default nginx site is still enabled — may intercept requests"
+    section "Reverse proxy"
+    fail "Neither nginx nor Apache appears to be running on this server"
 fi
 
 # ── 7. HTTP smoke tests ───────────────────────────────────────────────────────

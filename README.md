@@ -28,12 +28,25 @@ chmod +x setup.sh
 sudo ./setup.sh
 ```
 
-The script installs all system packages (Python 3, nginx, rsync), sets up a Python virtual environment, configures nginx on port 80, and starts the app as a systemd service.
+The script installs Python 3, nginx, and rsync; sets up a Python virtual environment; configures nginx on port 80 as the sole site; and starts the app as a systemd service.
 
 After setup, the app is available at:
 ```
 http://<server-ip>/rf-analyzer/index.html
 ```
+
+### Installing alongside an existing Apache server
+
+If Apache is already running on port 80, use `setup-apache.sh` instead. It adds the app as a configuration fragment so it coexists with whatever Apache is already serving — no existing sites are touched.
+
+```bash
+chmod +x setup-apache.sh
+sudo ./setup-apache.sh
+```
+
+The script enables the required Apache proxy modules (`proxy`, `proxy_http`, `alias`, `headers`, `expires`), drops `apache.conf` into `/etc/apache2/conf-available/`, enables it, and reloads Apache. Gunicorn still runs as the same systemd service on `127.0.0.1:5000`; Apache reverse-proxies to it.
+
+> **SSE note:** `apache.conf` sets `flushpackets=on` on the `/api/analyze` location. Without this, Apache buffers the SSE stream and the map will not update until the analysis finishes.
 
 ## Verify the installation
 
