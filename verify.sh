@@ -15,6 +15,7 @@ RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[0;33m'; BLD='\033[1m'; RST='\033[0
 pass() { echo -e "  ${GRN}[PASS]${RST} $1"; ((PASS++)); }
 fail() { echo -e "  ${RED}[FAIL]${RST} $1"; ((FAIL++)); }
 warn() { echo -e "  ${YLW}[WARN]${RST} $1"; ((WARN++)); }
+skip() { echo -e "  ${YLW}[SKIP]${RST} $1"; }
 section() { echo -e "\n${BLD}── $1 ──${RST}"; }
 
 # ── 1. Required files ─────────────────────────────────────────────────────────
@@ -24,6 +25,7 @@ for f in \
     "$INSTALL_DIR/app.py" \
     "$INSTALL_DIR/requirements.txt" \
     "$INSTALL_DIR/nginx.conf" \
+    "$INSTALL_DIR/apache.conf" \
     "$INSTALL_DIR/$SERVICE_NAME.service" \
     "$INSTALL_DIR/static/index.html" \
     "$INSTALL_DIR/static/js/main.js" \
@@ -91,51 +93,52 @@ esac
 
 active=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
 case "$active" in
-    active)   pass "Service is active (running)" ;;
+    active)     pass "Service is active (running)" ;;
     activating) warn "Service is still starting up — rerun in a moment" ;;
-    *)        fail "Service is not running (state=$active)"
-              echo -e "       Last 20 log lines:"
-              journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/         /'
-              ;;
+    *)          fail "Service is not running (state=$active)"
+                echo -e "       Last 20 log lines:"
+                journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/         /'
+                ;;
 esac
 
 # ── 5. Port binding ───────────────────────────────────────────────────────────
 section "Network / port binding"
 
-if command -v ss &>/dev/null; then
-    listener=$(ss -tlnp 2>/dev/null | grep ":$FLASK_PORT ")
-elif command -v netstat &>/dev/null; then
-    listener=$(netstat -tlnp 2>/dev/null | grep ":$FLASK_PORT ")
-else
-    listener=""
-fi
+port_listening() {
+    local port="$1"
+    ss -tlnp 2>/dev/null | grep -q ":${port} " && return 0
+    netstat -tlnp 2>/dev/null | grep -q ":${port} " && return 0
+    return 1
+}
 
-if [ -n "$listener" ]; then
+if port_listening "$FLASK_PORT"; then
     pass "Gunicorn is listening on port $FLASK_PORT"
 else
     fail "Nothing is listening on port $FLASK_PORT"
 fi
 
-if ss -tlnp 2>/dev/null | grep -q ':80 '; then
-    pass "Web server is listening on port 80"
-elif netstat -tlnp 2>/dev/null | grep -q ':80 '; then
+if port_listening 80; then
     pass "Web server is listening on port 80"
 else
     fail "Nothing is listening on port 80"
 fi
 
-# ── 6. Reverse proxy configuration ───────────────────────────────────────────
-# Auto-detect nginx vs Apache and check whichever is present.
+# ── 6. nginx ──────────────────────────────────────────────────────────────────
+section "nginx"
 
-USE_NGINX=false
-USE_APACHE=false
-command -v nginx      &>/dev/null && systemctl is-active nginx      -q 2>/dev/null && USE_NGINX=true
-command -v apache2    &>/dev/null && systemctl is-active apache2    -q 2>/dev/null && USE_APACHE=true
-command -v apache2ctl &>/dev/null && systemctl is-active apache2    -q 2>/dev/null && USE_APACHE=true
+NGINX_ACTIVE=false
+if command -v nginx &>/dev/null; then
+    if systemctl is-active nginx -q 2>/dev/null; then
+        NGINX_ACTIVE=true
+        pass "nginx is installed and running  ($(nginx -v 2>&1))"
+    else
+        warn "nginx is installed but not running"
+    fi
+else
+    skip "nginx is not installed"
+fi
 
-if $USE_NGINX && ! $USE_APACHE; then
-    section "nginx configuration"
-
+if $NGINX_ACTIVE; then
     nginx_test=$(nginx -t 2>&1)
     if echo "$nginx_test" | grep -q "test is successful"; then
         pass "nginx config syntax OK"
@@ -149,15 +152,31 @@ if $USE_NGINX && ! $USE_APACHE; then
         pass "nginx site enabled: $SITES_ENABLED"
     else
         fail "nginx site not in sites-enabled: $SITES_ENABLED"
+        echo "         Fix: sudo ln -s /etc/nginx/sites-available/$SERVICE_NAME /etc/nginx/sites-enabled/"
     fi
 
     if [ -e "/etc/nginx/sites-enabled/default" ]; then
-        warn "Default nginx site is still enabled — may intercept requests"
+        warn "Default nginx site is still enabled — may intercept requests on a dedicated server"
     fi
+fi
 
-elif $USE_APACHE; then
-    section "Apache configuration"
+# ── 7. Apache ─────────────────────────────────────────────────────────────────
+section "Apache"
 
+APACHE_ACTIVE=false
+if command -v apache2ctl &>/dev/null || command -v apache2 &>/dev/null; then
+    if systemctl is-active apache2 -q 2>/dev/null; then
+        APACHE_ACTIVE=true
+        APACHE_VER=$(apache2 -v 2>/dev/null | awk '/Server version/{print $3}')
+        pass "Apache is installed and running  ($APACHE_VER)"
+    else
+        warn "Apache is installed but not running"
+    fi
+else
+    skip "Apache is not installed"
+fi
+
+if $APACHE_ACTIVE; then
     apache2_test=$(apache2ctl configtest 2>&1)
     if echo "$apache2_test" | grep -q "Syntax OK"; then
         pass "Apache config syntax OK"
@@ -170,23 +189,26 @@ elif $USE_APACHE; then
     if [ -L "$APACHE_CONF" ] || [ -f "$APACHE_CONF" ]; then
         pass "Apache conf enabled: $APACHE_CONF"
     else
-        fail "Apache conf not in conf-enabled — run: sudo a2enconf $SERVICE_NAME"
+        fail "Apache conf not in conf-enabled"
+        echo "         Fix: sudo a2enconf $SERVICE_NAME && sudo systemctl reload apache2"
     fi
 
     for mod in proxy proxy_http alias headers expires; do
         if apache2ctl -M 2>/dev/null | grep -q "${mod}_module"; then
             pass "Apache module enabled: $mod"
         else
-            fail "Apache module missing: $mod  — run: sudo a2enmod $mod"
+            fail "Apache module missing: $mod"
+            echo "         Fix: sudo a2enmod $mod && sudo systemctl reload apache2"
         fi
     done
-
-else
-    section "Reverse proxy"
-    fail "Neither nginx nor Apache appears to be running on this server"
 fi
 
-# ── 7. HTTP smoke tests ───────────────────────────────────────────────────────
+if ! $NGINX_ACTIVE && ! $APACHE_ACTIVE; then
+    echo -e "  ${RED}[FAIL]${RST} Neither nginx nor Apache is running — no reverse proxy in front of Gunicorn"
+    ((FAIL++))
+fi
+
+# ── 8. HTTP smoke tests ───────────────────────────────────────────────────────
 section "HTTP smoke tests"
 
 http_check() {
@@ -210,34 +232,41 @@ http_check() {
     fi
 }
 
-# Flask direct (bypasses nginx)
-http_check "Flask /          (direct)"   "http://127.0.0.1:$FLASK_PORT/"          "200" "RF Path Coverage"
-http_check "Flask /api/files (direct)"   "http://127.0.0.1:$FLASK_PORT/api/files" "200" ""
+# Flask direct — always tested regardless of which proxy is in use
+http_check "Flask /          (direct)" "http://127.0.0.1:$FLASK_PORT/"          "200" "RF Path Coverage"
+http_check "Flask /api/files (direct)" "http://127.0.0.1:$FLASK_PORT/api/files" "200" ""
 
-# Via nginx
-http_check "nginx /rf-analyzer/index.html"  "$BASE_URL/rf-analyzer/index.html"  "200" "RF Path Coverage"
-http_check "nginx /rf-analyzer/ redirect"   "$BASE_URL/rf-analyzer/"            "200" "RF Path Coverage"
-http_check "nginx / redirect"               "$BASE_URL/"                        "301" ""
-http_check "nginx /static/js/main.js"       "$BASE_URL/static/js/main.js"       "200" "startAnalysis"
-http_check "nginx /static/css/style.css"    "$BASE_URL/static/css/style.css"    "200" "app-header"
-http_check "nginx /api/files"               "$BASE_URL/api/files"               "200" ""
-http_check "nginx /api/analyses"            "$BASE_URL/api/analyses"            "200" ""
+# Via reverse proxy (port 80) — works for both nginx and Apache
+http_check "proxy /rf-analyzer/index.html" "$BASE_URL/rf-analyzer/index.html" "200" "RF Path Coverage"
+http_check "proxy /rf-analyzer/"           "$BASE_URL/rf-analyzer/"           "200" "RF Path Coverage"
+http_check "proxy /static/js/main.js"      "$BASE_URL/static/js/main.js"      "200" "startAnalysis"
+http_check "proxy /static/css/style.css"   "$BASE_URL/static/css/style.css"   "200" "app-header"
+http_check "proxy /api/files"              "$BASE_URL/api/files"              "200" ""
+http_check "proxy /api/analyses"           "$BASE_URL/api/analyses"           "200" ""
+
+# Root redirect — nginx always sends 301; Apache only if dedicated (skip if Apache is sharing)
+if $NGINX_ACTIVE && ! $APACHE_ACTIVE; then
+    http_check "nginx / → 301 redirect" "$BASE_URL/" "301" ""
+fi
 
 rm -f /tmp/rfv_body
 
-# ── 8. Summary ────────────────────────────────────────────────────────────────
+# ── 9. Summary ────────────────────────────────────────────────────────────────
 echo -e "\n${BLD}══════════════════════════════════════${RST}"
 echo -e " PASS: ${GRN}$PASS${RST}   WARN: ${YLW}$WARN${RST}   FAIL: ${RED}$FAIL${RST}"
 echo -e "${BLD}══════════════════════════════════════${RST}"
 
 if [ "$FAIL" -gt 0 ]; then
     echo -e "\n${RED}One or more checks failed.${RST} Common fixes:\n"
-    echo "  Service not running:  sudo systemctl restart $SERVICE_NAME"
-    echo "                        sudo journalctl -u $SERVICE_NAME -n 50"
-    echo "  nginx not running:    sudo systemctl restart nginx"
-    echo "  Wrong site active:    sudo nginx -t && sudo systemctl reload nginx"
-    echo "  Permissions:          sudo chown -R www-data:www-data $INSTALL_DIR/uploads"
-    echo "  Missing packages:     cd $INSTALL_DIR && sudo -u www-data venv/bin/pip install -r requirements.txt"
+    echo "  Service not running:     sudo systemctl restart $SERVICE_NAME"
+    echo "                           sudo journalctl -u $SERVICE_NAME -n 50"
+    echo "  nginx not running:       sudo systemctl restart nginx"
+    echo "  Apache not running:      sudo systemctl restart apache2"
+    echo "  nginx site missing:      sudo ln -s /etc/nginx/sites-available/$SERVICE_NAME /etc/nginx/sites-enabled/ && sudo nginx -t && sudo systemctl reload nginx"
+    echo "  Apache conf missing:     sudo a2enconf $SERVICE_NAME && sudo systemctl reload apache2"
+    echo "  Apache module missing:   sudo a2enmod proxy proxy_http alias headers expires && sudo systemctl reload apache2"
+    echo "  Permissions:             sudo chown -R www-data:www-data $INSTALL_DIR/uploads"
+    echo "  Missing Python packages: cd $INSTALL_DIR && sudo -u www-data venv/bin/pip install -r requirements.txt"
     echo ""
     exit 1
 fi
