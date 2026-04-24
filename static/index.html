@@ -224,21 +224,21 @@
       <div class="param-group">
         <label class="param-label">Height AGL</label>
         <div class="param-row">
-          <input id="add-rx-height" class="ctrl-input" type="number" value="5" step="0.5" min="0" max="500" />
+          <input id="add-rx-height" class="ctrl-input" type="number" value="2" step="0.5" min="0" max="500" />
           <span class="param-unit">m</span>
         </div>
       </div>
       <div class="param-group">
         <label class="param-label">Antenna Gain</label>
         <div class="param-row">
-          <input id="add-rx-gain" class="ctrl-input" type="number" value="0" step="0.5" min="-3" max="15" />
+          <input id="add-rx-gain" class="ctrl-input" type="number" value="5.8" step="0.5" min="-3" max="15" />
           <span class="param-unit">dBi</span>
         </div>
       </div>
       <div class="param-group">
         <label class="param-label">Tx Power</label>
         <div class="param-row">
-          <input id="add-rx-power" class="ctrl-input" type="number" value="22" step="1" min="-30" max="43" />
+          <input id="add-rx-power" class="ctrl-input" type="number" value="28" step="1" min="-30" max="43" />
           <span class="param-unit">dBm</span>
         </div>
       </div>
@@ -291,6 +291,7 @@
       <div class="fm-footer">
         <button class="btn btn-primary"   id="fm-kml-load-btn"      disabled>▶ Load into Map</button>
         <button class="btn btn-secondary" id="fm-kml-download-btn"  disabled>Download</button>
+        <button class="btn btn-secondary" id="fm-kml-rename-btn"    disabled>Rename</button>
         <button class="btn btn-danger"    id="fm-kml-delete-btn"    disabled>Delete</button>
         <span class="tab-sep"></span>
         <button class="btn btn-secondary" id="fm-close-kml">Close</button>
@@ -332,6 +333,7 @@
         <button class="btn btn-primary"   id="fm-csv-load-btn"     disabled>▶ Load into Map</button>
         <button class="btn btn-primary"   id="fm-save-csv-btn"     disabled>Save to Server</button>
         <button class="btn btn-secondary" id="fm-download-csv-btn" disabled>Download</button>
+        <button class="btn btn-secondary" id="fm-csv-rename-btn"   disabled>Rename</button>
         <button class="btn btn-danger"    id="fm-csv-delete-btn"   disabled>Delete</button>
         <span class="tab-sep"></span>
         <button class="btn btn-secondary" id="fm-close-csv">Close</button>

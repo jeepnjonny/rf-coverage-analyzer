@@ -1275,6 +1275,24 @@ def upload_file(filetype: str):
     return jsonify({"filename": fname})
 
 
+@app.route("/api/files/<filetype>/<filename>", methods=["PATCH"])
+def rename_file(filetype: str, filename: str):
+    if filetype not in ("kml", "csv"):
+        return jsonify({"error": "Invalid type"}), 400
+    d = KML_DIR if filetype == "kml" else CSV_DIR
+    src = d / secure_filename(filename)
+    if not src.exists():
+        return jsonify({"error": "Not found"}), 404
+    new_name = secure_filename((request.get_json(force=True) or {}).get("new_name", ""))
+    if not new_name:
+        return jsonify({"error": "new_name required"}), 400
+    dst = d / new_name
+    if dst.exists():
+        return jsonify({"error": "A file with that name already exists"}), 409
+    src.rename(dst)
+    return jsonify({"ok": True, "filename": new_name})
+
+
 @app.route("/api/files/<filetype>/<filename>", methods=["DELETE"])
 def delete_file(filetype: str, filename: str):
     if filetype not in ("kml", "csv"):

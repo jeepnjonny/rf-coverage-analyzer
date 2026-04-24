@@ -376,6 +376,7 @@ async function selectFmFile(type, name) {
     renderFmFileList('kml');
     document.getElementById('fm-kml-load-btn').disabled     = false;
     document.getElementById('fm-kml-download-btn').disabled = false;
+    document.getElementById('fm-kml-rename-btn').disabled   = false;
     document.getElementById('fm-kml-delete-btn').disabled   = false;
     await showKmlDetail(name);
   } else {
@@ -384,6 +385,7 @@ async function selectFmFile(type, name) {
     document.getElementById('fm-csv-load-btn').disabled     = false;
     document.getElementById('fm-save-csv-btn').disabled     = false;
     document.getElementById('fm-download-csv-btn').disabled = false;
+    document.getElementById('fm-csv-rename-btn').disabled   = false;
     document.getElementById('fm-csv-delete-btn').disabled   = false;
     await loadCsvForEditor(name);
   }
@@ -492,9 +494,9 @@ async function saveKmlPointsAsCsv(placemarks) {
       name:             pm.name,
       longitude:        pm.lon.toFixed(6),
       latitude:         pm.lat.toFixed(6),
-      height_agl_m:     '5',
-      antenna_gain_dbi: '0',
-      tx_power_dbm:     '22',
+      height_agl_m:     '2',
+      antenna_gain_dbi: '5.8',
+      tx_power_dbm:     '28',
       enabled:          '1',
     };
     lines.push(CSV_COLS.map(c => {
@@ -520,7 +522,7 @@ async function saveKmlPointsAsCsv(placemarks) {
     fm.editorFile = data.filename;
     fm.editorRows = checked.map(pm => ({
       name: pm.name, longitude: pm.lon.toFixed(6), latitude: pm.lat.toFixed(6),
-      height_agl_m: '5', antenna_gain_dbi: '0', tx_power_dbm: '22', enabled: '1',
+      height_agl_m: '2', antenna_gain_dbi: '5.8', tx_power_dbm: '28', enabled: '1',
     }));
     fm.selCsv = data.filename;
     await refreshFmFileLists();
@@ -683,6 +685,7 @@ async function deleteFmFile(type) {
     fm.selKml = null;
     document.getElementById('fm-kml-load-btn').disabled     = true;
     document.getElementById('fm-kml-download-btn').disabled = true;
+    document.getElementById('fm-kml-rename-btn').disabled   = true;
     document.getElementById('fm-kml-delete-btn').disabled   = true;
     document.getElementById('fm-kml-detail').innerHTML      =
       '<div class="fm-detail-empty">Select a file to preview</div>';
@@ -692,12 +695,55 @@ async function deleteFmFile(type) {
     document.getElementById('fm-csv-load-btn').disabled     = true;
     document.getElementById('fm-save-csv-btn').disabled     = true;
     document.getElementById('fm-download-csv-btn').disabled = true;
+    document.getElementById('fm-csv-rename-btn').disabled   = true;
     document.getElementById('fm-csv-delete-btn').disabled   = true;
     document.getElementById('fm-editor-wrap').classList.add('hidden');
     const emEl = document.getElementById('fm-csv-editor-empty');
     emEl.style.display = ''; emEl.textContent = 'Select a file to edit';
   }
   await refreshFmFileLists();
+}
+
+async function renameFmFile(type) {
+  const oldName = type === 'kml' ? fm.selKml : fm.selCsv;
+  if (!oldName) return;
+
+  // Strip extension so user only types the base name
+  const ext     = oldName.includes('.') ? oldName.slice(oldName.lastIndexOf('.')) : '';
+  const oldBase = oldName.slice(0, oldName.length - ext.length);
+  const newBase = prompt('Rename to:', oldBase);
+  if (!newBase || newBase.trim() === oldBase) return;
+
+  const newName = newBase.trim() + ext;
+  showTransferSpinner(`Renaming…`);
+  try {
+    const res  = await fetch(`/api/files/${type}/${encodeURIComponent(oldName)}`, {
+      method:  'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ new_name: newName }),
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+
+    // Update loaded-file state if the renamed file was in use
+    if (type === 'kml' && state.kmlFile === oldName) {
+      state.kmlFile = data.filename;
+      updateSidebarBtns();
+    }
+    if (type === 'csv' && state.csvFile === oldName) {
+      state.csvFile = data.filename;
+      if (fm.editorFile === oldName) fm.editorFile = data.filename;
+      updateSidebarBtns();
+    }
+
+    await refreshFmFileLists();
+    await selectFmFile(type, data.filename);
+    setStatus(`Renamed to ${data.filename}`);
+  } catch (err) {
+    alert(`Rename failed: ${err.message}`);
+  } finally {
+    hideTransferSpinner();
+  }
 }
 
 function updateSidebarBtns() {
@@ -2077,9 +2123,9 @@ document.getElementById('add-rx-btn').addEventListener('click', () => {
   document.getElementById('add-rx-name').value   = `RX${n}`;
   document.getElementById('add-rx-lat').value    = center.lat.toFixed(6);
   document.getElementById('add-rx-lon').value    = center.lng.toFixed(6);
-  document.getElementById('add-rx-height').value = '5';
-  document.getElementById('add-rx-gain').value   = '0';
-  document.getElementById('add-rx-power').value  = '22';
+  document.getElementById('add-rx-height').value = '2';
+  document.getElementById('add-rx-gain').value   = '5.8';
+  document.getElementById('add-rx-power').value  = '28';
   document.getElementById('add-rx-modal').classList.remove('hidden');
   // Select the name so user can type immediately
   setTimeout(() => document.getElementById('add-rx-name').select(), 30);
@@ -2218,6 +2264,7 @@ document.getElementById('fm-kml-download-btn').addEventListener('click', () => {
   a.download = fm.selKml;
   a.click();
 });
+document.getElementById('fm-kml-rename-btn').addEventListener('click', () => renameFmFile('kml'));
 document.getElementById('fm-kml-delete-btn').addEventListener('click', () => deleteFmFile('kml'));
 
 // CSV tab
@@ -2240,6 +2287,7 @@ document.getElementById('fm-csv-upload').addEventListener('change', async e => {
 document.getElementById('fm-csv-load-btn').addEventListener('click',     loadFmCsv);
 document.getElementById('fm-save-csv-btn').addEventListener('click',     saveFmCsv);
 document.getElementById('fm-download-csv-btn').addEventListener('click', downloadFmCsv);
+document.getElementById('fm-csv-rename-btn').addEventListener('click',   () => renameFmFile('csv'));
 document.getElementById('fm-csv-delete-btn').addEventListener('click',   () => deleteFmFile('csv'));
 
 document.getElementById('fm-add-row-btn').addEventListener('click', () => {
