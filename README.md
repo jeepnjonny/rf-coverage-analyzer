@@ -28,25 +28,16 @@ chmod +x setup.sh
 sudo ./setup.sh
 ```
 
-The script installs Python 3, nginx, and rsync; sets up a Python virtual environment; configures nginx on port 80 as the sole site; and starts the app as a systemd service.
+The script installs Python 3, nginx, and rsync; sets up a Python virtual environment; installs the app as a set of `location` blocks inside nginx's existing default server; and starts the app as a systemd service.
 
 After setup, the app is available at:
 ```
 http://<server-ip>/rf-analyzer/index.html
 ```
 
-### Installing alongside an existing Apache server
+The setup script installs `nginx.conf` as `/etc/nginx/snippets/rf-coverage-analyzer.conf` and injects `include snippets/rf-coverage-analyzer.conf;` into the active nginx server block automatically. On re-deploy (`git pull && sudo ./setup.sh`) the injection is skipped if already present.
 
-If Apache is already running on port 80, use `setup-apache.sh` instead. It adds the app as a configuration fragment so it coexists with whatever Apache is already serving — no existing sites are touched.
-
-```bash
-chmod +x setup-apache.sh
-sudo ./setup-apache.sh
-```
-
-The script enables the required Apache proxy modules (`proxy`, `proxy_http`, `alias`, `headers`, `expires`), drops `apache.conf` into `/etc/apache2/conf-available/`, enables it, and reloads Apache. Gunicorn still runs as the same systemd service on `127.0.0.1:5000`; Apache reverse-proxies to it.
-
-> **SSE note:** `apache.conf` sets `flushpackets=on` on the `/api/analyze` location. Without this, Apache buffers the SSE stream and the map will not update until the analysis finishes.
+> **Path note:** The app uses top-level paths `/static/` and `/api/`. If your nginx server already serves content at those paths they will conflict.
 
 ## Verify the installation
 
@@ -109,7 +100,7 @@ Track segments are colored:
 |---|---|
 | Backend | Python / Flask, served by Gunicorn (`gthread` worker class) |
 | Frontend | Vanilla JS + Leaflet.js, no build step |
-| Reverse proxy | nginx on port 80 |
+| Reverse proxy | nginx (location blocks inside existing server) |
 | Elevation data | USGS 3DEP 1/3 arc-second tiles, cached in `uploads/tiles/` |
 | Process manager | systemd |
 
@@ -117,7 +108,7 @@ Analysis results are streamed to the browser via **Server-Sent Events (SSE)** so
 
 ## Configuration
 
-All RF defaults are set in the sidebar UI and are per-session. Server-side settings (workers, threads, port) are in `rf-coverage-analyzer.service`. nginx settings are in `nginx.conf`.
+All RF defaults are set in the sidebar UI and are per-session. Server-side settings (workers, threads, port) are in `rf-coverage-analyzer.service`. nginx location settings are in `nginx.conf` (installed to `/etc/nginx/snippets/rf-coverage-analyzer.conf`).
 
 To adjust Gunicorn concurrency, edit the service file and restart:
 ```bash

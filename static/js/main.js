@@ -69,6 +69,8 @@ const state = {
   rfStartTime:         null,  // when first points_batch received (for time-remaining estimate)
   currentPathPoint:    null,  // last path point whose profile is shown
   currentProfileRxIdx: -1,   // receiver index currently shown in path-point profile
+  currentProfileRx1Idx: -1,  // rx1 index when an inter-receiver profile is open (-1 = none)
+  currentProfileRx2Idx: -1,  // rx2 index when an inter-receiver profile is open (-1 = none)
   // Captured at analysis completion for save feature
   lastAnalysisStats:    null,
   lastAnalysisTotalPct: null,
@@ -102,7 +104,15 @@ function fmtPower(dbm) {
 }
 function fmtUV(dbm) { return `≈ ${dbmToUV(dbm).toFixed(3)} µV`; }
 
-function setStatus(msg) { document.getElementById('status-msg').textContent = msg; }
+function setStatus(msg) { document.getElementById('status-text').textContent = msg; }
+
+function showTransferSpinner(msg) {
+  document.getElementById('transfer-spinner').classList.remove('hidden');
+  if (msg !== undefined) setStatus(msg);
+}
+function hideTransferSpinner() {
+  document.getElementById('transfer-spinner').classList.add('hidden');
+}
 
 function setProgress(label, pct) {
   document.getElementById('progress-label').textContent = label;
@@ -499,6 +509,7 @@ async function saveKmlPointsAsCsv(placemarks) {
 
   const saveBtn = document.getElementById('fm-save-rx-btn');
   if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+  showTransferSpinner(`Saving ${filename}…`);
 
   try {
     const res  = await fetch('/api/upload/csv', { method: 'POST', body: fd });
@@ -519,6 +530,8 @@ async function saveKmlPointsAsCsv(placemarks) {
   } catch (err) {
     alert(`Save failed: ${err.message}`);
     if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save as CSV'; }
+  } finally {
+    hideTransferSpinner();
   }
 }
 
@@ -618,22 +631,27 @@ async function loadFmCsv() {
 
 async function saveFmCsv() {
   if (!fm.editorFile) return;
-  const res  = await fetch(`/api/csv/${encodeURIComponent(fm.editorFile)}`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rows: fm.editorRows }),
-  });
-  const data = await res.json();
-  if (data.ok) {
-    setStatus(`Saved ${fm.editorFile}`);
-    // Sync receivers if this is the currently loaded CSV
-    if (state.csvFile === fm.editorFile) {
-      state.receivers = fm.editorRows.map(r => ({ ...r }));
-      clearReceivers();
-      drawReceivers(state.receivers);
-      checkReady();
+  showTransferSpinner(`Saving ${fm.editorFile}…`);
+  try {
+    const res  = await fetch(`/api/csv/${encodeURIComponent(fm.editorFile)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: fm.editorRows }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      setStatus(`Saved ${fm.editorFile}`);
+      // Sync receivers if this is the currently loaded CSV
+      if (state.csvFile === fm.editorFile) {
+        state.receivers = fm.editorRows.map(r => ({ ...r }));
+        clearReceivers();
+        drawReceivers(state.receivers);
+        checkReady();
+      }
+    } else {
+      alert('Save failed');
     }
-  } else {
-    alert('Save failed');
+  } finally {
+    hideTransferSpinner();
   }
 }
 
@@ -778,20 +796,34 @@ async function updateReceiverPosition(rxIdx, lat, lon, markerObj) {
   state.receivers[rxIdx].latitude  = rc(lat).toFixed(6);
   state.receivers[rxIdx].longitude = rc(lon).toFixed(6);
 
-  // Analysis results are now stale — clear them
-  resultLayer.clearLayers();
-  interRxLayer.clearLayers();
-  state.pathResults         = [];
-  state.currentProfileData  = null;
-  state.currentPathPoint    = null;
-  state.currentProfileRxIdx = -1;
-  document.getElementById('profile-canvas').style.display = 'none';
-  document.getElementById('profile-empty').style.display  = '';
-  document.getElementById('profile-empty').textContent    = 'Click the path or an inter-receiver link to view terrain profile';
-  document.getElementById('profile-link-label').classList.add('hidden');
-  document.getElementById('profile-rx-sidebar').classList.add('hidden');
-  document.getElementById('map-signal-panel').classList.add('hidden');
-  hideResults();
+  // If a terrain profile for a link involving this receiver is open, close it
+  const profileInvolves = state.currentProfileRxIdx === rxIdx
+    || state.currentProfileRx1Idx === rxIdx
+    || state.currentProfileRx2Idx === rxIdx;
+  if (profileInvolves) {
+    state.currentProfileData   = null;
+    state.currentProfileRxIdx  = -1;
+    state.currentProfileRx1Idx = -1;
+    state.currentProfileRx2Idx = -1;
+    document.getElementById('profile-canvas').style.display = 'none';
+    document.getElementById('profile-empty').style.display  = '';
+    document.getElementById('profile-empty').textContent    = 'Click the path or an inter-receiver link to view terrain profile';
+    document.getElementById('profile-link-label').classList.add('hidden');
+    document.getElementById('profile-rx-sidebar').classList.add('hidden');
+  }
+
+  // Remove only inter-receiver polylines that involve the moved receiver
+  const toRemove = [];
+  interRxLayer.eachLayer(layer => {
+    if (layer.options.rx1_idx === rxIdx || layer.options.rx2_idx === rxIdx)
+      toRemove.push(layer);
+  });
+  toRemove.forEach(l => interRxLayer.removeLayer(l));
+
+  // Drop stored results for pairs involving this receiver so they can be refilled
+  state.interRxResults = state.interRxResults.filter(
+    r => r.rx1_idx !== rxIdx && r.rx2_idx !== rxIdx
+  );
 
   if (!state.csvFile) {
     setStatus('Receiver moved — no CSV file loaded, position not saved.');
@@ -799,7 +831,7 @@ async function updateReceiverPosition(rxIdx, lat, lon, markerObj) {
   }
 
   const name = state.receivers[rxIdx].name || `RX${rxIdx + 1}`;
-  setStatus(`Saving ${name} position…`);
+  showTransferSpinner(`Saving ${name} position…`);
 
   try {
     const res  = await fetch(`/api/csv/${encodeURIComponent(state.csvFile)}`, {
@@ -818,12 +850,28 @@ async function updateReceiverPosition(rxIdx, lat, lon, markerObj) {
       }
       // Refresh tooltip with updated coords
       if (markerObj) markerObj.setTooltipContent(_rxTooltip(state.receivers[rxIdx], rxIdx));
-      setStatus(`${name} repositioned and saved · re-run analysis to update coverage.`);
+
+      // Sync FM editor table if it is currently showing this CSV
+      if (fm.editorFile === state.csvFile && fm.editorRows[rxIdx]) {
+        fm.editorRows[rxIdx].latitude  = state.receivers[rxIdx].latitude;
+        fm.editorRows[rxIdx].longitude = state.receivers[rxIdx].longitude;
+        renderFmEditorTable();
+      }
+
+      // Recalculate links for the moved receiver only; skipClear keeps other links visible
+      if (state.receivers.filter(_rxEnabled).length >= 2) {
+        setStatus(`${name} saved · recalculating receiver links…`);
+        startAnalysis('links', { skipClear: true });
+      } else {
+        setStatus(`${name} repositioned and saved.`);
+      }
     } else {
       setStatus(`${name} moved but save failed — check server logs.`);
     }
   } catch (err) {
     setStatus(`Save error: ${err.message}`);
+  } finally {
+    hideTransferSpinner();
   }
 }
 
@@ -897,17 +945,20 @@ document.getElementById('download-map-btn').addEventListener('click', async () =
   }
 });
 
-function startAnalysis(mode) {
+function startAnalysis(mode, opts = {}) {
   if (state.analysisRunning) return;
 
-  // Clear only the layer(s) this mode will repopulate
-  if (mode === 'track') {
-    resultLayer.clearLayers();
-    state.pathResults    = [];
-    state.interRxResults = [];
-  } else if (mode === 'links') {
-    interRxLayer.clearLayers();
-    state.interRxResults = [];
+  // Clear only the layer(s) this mode will repopulate.
+  // skipClear=true lets a caller pre-clear selectively (e.g. receiver drag).
+  if (!opts.skipClear) {
+    if (mode === 'track') {
+      resultLayer.clearLayers();
+      state.pathResults    = [];
+      state.interRxResults = [];
+    } else if (mode === 'links') {
+      interRxLayer.clearLayers();
+      state.interRxResults = [];
+    }
   }
 
   // Reset save-related state and hide the save row
@@ -916,9 +967,11 @@ function startAnalysis(mode) {
   state.lastAnalysisParams   = null;
   document.getElementById('save-analysis-row').classList.add('hidden');
 
-  state.currentProfileData  = null;
-  state.currentPathPoint    = null;
-  state.currentProfileRxIdx = -1;
+  state.currentProfileData   = null;
+  state.currentPathPoint     = null;
+  state.currentProfileRxIdx  = -1;
+  state.currentProfileRx1Idx = -1;
+  state.currentProfileRx2Idx = -1;
   document.getElementById('profile-canvas').style.display   = 'none';
   document.getElementById('profile-empty').style.display    = '';
   document.getElementById('profile-empty').textContent      = 'Click the path or an inter-receiver link to view terrain profile';
@@ -1107,7 +1160,7 @@ function handleSSE(evt, ctx) {
       const pl = L.polyline(
         [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
          [parseFloat(rx2.latitude), parseFloat(rx2.longitude)]],
-        { color, weight: 2.5, opacity: 0.75 }
+        { color, weight: 2.5, opacity: 0.75, rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx }
       );
       pl.bindTooltip(
         `${rx1.name} ↔ ${rx2.name}<br>${evt.rssi} dBm · ${evt.dist_km} km · diff: ${evt.diff_db} dB`,
@@ -1179,6 +1232,7 @@ async function saveAnalysis() {
     total_coverage_pct: state.lastAnalysisTotalPct ?? null,
   };
 
+  showTransferSpinner(`Saving "${name}"…`);
   try {
     const res  = await fetch('/api/analyses', {
       method:  'POST',
@@ -1194,6 +1248,8 @@ async function saveAnalysis() {
     renderFmSavedList();
   } catch (err) {
     setStatus(`Save failed: ${err.message}`);
+  } finally {
+    hideTransferSpinner();
   }
 }
 
@@ -1254,7 +1310,7 @@ function _drawInterRxResults(results, receivers) {
     const pl = L.polyline(
       [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
        [parseFloat(rx2.latitude), parseFloat(rx2.longitude)]],
-      { color, weight: 2.5, opacity: 0.75 }
+      { color, weight: 2.5, opacity: 0.75, rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx }
     );
     pl.bindTooltip(
       `${rx1.name} ↔ ${rx2.name}<br>${evt.rssi} dBm · ${evt.dist_km} km · diff: ${evt.diff_db} dB`,
@@ -1319,6 +1375,7 @@ function _setSavedBtns(enabled) {
 
 async function loadSavedAnalysis() {
   if (!fm.selAnalysis) return;
+  showTransferSpinner('Loading analysis…');
   try {
     const res  = await fetch(`/api/analyses/${encodeURIComponent(fm.selAnalysis)}`);
     const data = await res.json();
@@ -1398,6 +1455,8 @@ async function loadSavedAnalysis() {
     setStatus(`Loaded "${data.name || 'analysis'}".`);
   } catch (err) {
     alert(`Load failed: ${err.message}`);
+  } finally {
+    hideTransferSpinner();
   }
 }
 
@@ -1472,8 +1531,10 @@ async function showTerrainProfile(rx1, rx2, rx1Idx = 0, rx2Idx = 1) {
 
   // Inter-receiver link view — hide the path-point receiver sidebar
   sidebar.classList.add('hidden');
-  state.currentPathPoint    = null;
-  state.currentProfileRxIdx = -1;
+  state.currentPathPoint     = null;
+  state.currentProfileRxIdx  = -1;
+  state.currentProfileRx1Idx = rx1Idx;
+  state.currentProfileRx2Idx = rx2Idx;
 
   canvas.style.display  = 'none';
   emptyEl.style.display = '';
@@ -1541,8 +1602,10 @@ async function showPathPointProfile(pt, forceRxIdx = null) {
   if (!rx) return;
 
   // Persist current point + rx so sidebar can re-render on switch
-  state.currentPathPoint    = pt;
-  state.currentProfileRxIdx = rxIdx;
+  state.currentPathPoint     = pt;
+  state.currentProfileRxIdx  = rxIdx;
+  state.currentProfileRx1Idx = -1;
+  state.currentProfileRx2Idx = -1;
 
   switchTab('profile');
   const canvas  = document.getElementById('profile-canvas');
@@ -2053,6 +2116,7 @@ document.getElementById('add-rx-confirm').addEventListener('click', async () => 
   checkReady();
   closeAddRxModal();
 
+  showTransferSpinner(`Saving ${newRx.name}…`);
   if (state.csvFile) {
     try {
       const res  = await fetch(`/api/csv/${encodeURIComponent(state.csvFile)}`, {
@@ -2071,6 +2135,8 @@ document.getElementById('add-rx-confirm').addEventListener('click', async () => 
       }
     } catch (err) {
       setStatus(`Added ${newRx.name} — save error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
     }
   } else {
     // No CSV loaded — auto-create one on the server
@@ -2104,6 +2170,8 @@ document.getElementById('add-rx-confirm').addEventListener('click', async () => 
       }
     } catch (err) {
       setStatus(`Added ${newRx.name} — CSV create error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
     }
   }
 });
@@ -2129,12 +2197,17 @@ document.getElementById('file-mgr-modal').addEventListener('click', e => {
 document.getElementById('fm-kml-upload').addEventListener('change', async e => {
   const file = e.target.files[0]; if (!file) return;
   const fd = new FormData(); fd.append('file', file);
-  const res  = await fetch('/api/upload/kml', { method: 'POST', body: fd });
-  const data = await res.json();
-  e.target.value = '';
-  if (data.error) { alert(data.error); return; }
-  await refreshFmFileLists();
-  await selectFmFile('kml', data.filename);
+  showTransferSpinner(`Uploading ${file.name}…`);
+  try {
+    const res  = await fetch('/api/upload/kml', { method: 'POST', body: fd });
+    const data = await res.json();
+    e.target.value = '';
+    if (data.error) { alert(data.error); return; }
+    await refreshFmFileLists();
+    await selectFmFile('kml', data.filename);
+  } finally {
+    hideTransferSpinner();
+  }
 });
 
 document.getElementById('fm-kml-load-btn').addEventListener('click',   loadFmKml);
@@ -2151,12 +2224,17 @@ document.getElementById('fm-kml-delete-btn').addEventListener('click', () => del
 document.getElementById('fm-csv-upload').addEventListener('change', async e => {
   const file = e.target.files[0]; if (!file) return;
   const fd = new FormData(); fd.append('file', file);
-  const res  = await fetch('/api/upload/csv', { method: 'POST', body: fd });
-  const data = await res.json();
-  e.target.value = '';
-  if (data.error) { alert(data.error); return; }
-  await refreshFmFileLists();
-  await selectFmFile('csv', data.filename);
+  showTransferSpinner(`Uploading ${file.name}…`);
+  try {
+    const res  = await fetch('/api/upload/csv', { method: 'POST', body: fd });
+    const data = await res.json();
+    e.target.value = '';
+    if (data.error) { alert(data.error); return; }
+    await refreshFmFileLists();
+    await selectFmFile('csv', data.filename);
+  } finally {
+    hideTransferSpinner();
+  }
 });
 
 document.getElementById('fm-csv-load-btn').addEventListener('click',     loadFmCsv);

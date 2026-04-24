@@ -386,7 +386,20 @@ html, body {
 }
 .progress-bar { height: 100%; background: var(--accent); transition: width .3s ease; border-radius: 4px; }
 .progress-label { font-size: 11px; color: var(--text-dim); }
-.status-msg { font-size: 11px; color: var(--text-dim); min-height: 14px; }
+.status-msg { font-size: 11px; color: var(--text-dim); min-height: 14px; display: flex; align-items: center; gap: 6px; }
+
+/* Transfer spinner — shown during upload / save / load */
+@keyframes spin { to { transform: rotate(360deg); } }
+.transfer-spinner {
+  display: inline-block;
+  width: 11px; height: 11px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  flex-shrink: 0;
+}
+.transfer-spinner.hidden { display: none; }
 
 /* ─── CSV Editor Modal ───────────────────────────────────── */
 
