@@ -1114,6 +1114,29 @@ def _parse_coord_text(text: str) -> list[tuple[float, float]]:
     return result
 
 
+def _validate_track_content(data: bytes, ext: str) -> str | None:
+    """
+    Return None if *data* is parseable XML of the expected track-file type,
+    or a human-readable error string if it is not.
+    """
+    try:
+        text = data.decode("utf-8", errors="replace")
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        return f"Invalid XML: {exc}"
+    except Exception as exc:
+        return f"Could not read file: {exc}"
+
+    local = root.tag.split("}")[-1].lower() if "}" in root.tag else root.tag.lower()
+    if ext == "gpx":
+        if local != "gpx":
+            return f"Not a valid GPX file (root element is <{local}>)"
+    else:  # kml / kmz
+        if local not in ("kml", "document", "folder"):
+            return f"Not a valid KML file (root element is <{local}>)"
+    return None
+
+
 def parse_kml(content: str, track_name: str | None = None) -> list[tuple[float, float]]:
     """
     Parse track coordinates from a KML file.
@@ -1123,7 +1146,10 @@ def parse_kml(content: str, track_name: str | None = None) -> list[tuple[float, 
     aid-station coordinates no longer pollute the track).
     Falls back to any <coordinates> element for bare KMLs with no Placemark wrapper.
     """
-    root = ET.fromstring(content)
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return []
     for ns in KML_NS:
         np = f"{{{ns}}}" if ns else ""
 
@@ -1177,7 +1203,10 @@ def parse_kml_info(content: str) -> dict:
       linestrings — [{name, point_count}] for each named LineString Placemark
       placemarks  — [{name, lat, lon, description, icon_type}] for each Point Placemark
     """
-    root        = ET.fromstring(content)
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return {"linestrings": [], "placemarks": []}
     linestrings: list[dict] = []
     placemarks:  list[dict] = []
     seen_ls:     set[str]   = set()
@@ -1258,7 +1287,10 @@ def parse_gpx(content: str, track_name: str | None = None) -> list[tuple[float, 
     If track_name is given, returns only the segment whose <name> matches.
     Waypoints (<wpt>) are ignored here — they are returned by parse_gpx_info.
     """
-    root = ET.fromstring(content)
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return []
     for ns in GPX_NS:
         np = f"{{{ns}}}" if ns else ""
 
@@ -1296,7 +1328,10 @@ def parse_gpx_info(content: str) -> dict:
       linestrings — [{name, point_count}] for each track/route
       placemarks  — [{name, lat, lon, description, icon_type}] for each waypoint
     """
-    root        = ET.fromstring(content)
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return {"linestrings": [], "placemarks": []}
     linestrings: list[dict] = []
     placemarks:  list[dict] = []
 
@@ -1412,9 +1447,18 @@ def upload_file(filetype: str):
         return jsonify({"error": "Empty filename"}), 400
     ext = f.filename.rsplit(".", 1)[-1].lower()
     if ext not in (ALLOWED_KML if filetype == "kml" else ALLOWED_CSV):
-        return jsonify({"error": "File type not allowed"}), 400
+        allowed = ", ".join(sorted(ALLOWED_KML if filetype == "kml" else ALLOWED_CSV))
+        return jsonify({"error": f"File type not allowed — expected one of: {allowed}"}), 400
+    data = f.read()
+    if not data:
+        return jsonify({"error": "Uploaded file is empty"}), 400
+    # Validate content before saving
+    if filetype == "kml":
+        err = _validate_track_content(data, ext)
+        if err:
+            return jsonify({"error": err}), 400
     fname = secure_filename(f.filename)
-    (KML_DIR if filetype == "kml" else CSV_DIR).joinpath(fname).write_bytes(f.read())
+    (KML_DIR if filetype == "kml" else CSV_DIR).joinpath(fname).write_bytes(data)
     return jsonify({"filename": fname})
 
 
@@ -1555,10 +1599,13 @@ def get_kml(filename: str):
     if not p.exists():
         return jsonify({"error": "Not found"}), 404
     track_name = request.args.get("track")   # optional: select track by name
-    content    = p.read_text(encoding="utf-8", errors="replace")
-    coords     = parse_track_file(content, p.name, track_name=track_name)
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+        coords  = parse_track_file(content, p.name, track_name=track_name)
+    except Exception as exc:
+        return jsonify({"error": f"Could not parse file: {exc}"}), 400
     if not coords:
-        return jsonify({"error": "No track coordinates found"}), 400
+        return jsonify({"error": "No track coordinates found in file"}), 400
     lats = [c[0] for c in coords]
     lons = [c[1] for c in coords]
     return jsonify({
@@ -1572,8 +1619,11 @@ def get_kml_info(filename: str):
     p = KML_DIR / secure_filename(filename)
     if not p.exists():
         return jsonify({"error": "Not found"}), 404
-    content = p.read_text(encoding="utf-8", errors="replace")
-    return jsonify(parse_track_file_info(content, p.name))
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+        return jsonify(parse_track_file_info(content, p.name))
+    except Exception as exc:
+        return jsonify({"error": f"Could not parse file: {exc}"}), 400
 
 
 # ---------------------------------------------------------------------------
@@ -1797,11 +1847,14 @@ def analyze():
                 kml_p = KML_DIR / secure_filename(kml_file)
                 if not kml_p.exists():
                     yield sse({"type": "error", "message": "KML file not found"}); return
-                waypoints = parse_track_file(
-                    kml_p.read_text(encoding="utf-8", errors="replace"), kml_p.name
-                )
+                try:
+                    waypoints = parse_track_file(
+                        kml_p.read_text(encoding="utf-8", errors="replace"), kml_p.name
+                    )
+                except Exception as exc:
+                    yield sse({"type": "error", "message": f"Could not parse track file: {exc}"}); return
                 if not waypoints:
-                    yield sse({"type": "error", "message": "No track coordinates found"}); return
+                    yield sse({"type": "error", "message": "No track coordinates found in file"}); return
                 path_pts = interpolate_path(waypoints)
 
             yield sse({
