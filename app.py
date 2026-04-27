@@ -61,7 +61,7 @@ ELEV_DB      = UPLOAD_DIR / "elevation_cache.db"     # SQLite — current store
 for d in [KML_DIR, CSV_DIR, TILE_DIR, ANALYSES_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_KML = {"kml", "kmz"}
+ALLOWED_KML = {"kml", "kmz", "gpx"}
 ALLOWED_CSV = {"csv"}
 
 _http = requests.Session()
@@ -1092,6 +1092,12 @@ KML_NS = [
     "",
 ]
 
+GPX_NS = [
+    "http://www.topografix.com/GPX/1/1",
+    "http://www.topografix.com/GPX/1/0",
+    "",
+]
+
 CSV_COLUMNS = ["name", "longitude", "latitude", "height_agl_m", "antenna_gain_dbi", "tx_power_dbm", "enabled"]
 
 
@@ -1229,6 +1235,143 @@ def parse_kml_info(content: str) -> dict:
     return {"linestrings": linestrings, "placemarks": placemarks}
 
 
+# ---------------------------------------------------------------------------
+# GPX parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_gpx_pts(container_el, pt_tag: str) -> list[tuple[float, float]]:
+    """Collect (lat, lon) from trkpt or rtept elements inside a trk/rte element."""
+    pts = []
+    for pt in container_el.iter(pt_tag):
+        try:
+            pts.append((_rc(float(pt.get("lat", ""))), _rc(float(pt.get("lon", "")))))
+        except (ValueError, TypeError):
+            pass
+    return pts
+
+
+def parse_gpx(content: str, track_name: str | None = None) -> list[tuple[float, float]]:
+    """
+    Parse track coordinates from a GPX file.
+
+    Checks <trk> elements first, falls back to <rte> elements.
+    If track_name is given, returns only the segment whose <name> matches.
+    Waypoints (<wpt>) are ignored here — they are returned by parse_gpx_info.
+    """
+    root = ET.fromstring(content)
+    for ns in GPX_NS:
+        np = f"{{{ns}}}" if ns else ""
+
+        # Prefer tracks; fall back to routes
+        containers = list(root.iter(f"{np}trk"))
+        pt_tag     = f"{np}trkpt"
+        if not containers:
+            containers = list(root.iter(f"{np}rte"))
+            pt_tag     = f"{np}rtept"
+
+        if not containers:
+            continue
+
+        if track_name is not None:
+            for trk in containers:
+                name_el = trk.find(f"{np}name")
+                if name_el is not None and (name_el.text or "").strip() == track_name:
+                    pts = _parse_gpx_pts(trk, pt_tag)
+                    if pts:
+                        return pts
+        else:
+            for trk in containers:
+                pts = _parse_gpx_pts(trk, pt_tag)
+                if pts:
+                    return pts
+
+        break  # correct namespace found — don't try others
+
+    return []
+
+
+def parse_gpx_info(content: str) -> dict:
+    """
+    Return structured metadata for a GPX file in the same shape as parse_kml_info:
+      linestrings — [{name, point_count}] for each track/route
+      placemarks  — [{name, lat, lon, description, icon_type}] for each waypoint
+    """
+    root        = ET.fromstring(content)
+    linestrings: list[dict] = []
+    placemarks:  list[dict] = []
+
+    for ns in GPX_NS:
+        np           = f"{{{ns}}}" if ns else ""
+        found_any    = False
+
+        # Tracks
+        for trk in root.iter(f"{np}trk"):
+            found_any = True
+            name_el = trk.find(f"{np}name")
+            name    = (name_el.text or "").strip() if name_el is not None else ""
+            pts     = _parse_gpx_pts(trk, f"{np}trkpt")
+            if pts:
+                linestrings.append({
+                    "name":        name or f"Track {len(linestrings) + 1}",
+                    "point_count": len(pts),
+                })
+
+        # Routes (treated as tracks)
+        for rte in root.iter(f"{np}rte"):
+            found_any = True
+            name_el = rte.find(f"{np}name")
+            name    = (name_el.text or "").strip() if name_el is not None else ""
+            pts     = _parse_gpx_pts(rte, f"{np}rtept")
+            if pts:
+                linestrings.append({
+                    "name":        name or f"Route {len(linestrings) + 1}",
+                    "point_count": len(pts),
+                })
+
+        # Waypoints → placemarks
+        for wpt in root.iter(f"{np}wpt"):
+            found_any = True
+            try:
+                lat     = _rc(float(wpt.get("lat", "")))
+                lon     = _rc(float(wpt.get("lon", "")))
+                name_el = wpt.find(f"{np}name")
+                desc_el = wpt.find(f"{np}desc")
+                placemarks.append({
+                    "name":        (name_el.text or "").strip() if name_el is not None else "",
+                    "lat":         lat,
+                    "lon":         lon,
+                    "description": (desc_el.text or "").strip() if desc_el is not None else "",
+                    "icon_type":   "point",
+                })
+            except (ValueError, TypeError):
+                pass
+
+        if found_any:
+            break
+
+    return {"linestrings": linestrings, "placemarks": placemarks}
+
+
+def _is_gpx(filename: str) -> bool:
+    return Path(filename).suffix.lower() == ".gpx"
+
+
+def parse_track_file(content: str, filename: str,
+                     track_name: str | None = None) -> list[tuple[float, float]]:
+    """Dispatch to parse_gpx or parse_kml based on file extension."""
+    if _is_gpx(filename):
+        return parse_gpx(content, track_name)
+    return parse_kml(content, track_name)
+
+
+def parse_track_file_info(content: str, filename: str) -> dict:
+    """Dispatch to parse_gpx_info or parse_kml_info based on file extension."""
+    if _is_gpx(filename):
+        return parse_gpx_info(content)
+    return parse_kml_info(content)
+
+
+
 def parse_csv_file(path: Path) -> list[dict]:
     with open(path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
@@ -1253,7 +1396,7 @@ def index():
 
 @app.route("/api/files")
 def list_files():
-    kmls = sorted(f.name for f in KML_DIR.iterdir() if f.suffix.lower() == ".kml")
+    kmls = sorted(f.name for f in KML_DIR.iterdir() if f.suffix.lower() in (".kml", ".gpx"))
     csvs = sorted(f.name for f in CSV_DIR.iterdir() if f.suffix.lower() == ".csv")
     return jsonify({"kml": kmls, "csv": csvs})
 
@@ -1411,10 +1554,11 @@ def get_kml(filename: str):
     p = KML_DIR / secure_filename(filename)
     if not p.exists():
         return jsonify({"error": "Not found"}), 404
-    track_name = request.args.get("track")   # optional: select LineString by name
-    coords = parse_kml(p.read_text(encoding="utf-8", errors="replace"), track_name=track_name)
+    track_name = request.args.get("track")   # optional: select track by name
+    content    = p.read_text(encoding="utf-8", errors="replace")
+    coords     = parse_track_file(content, p.name, track_name=track_name)
     if not coords:
-        return jsonify({"error": "No coordinates found in KML"}), 400
+        return jsonify({"error": "No track coordinates found"}), 400
     lats = [c[0] for c in coords]
     lons = [c[1] for c in coords]
     return jsonify({
@@ -1428,7 +1572,8 @@ def get_kml_info(filename: str):
     p = KML_DIR / secure_filename(filename)
     if not p.exists():
         return jsonify({"error": "Not found"}), 404
-    return jsonify(parse_kml_info(p.read_text(encoding="utf-8", errors="replace")))
+    content = p.read_text(encoding="utf-8", errors="replace")
+    return jsonify(parse_track_file_info(content, p.name))
 
 
 # ---------------------------------------------------------------------------
@@ -1652,9 +1797,11 @@ def analyze():
                 kml_p = KML_DIR / secure_filename(kml_file)
                 if not kml_p.exists():
                     yield sse({"type": "error", "message": "KML file not found"}); return
-                waypoints = parse_kml(kml_p.read_text(encoding="utf-8", errors="replace"))
+                waypoints = parse_track_file(
+                    kml_p.read_text(encoding="utf-8", errors="replace"), kml_p.name
+                )
                 if not waypoints:
-                    yield sse({"type": "error", "message": "No coordinates in KML"}); return
+                    yield sse({"type": "error", "message": "No track coordinates found"}); return
                 path_pts = interpolate_path(waypoints)
 
             yield sse({

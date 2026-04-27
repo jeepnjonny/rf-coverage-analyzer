@@ -456,7 +456,7 @@ async function showKmlDetail(name) {
       });
       html += '</div>';
 
-      const defName = name.replace(/\.kml$/i, '') + '-receivers.csv';
+      const defName = name.replace(/\.(kml|gpx)$/i, '') + '-receivers.csv';
       html += `<div class="fm-save-rx-row">
         <input id="fm-rx-csv-name" class="ctrl-input" type="text" value="${defName}" />
         <button class="btn btn-primary btn-sm" id="fm-save-rx-btn">Save as CSV</button>

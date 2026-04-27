@@ -31,7 +31,7 @@
     <section class="panel">
       <h3 class="panel-title">Files</h3>
       <button class="file-mgr-btn" id="kml-mgr-btn">
-        <div class="fmb-type">KML Track</div>
+        <div class="fmb-type">Track File</div>
         <div class="fmb-name" id="kml-mgr-name">— not loaded —</div>
       </button>
       <button class="file-mgr-btn" id="csv-mgr-btn">
@@ -267,7 +267,7 @@
 
     <!-- Tab bar -->
     <div class="fm-tabs">
-      <button class="fm-tab-btn active" data-fm-tab="kml">KML Track</button>
+      <button class="fm-tab-btn active" data-fm-tab="kml">Track (KML/GPX)</button>
       <button class="fm-tab-btn"        data-fm-tab="csv">Receiver CSV</button>
       <button class="fm-tab-btn"        data-fm-tab="saved">Saved Analyses</button>
     </div>
@@ -278,10 +278,10 @@
         <div class="fm-list-col">
           <div class="fm-col-header">
             <span>Stored Files</span>
-            <label class="upload-btn">Upload <input type="file" id="fm-kml-upload" accept=".kml" hidden /></label>
+            <label class="upload-btn">Upload <input type="file" id="fm-kml-upload" accept=".kml,.gpx" hidden /></label>
           </div>
           <div class="fm-file-list" id="fm-kml-list">
-            <div class="fm-empty">No KML files</div>
+            <div class="fm-empty">No track files</div>
           </div>
         </div>
         <div class="fm-detail-col" id="fm-kml-detail">
