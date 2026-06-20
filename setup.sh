@@ -54,7 +54,8 @@ chmod -R u=rwX,g=rwX "$INSTALL_DIR/uploads"
 
 # ── 4. Python virtual environment ────────────────────────────────────────────
 echo "[4/6] Setting up Python virtual environment..."
-if [ ! -d "$INSTALL_DIR/venv" ]; then
+if [ ! -d "$INSTALL_DIR/venv" ] || ! sudo -u www-data "$INSTALL_DIR/venv/bin/python" -c "import pip" 2>/dev/null; then
+    rm -rf "$INSTALL_DIR/venv"
     sudo -u www-data python3 -m venv "$INSTALL_DIR/venv"
 fi
 sudo -u www-data "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
