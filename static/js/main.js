@@ -2370,6 +2370,10 @@ function startInfraAdvisor() {
   statusEl.textContent = '';
   document.getElementById('ia-progress-bar').style.width = '0%';
   document.getElementById('ia-progress-label').textContent = 'Initializing…';
+  const importBtn = document.getElementById('ia-import-btn');
+  importBtn.classList.add('hidden');
+  importBtn.disabled = false;
+  importBtn.textContent = '+ Add to Receivers';
   checkReady();
 
   const params = {
@@ -2462,6 +2466,8 @@ function _handleIaSSE(evt) {
         `Done — ${evt.selected_count} location${evt.selected_count !== 1 ? 's' : ''}, ` +
         `${evt.final_coverage_pct}% coverage`;
       statusEl.textContent = '';
+      if (state.iaSuggestions.length > 0)
+        document.getElementById('ia-import-btn').classList.remove('hidden');
       _iaFinish();
       break;
 
@@ -2553,4 +2559,89 @@ function _iaFinish() {
   setTimeout(() => {
     document.getElementById('ia-progress-container').classList.add('hidden');
   }, 1500);
+}
+
+document.getElementById('ia-import-btn').addEventListener('click', _iaImportReceivers);
+
+async function _iaImportReceivers() {
+  if (!state.iaSuggestions.length) return;
+
+  const antH  = parseFloat(document.getElementById('ia-ant-height').value) || 4;
+  const added = [];
+
+  state.iaSuggestions.forEach((s, i) => {
+    const rx = {
+      name:             `Advisor-${s.rank}`,
+      latitude:         s.lat.toFixed(6),
+      longitude:        s.lon.toFixed(6),
+      height_agl_m:     String(antH),
+      antenna_gain_dbi: '0',
+      tx_power_dbm:     '22',
+      enabled:          '1',
+    };
+    const idx = state.receivers.length;
+    state.receivers.push(rx);
+    _addRxMarker(rx, idx);
+    added.push(rx.name);
+  });
+
+  checkReady();
+  document.getElementById('ia-import-btn').disabled = true;
+  document.getElementById('ia-import-btn').textContent = 'Added!';
+
+  const csvRows = state.receivers;
+
+  if (state.csvFile) {
+    showTransferSpinner(`Saving ${state.csvFile}…`);
+    try {
+      const res  = await fetch(`/api/csv/${encodeURIComponent(state.csvFile)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rows: csvRows }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        fm.editorFile = state.csvFile;
+        fm.editorRows = csvRows.map(r => ({ ...r }));
+        setStatus(`Added ${added.length} advisor site(s) to ${state.csvFile}.`);
+      } else {
+        setStatus('Receivers added to map — CSV save failed.');
+      }
+    } catch (err) {
+      setStatus(`Receivers added — save error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
+    }
+  } else {
+    // No CSV loaded — create a new one
+    showTransferSpinner('Creating receivers CSV…');
+    try {
+      const lines = [CSV_COLS.join(',')];
+      csvRows.forEach(row => {
+        lines.push(CSV_COLS.map(c => {
+          const v = String(row[c] ?? '');
+          return v.includes(',') ? `"${v.replace(/"/g, '""')}"` : v;
+        }).join(','));
+      });
+      const ts       = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+      const filename = `advisor-${ts}.csv`;
+      const blob     = new Blob([lines.join('\n')], { type: 'text/csv' });
+      const fd       = new FormData();
+      fd.append('file', new File([blob], filename, { type: 'text/csv' }));
+      const res  = await fetch('/api/upload/csv', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.filename) {
+        state.csvFile  = data.filename;
+        fm.editorFile  = data.filename;
+        fm.editorRows  = csvRows.map(r => ({ ...r }));
+        fm.selCsv      = data.filename;
+        await loadFmFiles();
+        updateSidebarBtns();
+        setStatus(`Created ${data.filename} with ${added.length} advisor site(s).`);
+      }
+    } catch (err) {
+      setStatus(`Receivers added to map — CSV create error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
+    }
+  }
 }
