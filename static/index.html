@@ -103,6 +103,57 @@
       </div>
     </section>
 
+    <section class="panel" id="infra-advisor-panel">
+      <h3 class="panel-title">Infrastructure Advisor</h3>
+
+      <div class="param-group">
+        <label class="param-label hint-label" title="Antenna height above ground at each suggested infrastructure site. Taller is better for RF but may require a mast.">
+          Antenna Height AGL <span class="hint-icon">?</span>
+        </label>
+        <div class="param-row">
+          <input type="number" id="ia-ant-height" class="ctrl-input" value="4" step="0.5" min="1" max="30" />
+          <span class="param-unit">m</span>
+        </div>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label hint-label" title="Maximum walking distance from a road. Sites within this range of a road are considered reachable by short hike.">
+          Max Walk Distance <span class="hint-icon">?</span>
+        </label>
+        <div class="param-row">
+          <input type="number" id="ia-max-walk" class="ctrl-input" value="500" step="50" min="0" max="2000" />
+          <span class="param-unit">m from road</span>
+        </div>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Max Locations to Find</label>
+        <div class="param-row">
+          <input type="number" id="ia-max-locs" class="ctrl-input" value="5" step="1" min="1" max="20" />
+        </div>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Target Coverage</label>
+        <div class="param-row">
+          <input type="number" id="ia-target-pct" class="ctrl-input" value="90" step="5" min="50" max="100" />
+          <span class="param-unit">%</span>
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-full" id="ia-run-btn" disabled>▶ Suggest Locations</button>
+
+      <div id="ia-progress-container" class="hidden">
+        <div class="progress-label" id="ia-progress-label">Initializing…</div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="ia-progress-bar" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="status-msg" id="ia-status-msg"></div>
+
+      <div id="ia-results" class="ia-results hidden"></div>
+    </section>
+
     <section class="panel">
       <div style="display:flex;gap:6px">
         <button id="analyze-track-btn" class="btn btn-primary btn-full" disabled>▶ Track Coverage</button>

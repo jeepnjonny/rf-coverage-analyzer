@@ -937,6 +937,19 @@ VEG_PROFILES: dict[str, dict] = {
 HARD_FAIL_DB = 30.0
 
 # ---------------------------------------------------------------------------
+# Infrastructure Location Advisor — OSM + greedy site selection
+# ---------------------------------------------------------------------------
+
+OVERPASS_URL           = "https://overpass-api.de/api/interpreter"
+TIER1_HIGHWAYS: set[str] = {
+    "motorway", "trunk", "primary", "secondary", "tertiary",
+    "residential", "unclassified", "service", "track",
+}
+ROAD_SAMPLE_SPACING_M  = 250   # metres between sampled road candidates
+MAX_CANDIDATES         = 200   # hard cap on total candidates sent to RF scoring
+HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
+
+# ---------------------------------------------------------------------------
 # ProcessPoolExecutor — true multi-core parallelism for RF analysis
 #
 # Each pool worker is a separate OS process with its own GIL, tile LRU cache,
@@ -1798,6 +1811,47 @@ def _point_task(args: tuple) -> dict:
     }
 
 
+def score_candidate(args: tuple) -> dict:
+    """Score one infrastructure candidate location against all track points.
+
+    Module-level (picklable) so it can run inside ProcessPoolExecutor workers.
+    Uses the same RF pipeline as _point_task but treats the candidate as the
+    fixed infrastructure and each track point as the mobile device.
+    """
+    (cand_idx, cand_lat, cand_lon, cand_height_agl,
+     track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+     sensitivity_dbm, veg_type, fade_margin_db) = args
+
+    TRACKER_H = 1.5
+    rx_total  = _get_elev(cand_lat, cand_lon) + cand_height_agl
+    covered: list[int] = []
+
+    for idx, (plat, plon) in enumerate(track_pts):
+        t_total   = _get_elev(plat, plon) + TRACKER_H
+        profile, dist = _terrain_profile_cached(
+            _rc(plat), _rc(plon), _rc(cand_lat), _rc(cand_lon)
+        )
+        diff_loss = deygout_loss_db(profile, t_total, rx_total, dist, freq_mhz)
+        if diff_loss >= HARD_FAIL_DB:
+            continue
+        veg_loss  = vegetation_loss_db(profile, t_total, rx_total, dist, freq_mhz, veg_type)
+        if veg_loss >= HARD_FAIL_DB:
+            continue
+        path_loss = fspl_db(freq_mhz, dist)
+        rssi      = tx_power_dbm + tx_gain_dbi - path_loss - diff_loss - veg_loss
+        if rssi >= (sensitivity_dbm + fade_margin_db):
+            covered.append(idx)
+
+    total = len(track_pts)
+    return {
+        "cand_idx":    cand_idx,
+        "covered_set": covered,
+        "coverage_pct": round(len(covered) / total * 100, 1) if total else 0.0,
+        "lat":          cand_lat,
+        "lon":          cand_lon,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Route – RF Analysis (Server-Sent Events)
 # ---------------------------------------------------------------------------
@@ -2056,6 +2110,365 @@ def analyze():
             "Cache-Control":    "no-cache",
             "X-Accel-Buffering": "no",
             "Connection":       "keep-alive",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure Location Advisor — OSM helpers + greedy optimizer
+# ---------------------------------------------------------------------------
+
+def fetch_osm_roads(lat_min: float, lat_max: float,
+                    lon_min: float, lon_max: float) -> list[dict]:
+    """Fetch road/trail polylines from the Overpass API for the bounding box."""
+    query = (
+        f"[out:json][timeout:60];"
+        f"way[\"highway\"]({lat_min},{lon_min},{lat_max},{lon_max});"
+        f"(._; >>;);"
+        f"out body;"
+    )
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = _http.post(OVERPASS_URL, data={"data": query}, timeout=90)
+            if resp.status_code in (429, 504):
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+            break
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(5 * (attempt + 1))
+    else:
+        raise RuntimeError(f"Overpass API failed after 3 attempts: {last_exc}")
+
+    nodes: dict[int, tuple[float, float]] = {}
+    ways_raw: list[dict] = []
+    for el in elements:
+        if el["type"] == "node":
+            nodes[el["id"]] = (_rc(el["lat"]), _rc(el["lon"]))
+        elif el["type"] == "way":
+            ways_raw.append(el)
+
+    ways: list[dict] = []
+    for way in ways_raw:
+        hw = way.get("tags", {}).get("highway", "")
+        if hw not in TIER1_HIGHWAYS:
+            continue
+        pts = [nodes[nid] for nid in way.get("nodes", []) if nid in nodes]
+        if len(pts) >= 2:
+            ways.append({"highway": hw, "nodes": pts})
+    return ways
+
+
+def sample_road_candidates(ways: list[dict], spacing_m: float) -> list[dict]:
+    """Sample candidate infrastructure points every spacing_m metres along roads."""
+    seen: set[tuple[float, float]] = set()
+    candidates: list[dict] = []
+
+    for way in ways:
+        pts = way["nodes"]
+        hw  = way["highway"]
+
+        key = (round(pts[0][0], 4), round(pts[0][1], 4))
+        if key not in seen:
+            seen.add(key)
+            candidates.append({"lat": pts[0][0], "lon": pts[0][1],
+                                "tier": 1, "highway": hw})
+
+        dist_since_last = 0.0
+        for i in range(len(pts) - 1):
+            lat1, lon1 = pts[i]
+            lat2, lon2 = pts[i + 1]
+            seg       = haversine(lat1, lon1, lat2, lon2)
+            remaining = spacing_m - dist_since_last
+
+            if seg >= remaining:
+                pos = remaining
+                while pos <= seg:
+                    f  = pos / seg
+                    la, lo = intermediate_point(lat1, lon1, lat2, lon2, min(f, 1.0))
+                    k = (round(la, 4), round(lo, 4))
+                    if k not in seen:
+                        seen.add(k)
+                        candidates.append({"lat": la, "lon": lo,
+                                           "tier": 1, "highway": hw})
+                    pos += spacing_m
+                dist_since_last = seg - (pos - spacing_m)
+            else:
+                dist_since_last += seg
+
+    return candidates
+
+
+def find_highpoint_candidates(
+    tier1_pts: list[dict],
+    max_dist_m: float,
+    grid_m: float,
+) -> list[dict]:
+    """For each Tier-1 road point find the highest terrain point reachable by hike.
+
+    Scans radially in 12 directions out to max_dist_m at grid_m intervals.
+    Returns each best-elevated point that is higher than its corresponding road
+    point (deduplicated across all road points).
+    """
+    if not tier1_pts or max_dist_m <= 0:
+        return []
+
+    n_rings  = max(1, int(max_dist_m / grid_m))
+    n_angles = 12
+    seen: set[tuple[float, float]] = set()
+    candidates: list[dict] = []
+
+    for road_pt in tier1_pts:
+        lat0, lon0 = road_pt["lat"], road_pt["lon"]
+        road_elev  = _get_elev(_rc(lat0), _rc(lon0))
+        best_elev  = road_elev
+        best_la: float | None = None
+        best_lo: float | None = None
+
+        cos_lat = math.cos(math.radians(lat0))
+        for ring in range(1, n_rings + 1):
+            dist = ring * grid_m
+            for ai in range(n_angles):
+                bearing = math.tau * ai / n_angles
+                la = _rc(lat0 + (dist * math.cos(bearing)) / 111_000.0)
+                lo = _rc(lon0 + (dist * math.sin(bearing))
+                         / (111_000.0 * max(cos_lat, 0.001)))
+                elev = _get_elev(la, lo)
+                if elev > best_elev:
+                    best_elev = elev
+                    best_la, best_lo = la, lo
+
+        if best_la is not None:
+            key = (round(best_la, 4), round(best_lo, 4))
+            if key not in seen:
+                seen.add(key)
+                candidates.append({"lat": best_la, "lon": best_lo,
+                                    "tier": 2, "highway": "highpoint"})
+
+    return candidates
+
+
+def greedy_set_cover(
+    candidates: list[dict],
+    total_pts: int,
+    max_n: int,
+    target_pct: float = 100.0,
+) -> list[dict]:
+    """Iteratively select the candidate with the best marginal coverage gain."""
+    if not candidates or total_pts == 0:
+        return []
+
+    remaining = [{**c, "covered_set": set(c["covered_set"])} for c in candidates]
+    covered:  set[int]   = set()
+    selected: list[dict] = []
+
+    for rank in range(1, max_n + 1):
+        if len(covered) / total_pts * 100 >= target_pct:
+            break
+        if not remaining:
+            break
+
+        remaining.sort(key=lambda c: len(c["covered_set"] - covered), reverse=True)
+        best     = remaining.pop(0)
+        marginal = best["covered_set"] - covered
+
+        if not marginal:
+            break
+
+        covered |= marginal
+        selected.append({
+            "rank":           rank,
+            "lat":            best["lat"],
+            "lon":            best["lon"],
+            "tier":           best.get("tier", 1),
+            "highway":        best.get("highway", ""),
+            "coverage_pct":   best["coverage_pct"],
+            "marginal_pts":   len(marginal),
+            "marginal_pct":   round(len(marginal) / total_pts * 100, 1),
+            "cumulative_pct": round(len(covered)  / total_pts * 100, 1),
+        })
+
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Route – Infrastructure Location Advisor (Server-Sent Events)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/suggest-locations", methods=["POST"])
+def suggest_locations():
+    data             = request.get_json()
+    kml_file         = data.get("kml_file")
+    freq_mhz         = float(data.get("freq_mhz",            915))
+    tx_power_dbm     = float(data.get("tx_power_dbm",         22))
+    tx_gain_dbi      = float(data.get("tx_gain_dbi",           0))
+    sensitivity_dbm  = float(data.get("sensitivity_dbm",    -135))
+    veg_type         = data.get("veg_type",                "none")
+    fade_margin_db   = float(data.get("fade_margin_db",        0))
+    antenna_height_m = float(data.get("antenna_height_m",      4))
+    max_walk_m       = float(data.get("max_walk_m",           500))
+    max_locations    = int(  data.get("max_locations",          5))
+    target_cov_pct   = float(data.get("target_coverage_pct",  90))
+
+    def generate():
+        try:
+            yield sse({"type": "status", "message": "Parsing track file…"})
+
+            if not kml_file:
+                yield sse({"type": "error", "message": "kml_file is required"}); return
+            kml_p = KML_DIR / secure_filename(kml_file)
+            if not kml_p.exists():
+                yield sse({"type": "error", "message": "Track file not found"}); return
+
+            try:
+                waypoints = parse_track_file(
+                    kml_p.read_text(encoding="utf-8", errors="replace"), kml_p.name
+                )
+            except Exception as exc:
+                yield sse({"type": "error", "message": f"Could not parse track: {exc}"}); return
+            if not waypoints:
+                yield sse({"type": "error", "message": "No track coordinates found"}); return
+
+            # Cap at 300 pts — adequate coverage resolution, bounded per-candidate cost
+            track_pts = interpolate_path(waypoints, max_pts=300)
+            total_pts = len(track_pts)
+
+            yield sse({"type": "status",
+                       "message": f"Track: {total_pts} scoring points. Fetching terrain…"})
+
+            all_lats = [p[0] for p in track_pts]
+            all_lons = [p[1] for p in track_pts]
+            la_min = min(all_lats) - 0.02
+            la_max = max(all_lats) + 0.02
+            lo_min = min(all_lons) - 0.02
+            lo_max = max(all_lons) + 0.02
+
+            # Prefetch elevation tiles (identical pattern to analyze())
+            _prog = [0, 1]
+            def _tile_cb(done, total):
+                _prog[0], _prog[1] = done, max(1, total)
+
+            tile_thread = threading.Thread(
+                target=lambda: _tiles.prefetch_area(la_min, la_max, lo_min, lo_max, _tile_cb),
+                daemon=True,
+            )
+            tile_thread.start()
+            while tile_thread.is_alive():
+                yield sse({"type": "elev_progress",
+                           "current": _prog[0], "total": _prog[1],
+                           "message": f"Tile {_prog[0]}/{_prog[1]} cached…"})
+                time.sleep(0.6)
+            tile_thread.join()
+            yield sse({"type": "elev_progress", "current": _prog[1], "total": _prog[1]})
+
+            # Fetch OSM road/trail network
+            yield sse({"type": "status",
+                       "message": "Fetching road/trail data from OpenStreetMap…"})
+            try:
+                ways = fetch_osm_roads(la_min, la_max, lo_min, lo_max)
+            except RuntimeError as exc:
+                yield sse({"type": "error", "message": str(exc)}); return
+
+            yield sse({"type": "osm_status",
+                       "message": f"Found {len(ways)} road/trail segments. Generating candidates…",
+                       "way_count": len(ways)})
+
+            # Tier-1: sample points along driveable roads
+            tier1 = sample_road_candidates(ways, ROAD_SAMPLE_SPACING_M)
+
+            # Tier-2: elevated sites reachable by short hike from a road
+            tier2: list[dict] = []
+            if max_walk_m > 0 and tier1:
+                yield sse({"type": "status",
+                           "message": "Scanning for elevated hike-accessible sites…"})
+                tier2 = find_highpoint_candidates(tier1, max_walk_m, HIGHPOINT_GRID_M)
+
+            # Merge, deduplicate, cap
+            seen_keys: set[tuple[float, float]] = set()
+            candidates: list[dict] = []
+            for c in tier1 + tier2:
+                k = (round(c["lat"], 4), round(c["lon"], 4))
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    candidates.append(c)
+            candidates = candidates[:MAX_CANDIDATES]
+
+            if not candidates:
+                yield sse({
+                    "type":    "error",
+                    "message": ("No road/trail candidates found in the course area. "
+                                "Ensure the course overlaps an area with OSM road data."),
+                }); return
+
+            yield sse({
+                "type":            "osm_status",
+                "message":         f"{len(candidates)} candidate sites ready to score.",
+                "way_count":       len(ways),
+                "candidate_count": len(candidates),
+                "tier1_count":     len(tier1),
+                "tier2_count":     len(tier2),
+            })
+
+            # Parallel RF scoring via the analysis process pool
+            yield sse({"type": "status",
+                       "message": "Scoring candidate sites via RF model…"})
+
+            score_args = [
+                (i, c["lat"], c["lon"], antenna_height_m,
+                 track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+                 sensitivity_dbm, veg_type, fade_margin_db)
+                for i, c in enumerate(candidates)
+            ]
+
+            scored: list[dict] = []
+            pool = _get_analysis_pool()
+            futures = {pool.submit(score_candidate, a): a[0] for a in score_args}
+            done_count = 0
+            for fut in as_completed(futures):
+                result = fut.result()
+                c = candidates[result["cand_idx"]]
+                result["tier"]    = c.get("tier", 1)
+                result["highway"] = c.get("highway", "")
+                scored.append(result)
+                done_count += 1
+                if done_count % 5 == 0 or done_count == len(candidates):
+                    yield sse({"type": "scoring_progress",
+                               "current": done_count,
+                               "total":   len(candidates)})
+
+            # Greedy set-cover to select the best combination
+            yield sse({"type": "status",
+                       "message": "Selecting optimal location combination…"})
+            selected = greedy_set_cover(scored, total_pts, max_locations, target_cov_pct)
+
+            for loc in selected:
+                yield sse({"type": "suggestion", **loc})
+
+            final_pct = selected[-1]["cumulative_pct"] if selected else 0.0
+            yield sse({
+                "type":               "complete",
+                "selected_count":     len(selected),
+                "total_candidates":   len(candidates),
+                "final_coverage_pct": final_pct,
+                "locations":          selected,
+            })
+
+        except GeneratorExit:
+            pass
+        except Exception as exc:
+            import traceback
+            yield sse({"type": "error", "message": f"{exc}\n{traceback.format_exc()}"})
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
         },
     )
 
