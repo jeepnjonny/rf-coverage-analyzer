@@ -2311,3 +2311,246 @@ document.getElementById('save-analysis-btn').addEventListener('click',  saveAnal
 // ---------------------------------------------------------------------------
 
 refreshFmFileLists();
+
+// ---------------------------------------------------------------------------
+// Infrastructure Location Advisor
+// ---------------------------------------------------------------------------
+
+// Extend state for the advisor
+state.iaRunning     = false;
+state.iaAbortCtrl   = null;
+state.iaSuggestions = [];
+state.iaSelectedIdx = -1;
+state.iaMarkerLayer = L.layerGroup().addTo(map);
+state.iaMarkers     = [];   // Leaflet marker refs, parallel to iaSuggestions
+
+// Patch checkReady() to also gate the advisor button
+const _origCheckReady = checkReady;
+checkReady = function () {
+  _origCheckReady();
+  const iaBtn = document.getElementById('ia-run-btn');
+  if (iaBtn) {
+    if (state.iaRunning) {
+      iaBtn.textContent = '◼ Stop';
+      iaBtn.className   = 'btn btn-danger btn-full';
+      iaBtn.disabled    = false;
+    } else {
+      iaBtn.textContent = '▶ Suggest Locations';
+      iaBtn.className   = 'btn btn-primary btn-full';
+      iaBtn.disabled    = !state.kmlFile || state.analysisRunning;
+    }
+  }
+};
+
+document.getElementById('ia-run-btn').addEventListener('click', () => {
+  if (state.iaRunning) {
+    state.iaAbortCtrl?.abort();
+  } else {
+    startInfraAdvisor();
+  }
+});
+
+function startInfraAdvisor() {
+  if (state.iaRunning || state.analysisRunning) return;
+
+  state.iaRunning     = true;
+  state.iaSuggestions = [];
+  state.iaSelectedIdx = -1;
+  state.iaMarkerLayer.clearLayers();
+  state.iaMarkers     = [];
+  state.iaAbortCtrl   = new AbortController();
+
+  const resultsEl  = document.getElementById('ia-results');
+  const progressEl = document.getElementById('ia-progress-container');
+  const statusEl   = document.getElementById('ia-status-msg');
+
+  resultsEl.classList.add('hidden');
+  resultsEl.innerHTML = '';
+  progressEl.classList.remove('hidden');
+  statusEl.textContent = '';
+  document.getElementById('ia-progress-bar').style.width = '0%';
+  document.getElementById('ia-progress-label').textContent = 'Initializing…';
+  checkReady();
+
+  const params = {
+    kml_file:             state.kmlFile,
+    freq_mhz:             parseFloat(document.getElementById('freq-select').value),
+    tx_power_dbm:         parseFloat(document.getElementById('tx-power').value),
+    tx_gain_dbi:          parseFloat(document.getElementById('tx-gain').value),
+    sensitivity_dbm:      parseFloat(document.getElementById('rx-sens').value),
+    veg_type:             document.getElementById('veg-loss').value,
+    fade_margin_db:       parseFloat(document.getElementById('fade-margin').value) || 0,
+    antenna_height_m:     parseFloat(document.getElementById('ia-ant-height').value) || 4,
+    max_walk_m:           parseFloat(document.getElementById('ia-max-walk').value) || 500,
+    max_locations:        parseInt(document.getElementById('ia-max-locs').value) || 5,
+    target_coverage_pct:  parseFloat(document.getElementById('ia-target-pct').value) || 90,
+  };
+
+  fetch('/api/suggest-locations', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(params),
+    signal:  state.iaAbortCtrl.signal,
+  }).then(res => {
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    function pump() {
+      reader.read().then(({ done, value }) => {
+        if (done) { _iaFinish(); return; }
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        lines.forEach(line => {
+          if (!line.startsWith('data: ')) return;
+          try { _handleIaSSE(JSON.parse(line.slice(6))); } catch { /* skip */ }
+        });
+        pump();
+      }).catch(() => _iaFinish());
+    }
+    pump();
+  }).catch(err => {
+    if (err.name !== 'AbortError') {
+      document.getElementById('ia-status-msg').textContent = `Error: ${err.message}`;
+    }
+    _iaFinish();
+  });
+}
+
+function _handleIaSSE(evt) {
+  const statusEl   = document.getElementById('ia-status-msg');
+  const progressEl = document.getElementById('ia-progress-label');
+  const barEl      = document.getElementById('ia-progress-bar');
+
+  switch (evt.type) {
+    case 'status':
+      statusEl.textContent = evt.message;
+      break;
+
+    case 'elev_progress':
+      if (evt.total > 0) {
+        progressEl.textContent = evt.message || `Terrain: ${evt.current}/${evt.total}`;
+        barEl.style.width = `${Math.min(25, (evt.current / evt.total) * 25)}%`;
+      }
+      break;
+
+    case 'osm_status':
+      statusEl.textContent = evt.message;
+      if (evt.candidate_count) {
+        progressEl.textContent = `${evt.candidate_count} candidates to score`;
+        barEl.style.width = '30%';
+      }
+      break;
+
+    case 'scoring_progress':
+      progressEl.textContent = `Scoring: ${evt.current}/${evt.total}`;
+      barEl.style.width = `${30 + (evt.current / evt.total) * 55}%`;
+      break;
+
+    case 'suggestion': {
+      state.iaSuggestions.push(evt);
+      _addIaMarker(evt, state.iaSuggestions.length - 1);
+      _appendIaResultItem(evt, state.iaSuggestions.length - 1);
+      document.getElementById('ia-results').classList.remove('hidden');
+      barEl.style.width = `${85 + (evt.rank / Math.max(evt.rank + 1, 2)) * 12}%`;
+      break;
+    }
+
+    case 'complete':
+      barEl.style.width = '100%';
+      progressEl.textContent =
+        `Done — ${evt.selected_count} location${evt.selected_count !== 1 ? 's' : ''}, ` +
+        `${evt.final_coverage_pct}% coverage`;
+      statusEl.textContent = '';
+      _iaFinish();
+      break;
+
+    case 'error':
+      statusEl.textContent = `Error: ${evt.message.split('\n')[0]}`;
+      _iaFinish();
+      break;
+  }
+}
+
+function _addIaMarker(suggestion, idx) {
+  const isHike = suggestion.tier === 2;
+  const icon = L.divIcon({
+    className: '',
+    html: `<div class="ia-marker${isHike ? ' ia-tier-2' : ''}">${suggestion.rank}</div>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+  });
+  const marker = L.marker([suggestion.lat, suggestion.lon], { icon })
+    .bindTooltip(
+      `<b>#${suggestion.rank} — ${isHike ? 'Hike-accessible' : suggestion.highway || 'Road'}</b><br>` +
+      `Individual: ${suggestion.coverage_pct}%<br>` +
+      `Marginal gain: +${suggestion.marginal_pct}%<br>` +
+      `Cumulative: ${suggestion.cumulative_pct}%`,
+      { direction: 'top', offset: [0, -12] }
+    )
+    .on('click', () => _selectIaSuggestion(idx));
+  marker.addTo(state.iaMarkerLayer);
+  state.iaMarkers.push(marker);
+}
+
+function _appendIaResultItem(suggestion, idx) {
+  const el = document.createElement('div');
+  el.className = 'ia-item';
+  el.dataset.iaIdx = idx;
+
+  const covColor = coverageColor(suggestion.cumulative_pct);
+  const tierLabel = suggestion.tier === 2 ? 'Hike' : (suggestion.highway || 'Road');
+
+  el.innerHTML = `
+    <div class="ia-item-header">
+      <span class="ia-rank-badge">#${suggestion.rank}</span>
+      <span class="ia-tier-badge${suggestion.tier === 2 ? ' ia-tier-2' : ''}">${tierLabel}</span>
+      <span style="flex:1;font-size:11px;color:var(--text-dim)">${suggestion.lat.toFixed(5)}, ${suggestion.lon.toFixed(5)}</span>
+    </div>
+    <div class="ia-cov-row">
+      <span class="ia-cov-label">This site:</span>
+      <span class="ia-cov-pct" style="color:${coverageColor(suggestion.coverage_pct)}">${suggestion.coverage_pct}%</span>
+    </div>
+    <div class="ia-cov-row">
+      <span class="ia-cov-label">Marginal:</span>
+      <span class="ia-cov-pct" style="color:var(--success)">+${suggestion.marginal_pct}%</span>
+    </div>
+    <div class="ia-cov-row">
+      <span class="ia-cov-label">Cumulative:</span>
+      <span class="ia-cov-pct" style="color:${covColor}">${suggestion.cumulative_pct}%</span>
+      <div class="ia-cov-bar-wrap">
+        <div class="ia-cov-bar-fill" style="width:${suggestion.cumulative_pct}%;background:${covColor}"></div>
+      </div>
+    </div>
+  `;
+  el.addEventListener('click', () => _selectIaSuggestion(idx));
+  document.getElementById('ia-results').appendChild(el);
+}
+
+function _selectIaSuggestion(idx) {
+  state.iaSelectedIdx = idx;
+
+  // Update sidebar items
+  document.querySelectorAll('.ia-item').forEach((el, i) =>
+    el.classList.toggle('ia-selected', i === idx));
+
+  // Update map markers
+  state.iaMarkers.forEach((marker, i) => {
+    const iconEl = marker.getElement()?.querySelector('.ia-marker');
+    if (iconEl) iconEl.classList.toggle('ia-selected', i === idx);
+  });
+
+  // Pan map to selected marker
+  const s = state.iaSuggestions[idx];
+  if (s) map.panTo([s.lat, s.lon]);
+}
+
+function _iaFinish() {
+  state.iaRunning   = false;
+  state.iaAbortCtrl = null;
+  checkReady();
+  // Hide progress bar after a short delay so users can see the final state
+  setTimeout(() => {
+    document.getElementById('ia-progress-container').classList.add('hidden');
+  }, 1500);
+}

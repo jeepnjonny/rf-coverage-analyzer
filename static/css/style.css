@@ -843,6 +843,98 @@ html, body {
   text-align: left;
 }
 
+/* ─── Infrastructure Advisor ─────────────────────────────── */
+
+.ia-results {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 4px;
+}
+
+.ia-item {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  cursor: pointer;
+  transition: border-color .15s;
+}
+.ia-item:hover        { border-color: var(--accent); }
+.ia-item.ia-selected  { border-color: var(--accent); background: rgba(79,142,247,0.08); }
+
+.ia-item-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ia-rank-badge {
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 3px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+
+.ia-tier-badge {
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+.ia-tier-badge.ia-tier-2 { color: #ffc107; border-color: #ffc107; }
+
+.ia-cov-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.ia-cov-label { color: var(--text-dim); flex-shrink: 0; min-width: 58px; }
+.ia-cov-pct   { font-weight: 600; min-width: 38px; }
+
+.ia-cov-bar-wrap { flex: 1; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.ia-cov-bar-fill { height: 100%; border-radius: 3px; }
+
+.ia-coords {
+  font-size: 10px;
+  font-family: monospace;
+  color: var(--text-dim);
+}
+
+/* Leaflet DivIcon markers for suggested infrastructure sites */
+.ia-marker {
+  width: 22px;
+  height: 22px;
+  background: #e67e00;
+  border: 2.5px solid #fff;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 1px 5px rgba(0,0,0,0.55);
+  transition: transform .1s, box-shadow .1s;
+}
+.ia-marker.ia-tier-2   { background: #b8860b; }
+.ia-marker.ia-selected {
+  transform: scale(1.2);
+  box-shadow: 0 0 0 4px rgba(230,126,0,0.45), 0 2px 8px rgba(0,0,0,0.5);
+}
+
 /* ─── Utilities ──────────────────────────────────────────── */
 
 .hidden { display: none !important; }
