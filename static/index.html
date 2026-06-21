@@ -164,6 +164,12 @@
         <label for="ia-use-existing" class="param-label">Account for existing receivers</label>
       </div>
 
+      <div style="display:flex;align-items:center;gap:8px;padding:2px 0 6px">
+        <input type="checkbox" id="ia-foot-trails">
+        <label for="ia-foot-trails" class="param-label hint-label"
+               title="Include OSM foot trails (path, footway, bridleway) as candidate locations. Useful for backcountry courses where summits are only reachable on foot. Adds more candidates but the 200-site cap and link-budget filter still apply.">Include foot trails <span class="hint-icon">?</span></label>
+      </div>
+
       <div style="display:flex;gap:6px">
         <button class="btn btn-primary" id="ia-run-btn" style="flex:1" disabled>▶ Suggest Locations</button>
         <button class="btn" id="ia-clear-btn" title="Clear results" style="padding:0 10px">✕</button>
