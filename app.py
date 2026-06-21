@@ -2318,6 +2318,7 @@ def greedy_set_cover(
     max_n: int,
     target_pct: float = 100.0,
     pre_covered: set[int] | None = None,
+    min_contribution_pct: float = 0.0,
 ) -> list[dict]:
     """Iteratively select the candidate with the best marginal coverage gain."""
     if not candidates or total_pts == 0:
@@ -2326,6 +2327,8 @@ def greedy_set_cover(
     remaining = [{**c, "covered_set": set(c["covered_set"])} for c in candidates]
     covered:  set[int]   = set(pre_covered) if pre_covered else set()
     selected: list[dict] = []
+    min_marginal_pts = max(1, math.ceil(min_contribution_pct / 100.0 * total_pts)) \
+                       if min_contribution_pct > 0 else 1
 
     for rank in range(1, max_n + 1):
         if len(covered) / total_pts * 100 >= target_pct:
@@ -2337,7 +2340,7 @@ def greedy_set_cover(
         best     = remaining.pop(0)
         marginal = best["covered_set"] - covered
 
-        if not marginal:
+        if len(marginal) < min_marginal_pts:
             break
 
         covered |= marginal
@@ -2374,9 +2377,10 @@ def suggest_locations():
     max_walk_m       = float(data.get("max_walk_m",           500))
     max_locations    = int(  data.get("max_locations",          5))
     target_cov_pct   = float(data.get("target_coverage_pct",  90))
-    tier_hint           = str(  data.get("tier_hint",         "wide1")).lower()
-    existing_receivers  = [r for r in data.get("receivers", [])
-                           if str(r.get("enabled", "1")) != "0"]
+    tier_hint              = str(  data.get("tier_hint",            "wide1")).lower()
+    min_contribution_pct   = float(data.get("min_contribution_pct",    1.0))
+    existing_receivers     = [r for r in data.get("receivers", [])
+                              if str(r.get("enabled", "1")) != "0"]
 
     def generate():
         try:
@@ -2629,6 +2633,7 @@ def suggest_locations():
             selected = greedy_set_cover(
                 scored, total_pts, max_locations, target_cov_pct,
                 pre_covered=pre_covered,
+                min_contribution_pct=min_contribution_pct,
             )
 
             for loc in selected:
