@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 from collections import OrderedDict
 import functools
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait as cf_wait
 from pathlib import Path
 
 import requests
@@ -2522,21 +2522,26 @@ def suggest_locations():
             futures = {pool.submit(score_candidate, a): a[0] for a in score_args}
             done_count  = 0
             skip_count  = 0
-            for fut in as_completed(futures):
-                try:
-                    result = fut.result(timeout=120)
-                except Exception as exc:
-                    skip_count += 1
-                    app.logger.warning("score_candidate failed: %s", exc)
-                    done_count += 1
+            pending = set(futures.keys())
+            while pending:
+                just_done, pending = cf_wait(pending, timeout=8)
+                if not just_done:
+                    # No futures finished in 8 s — yield keepalive to prevent proxy timeout
                     yield sse({"type": "scoring_progress",
                                "current": done_count, "total": n_cands})
                     continue
-                c = candidates[result["cand_idx"]]
-                result["tier"]    = c.get("tier", 1)
-                result["highway"] = c.get("highway", "")
-                scored.append(result)
-                done_count += 1
+                for fut in just_done:
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        skip_count += 1
+                        app.logger.warning("score_candidate failed: %s", exc)
+                    else:
+                        c = candidates[result["cand_idx"]]
+                        result["tier"]    = c.get("tier", 1)
+                        result["highway"] = c.get("highway", "")
+                        scored.append(result)
+                    done_count += 1
                 yield sse({"type": "scoring_progress",
                            "current": done_count, "total": n_cands})
 
