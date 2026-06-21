@@ -2502,9 +2502,13 @@ function _handleIaSSE(evt) {
       progressEl.textContent =
         `Done — ${evt.selected_count} location${evt.selected_count !== 1 ? 's' : ''}, ` +
         `${evt.final_coverage_pct}% coverage`;
-      statusEl.textContent = '';
-      if (state.iaSuggestions.length > 0)
+      if (evt.selected_count === 0) {
+        statusEl.textContent =
+          'No viable sites found. Try lower fade margin, higher TX power, or check that roads exist near the course.';
+      } else {
+        statusEl.textContent = '';
         document.getElementById('ia-import-btn').classList.remove('hidden');
+      }
       _iaFinish();
       break;
 
