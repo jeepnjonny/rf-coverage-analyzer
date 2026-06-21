@@ -2209,8 +2209,12 @@ def analyze():
 # Infrastructure Location Advisor — OSM helpers + greedy optimizer
 # ---------------------------------------------------------------------------
 
+FOOT_HIGHWAYS: frozenset[str] = frozenset({"path", "footway", "bridleway"})
+
+
 def fetch_osm_roads(lat_min: float, lat_max: float,
-                    lon_min: float, lon_max: float) -> list[dict]:
+                    lon_min: float, lon_max: float,
+                    include_foot_trails: bool = False) -> list[dict]:
     """Fetch road/trail polylines from the Overpass API for the bounding box."""
     query = (
         f"[out:json][timeout:60];"
@@ -2234,6 +2238,7 @@ def fetch_osm_roads(lat_min: float, lat_max: float,
     else:
         raise RuntimeError(f"Overpass API failed after 3 attempts: {last_exc}")
 
+    allowed = TIER1_HIGHWAYS | (FOOT_HIGHWAYS if include_foot_trails else frozenset())
     nodes: dict[int, tuple[float, float]] = {}
     ways_raw: list[dict] = []
     for el in elements:
@@ -2245,7 +2250,7 @@ def fetch_osm_roads(lat_min: float, lat_max: float,
     ways: list[dict] = []
     for way in ways_raw:
         hw = way.get("tags", {}).get("highway", "")
-        if hw not in TIER1_HIGHWAYS:
+        if hw not in allowed:
             continue
         pts = [nodes[nid] for nid in way.get("nodes", []) if nid in nodes]
         if len(pts) >= 2:
@@ -2410,6 +2415,7 @@ def suggest_locations():
     target_cov_pct   = float(data.get("target_coverage_pct",  90))
     tier_hint              = str(  data.get("tier_hint",            "wide1")).lower()
     min_contribution_pct   = float(data.get("min_contribution_pct",    1.0))
+    include_foot_trails    = bool( data.get("include_foot_trails",   False))
     existing_receivers     = [r for r in data.get("receivers", [])
                               if str(r.get("enabled", "1")) != "0"]
 
@@ -2524,7 +2530,8 @@ def suggest_locations():
             _osm_exc:    list = [None]
             def _do_osm():
                 try:
-                    _osm_result[0] = fetch_osm_roads(la_min, la_max, lo_min, lo_max)
+                    _osm_result[0] = fetch_osm_roads(la_min, la_max, lo_min, lo_max,
+                                                     include_foot_trails)
                 except Exception as e:
                     _osm_exc[0] = e
             osm_thread = threading.Thread(target=_do_osm, daemon=True)

@@ -2444,6 +2444,7 @@ function startInfraAdvisor() {
     target_coverage_pct:  parseFloat(document.getElementById('ia-target-pct').value) || 90,
     tier_hint:             document.getElementById('ia-tier-select').value || 'wide1',
     min_contribution_pct:  parseFloat(document.getElementById('ia-min-contrib').value) || 0,
+    include_foot_trails:   document.getElementById('ia-foot-trails').checked,
   };
   if (document.getElementById('ia-use-existing').checked && state.receivers.length) {
     params.receivers = state.receivers.filter(r => (r.enabled ?? '1') !== '0');
