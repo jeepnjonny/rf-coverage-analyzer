@@ -2423,13 +2423,27 @@ def suggest_locations():
             tile_thread.join()
             yield sse({"type": "elev_progress", "current": _prog[1], "total": _prog[1]})
 
-            # Fetch OSM road/trail network
+            # Fetch OSM road/trail network — run in a thread so we can keep
+            # yielding keepalive events and avoid proxy / browser timeouts.
             yield sse({"type": "status",
                        "message": "Fetching road/trail data from OpenStreetMap…"})
-            try:
-                ways = fetch_osm_roads(la_min, la_max, lo_min, lo_max)
-            except RuntimeError as exc:
-                yield sse({"type": "error", "message": str(exc)}); return
+            _osm_result: list = [None]
+            _osm_exc:    list = [None]
+            def _do_osm():
+                try:
+                    _osm_result[0] = fetch_osm_roads(la_min, la_max, lo_min, lo_max)
+                except Exception as e:
+                    _osm_exc[0] = e
+            osm_thread = threading.Thread(target=_do_osm, daemon=True)
+            osm_thread.start()
+            while osm_thread.is_alive():
+                yield sse({"type": "status",
+                           "message": "Fetching road/trail data from OpenStreetMap…"})
+                time.sleep(3)
+            osm_thread.join()
+            if _osm_exc[0]:
+                yield sse({"type": "error", "message": str(_osm_exc[0])}); return
+            ways = _osm_result[0]
 
             yield sse({"type": "osm_status",
                        "message": f"Found {len(ways)} road/trail segments. Generating candidates…",
@@ -2438,12 +2452,32 @@ def suggest_locations():
             # Tier-1: sample points along driveable roads
             tier1 = sample_road_candidates(ways, ROAD_SAMPLE_SPACING_M)
 
-            # Tier-2: elevated sites reachable by short hike from a road
+            # Tier-2: elevated sites reachable by short hike — run in thread
+            # so the keepalive yields prevent proxy timeouts during the scan.
             tier2: list[dict] = []
             if max_walk_m > 0 and tier1:
                 yield sse({"type": "status",
                            "message": "Scanning for elevated hike-accessible sites…"})
-                tier2 = find_highpoint_candidates(tier1, max_walk_m, HIGHPOINT_GRID_M)
+                _hp_result: list = [None]
+                _hp_exc:    list = [None]
+                def _do_hp():
+                    try:
+                        _hp_result[0] = find_highpoint_candidates(
+                            tier1, max_walk_m, HIGHPOINT_GRID_M)
+                    except Exception as e:
+                        _hp_exc[0] = e
+                hp_thread = threading.Thread(target=_do_hp, daemon=True)
+                hp_thread.start()
+                while hp_thread.is_alive():
+                    yield sse({"type": "status",
+                               "message": "Scanning for elevated hike-accessible sites…"})
+                    time.sleep(3)
+                hp_thread.join()
+                if _hp_exc[0]:
+                    app.logger.warning("Highpoint scan error: %s", _hp_exc[0])
+                    # Non-fatal: continue without Tier-2 candidates
+                else:
+                    tier2 = _hp_result[0] or []
 
             # Merge, deduplicate, cap
             seen_keys: set[tuple[float, float]] = set()
@@ -2472,8 +2506,9 @@ def suggest_locations():
             })
 
             # Parallel RF scoring via the analysis process pool
+            n_cands = len(candidates)
             yield sse({"type": "status",
-                       "message": "Scoring candidate sites via RF model…"})
+                       "message": f"Scoring {n_cands} candidate sites via RF model…"})
 
             score_args = [
                 (i, c["lat"], c["lon"], antenna_height_m,
@@ -2485,18 +2520,29 @@ def suggest_locations():
             scored: list[dict] = []
             pool = _get_analysis_pool()
             futures = {pool.submit(score_candidate, a): a[0] for a in score_args}
-            done_count = 0
+            done_count  = 0
+            skip_count  = 0
             for fut in as_completed(futures):
-                result = fut.result()
+                try:
+                    result = fut.result(timeout=120)
+                except Exception as exc:
+                    skip_count += 1
+                    app.logger.warning("score_candidate failed: %s", exc)
+                    done_count += 1
+                    yield sse({"type": "scoring_progress",
+                               "current": done_count, "total": n_cands})
+                    continue
                 c = candidates[result["cand_idx"]]
                 result["tier"]    = c.get("tier", 1)
                 result["highway"] = c.get("highway", "")
                 scored.append(result)
                 done_count += 1
-                if done_count % 5 == 0 or done_count == len(candidates):
-                    yield sse({"type": "scoring_progress",
-                               "current": done_count,
-                               "total":   len(candidates)})
+                yield sse({"type": "scoring_progress",
+                           "current": done_count, "total": n_cands})
+
+            if skip_count:
+                yield sse({"type": "status",
+                           "message": f"{skip_count} candidate(s) skipped due to scoring errors."})
 
             # Greedy set-cover to select the best combination
             yield sse({"type": "status",
