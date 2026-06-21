@@ -106,7 +106,10 @@
       <h3 class="panel-title">Infrastructure Advisor</h3>
 
       <div class="param-group">
-        <label class="param-label">Suggest Sites For</label>
+        <label class="param-label hint-label"
+               title="WIDE1 fill-in: samples points every 250 m along roads and short hikes (≤ max walk distance). Best for portable/temporary digipeaters that close coverage gaps. If WIDE2 or iGate receivers are already loaded, chain-aware scoring is applied automatically — only WIDE1 candidates that can also relay to a backbone receiver are kept.&#10;&#10;WIDE2 backbone: identical road/hike pool but elevation highpoints are scored first and given budget priority, favouring commanding hilltop positions with wide area coverage. Use this when placing permanent infrastructure.">
+          Suggest Sites For <span class="hint-icon">?</span>
+        </label>
         <select id="ia-tier-select" class="ctrl-select full-width">
           <option value="wide1">WIDE1 — fill-in (road / short hike)</option>
           <option value="wide2">WIDE2 — backbone (hilltop elevation)</option>
