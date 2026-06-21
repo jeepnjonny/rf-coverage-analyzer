@@ -149,12 +149,23 @@
         </div>
       </div>
 
+      <div class="param-group">
+        <label class="param-label">Min. Site Contribution</label>
+        <div class="param-row">
+          <input type="number" id="ia-min-contrib" class="ctrl-input" value="1" step="0.5" min="0" max="50" />
+          <span class="param-unit">%</span>
+        </div>
+      </div>
+
       <div style="display:flex;align-items:center;gap:8px;padding:2px 0 6px">
         <input type="checkbox" id="ia-use-existing" checked>
         <label for="ia-use-existing" class="param-label">Account for existing receivers</label>
       </div>
 
-      <button class="btn btn-primary btn-full" id="ia-run-btn" disabled>▶ Suggest Locations</button>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-primary" id="ia-run-btn" style="flex:1" disabled>▶ Suggest Locations</button>
+        <button class="btn" id="ia-clear-btn" title="Clear results" style="padding:0 10px">✕</button>
+      </div>
 
       <div id="ia-progress-container" class="hidden">
         <div class="progress-label" id="ia-progress-label">Initializing…</div>

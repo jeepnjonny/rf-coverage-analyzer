@@ -2468,7 +2468,8 @@ function startInfraAdvisor() {
     max_walk_m:           parseFloat(document.getElementById('ia-max-walk').value) || 500,
     max_locations:        parseInt(document.getElementById('ia-max-locs').value) || 5,
     target_coverage_pct:  parseFloat(document.getElementById('ia-target-pct').value) || 90,
-    tier_hint:            document.getElementById('ia-tier-select').value || 'wide1',
+    tier_hint:             document.getElementById('ia-tier-select').value || 'wide1',
+    min_contribution_pct:  parseFloat(document.getElementById('ia-min-contrib').value) || 0,
   };
   if (document.getElementById('ia-use-existing').checked && state.receivers.length) {
     params.receivers = state.receivers.filter(r => (r.enabled ?? '1') !== '0');
@@ -2605,6 +2606,14 @@ function _addIaMarker(suggestion, idx) {
   state.iaMarkers.push(marker);
 }
 
+function _renderIaResults() {
+  const container = document.getElementById('ia-results');
+  container.innerHTML = '';
+  state.iaSuggestions.forEach((s, i) => _appendIaResultItem(s, i));
+  container.classList.toggle('hidden', state.iaSuggestions.length === 0);
+  updateLegend();
+}
+
 function _appendIaResultItem(suggestion, idx) {
   const el = document.createElement('div');
   el.className = 'ia-item';
@@ -2618,6 +2627,8 @@ function _appendIaResultItem(suggestion, idx) {
       <span class="ia-rank-badge">#${suggestion.rank}</span>
       <span class="ia-tier-badge${suggestion.tier === 2 ? ' ia-tier-2' : ''}">${tierLabel}</span>
       <span style="flex:1;font-size:11px;color:var(--text-dim)">${suggestion.lat.toFixed(5)}, ${suggestion.lon.toFixed(5)}</span>
+      <button class="ia-action-btn ia-add-btn" title="Add this site to receivers" data-idx="${idx}">+</button>
+      <button class="ia-action-btn ia-del-btn" title="Remove this suggestion" data-idx="${idx}">🗑</button>
     </div>
     <div class="ia-cov-row">
       <span class="ia-cov-label">This site:</span>
@@ -2635,6 +2646,14 @@ function _appendIaResultItem(suggestion, idx) {
       </div>
     </div>
   `;
+  el.querySelector('.ia-add-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    _addSingleIaSuggestion(parseInt(e.currentTarget.dataset.idx));
+  });
+  el.querySelector('.ia-del-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    _deleteIaSuggestion(parseInt(e.currentTarget.dataset.idx));
+  });
   el.addEventListener('click', () => _selectIaSuggestion(idx));
   document.getElementById('ia-results').appendChild(el);
 }
@@ -2657,6 +2676,62 @@ function _selectIaSuggestion(idx) {
   if (s) map.panTo([s.lat, s.lon]);
 }
 
+function _deleteIaSuggestion(idx) {
+  if (state.iaMarkers[idx]) {
+    state.iaMarkerLayer.removeLayer(state.iaMarkers[idx]);
+  }
+  state.iaSuggestions.splice(idx, 1);
+  state.iaMarkers.splice(idx, 1);
+  _renderIaResults();
+  if (!state.iaSuggestions.length) {
+    document.getElementById('ia-import-btn').classList.add('hidden');
+  }
+}
+
+function _addSingleIaSuggestion(idx) {
+  const s    = state.iaSuggestions[idx];
+  if (!s) return;
+  const antH = parseFloat(document.getElementById('ia-ant-height').value) || 4;
+  const tier = document.getElementById('ia-tier-select').value || 'wide1';
+  const rx = {
+    name:             `Advisor-${s.rank}`,
+    latitude:         s.lat.toFixed(6),
+    longitude:        s.lon.toFixed(6),
+    height_agl_m:     String(antH),
+    antenna_gain_dbi: '0',
+    tx_power_dbm:     '22',
+    enabled:          '1',
+    role:             tier,
+  };
+  const rxIdx = state.receivers.length;
+  state.receivers.push(rx);
+  _addRxMarker(rx, rxIdx);
+  updateLegend();
+  setStatus(`Added ${rx.name} to receivers.`);
+  checkReady();
+}
+
+function _iaClear() {
+  if (state.iaRunning && state.iaAbortCtrl) {
+    state.iaAbortCtrl.abort();
+  }
+  state.iaMarkerLayer.clearLayers();
+  state.iaSuggestions = [];
+  state.iaMarkers     = [];
+  state.iaSelectedIdx = null;
+  state.iaRunning     = false;
+  state.iaAbortCtrl   = null;
+  document.getElementById('ia-results').innerHTML = '';
+  document.getElementById('ia-results').classList.add('hidden');
+  document.getElementById('ia-import-btn').classList.add('hidden');
+  document.getElementById('ia-progress-container').classList.add('hidden');
+  document.getElementById('ia-status-msg').textContent  = '';
+  document.getElementById('ia-progress-label').textContent = 'Initializing…';
+  document.getElementById('ia-progress-bar').style.width = '0%';
+  updateLegend();
+  checkReady();
+}
+
 function _iaFinish() {
   state.iaRunning   = false;
   state.iaAbortCtrl = null;
@@ -2668,6 +2743,7 @@ function _iaFinish() {
 }
 
 document.getElementById('ia-import-btn').addEventListener('click', _iaImportReceivers);
+document.getElementById('ia-clear-btn').addEventListener('click', _iaClear);
 
 async function _iaImportReceivers() {
   if (!state.iaSuggestions.length) return;

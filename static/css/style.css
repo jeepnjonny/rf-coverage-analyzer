@@ -888,6 +888,15 @@ html, body {
 .ia-item:hover        { border-color: var(--accent); }
 .ia-item.ia-selected  { border-color: var(--accent); background: rgba(79,142,247,0.08); }
 
+.ia-action-btn {
+  background: none; border: none; cursor: pointer; padding: 1px 4px;
+  border-radius: 3px; font-size: 12px; line-height: 1; flex-shrink: 0;
+  opacity: 0.5; transition: opacity .15s, background .15s;
+}
+.ia-action-btn:hover { opacity: 1; }
+.ia-add-btn:hover { background: rgba(76,175,125,0.18); color: var(--success); }
+.ia-del-btn:hover { background: rgba(224,82,82,0.15); color: var(--danger); }
+
 .ia-item-header {
   display: flex;
   align-items: center;
