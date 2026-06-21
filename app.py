@@ -946,7 +946,8 @@ TIER1_HIGHWAYS: set[str] = {
     "residential", "unclassified", "service", "track",
 }
 ROAD_SAMPLE_SPACING_M  = 250   # metres between sampled road candidates
-MAX_CANDIDATES         = 200   # hard cap on total candidates sent to RF scoring
+MAX_CANDIDATES         = 200   # hard cap on candidates sent to full RF scoring
+RAW_CANDIDATES_CAP     = 1000  # raw pool size before FSPL pre-filter
 HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
 
 # ---------------------------------------------------------------------------
@@ -2516,10 +2517,9 @@ def suggest_locations():
                 else:
                     tier2 = _hp_result[0] or []
 
-            # Merge, deduplicate, cap.
-            # For WIDE2 (backbone) mode: put tier2 elevation highpoints first so they
-            # fill the MAX_CANDIDATES budget before lower road points; also sort by
-            # descending elevation so the tallest hilltops are scored first.
+            # Merge and deduplicate into raw pool (up to RAW_CANDIDATES_CAP).
+            # For WIDE2 mode put elevation highpoints first so they fill the budget
+            # before lower road points.
             if tier_hint == "wide2":
                 tier2_sorted = sorted(tier2, key=lambda c: c.get("elev_m", 0), reverse=True)
                 merged_order = tier2_sorted + tier1
@@ -2532,6 +2532,35 @@ def suggest_locations():
                 if k not in seen_keys:
                     seen_keys.add(k)
                     candidates.append(c)
+                if len(candidates) >= RAW_CANDIDATES_CAP:
+                    break
+
+            # FSPL-based range pre-filter — cheap haversine pass to drop candidates
+            # that are too far from every track point to ever close the link budget,
+            # even under ideal free-space conditions.  Runs in milliseconds and
+            # lets us draw from a 1000-candidate raw pool while only passing the
+            # spatially relevant subset to the expensive terrain/diffraction model.
+            fspl_budget_db = (tx_power_dbm + tx_gain_dbi
+                              - sensitivity_dbm - fade_margin_db)
+            try:
+                max_range_m = (10 ** ((fspl_budget_db - 32.44
+                                       - 20 * math.log10(freq_mhz)) / 20)) * 1000.0
+            except (ValueError, ZeroDivisionError):
+                max_range_m = float("inf")
+
+            if math.isfinite(max_range_m):
+                raw_count = len(candidates)
+                candidates = [
+                    c for c in candidates
+                    if any(haversine(c["lat"], c["lon"], tp[0], tp[1]) <= max_range_m
+                           for tp in track_pts)
+                ]
+                removed = raw_count - len(candidates)
+                if removed:
+                    yield sse({"type": "status",
+                               "message": (f"Range pre-filter: {removed} out-of-range "
+                                           f"candidates removed, {len(candidates)} remain.")})
+
             candidates = candidates[:MAX_CANDIDATES]
 
             if not candidates:
