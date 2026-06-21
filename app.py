@@ -2305,7 +2305,8 @@ def find_highpoint_candidates(
             if key not in seen:
                 seen.add(key)
                 candidates.append({"lat": best_la, "lon": best_lo,
-                                    "tier": 2, "highway": "highpoint"})
+                                    "tier": 2, "highway": "highpoint",
+                                    "elev_m": best_elev})
 
     return candidates
 
@@ -2371,6 +2372,7 @@ def suggest_locations():
     max_walk_m       = float(data.get("max_walk_m",           500))
     max_locations    = int(  data.get("max_locations",          5))
     target_cov_pct   = float(data.get("target_coverage_pct",  90))
+    tier_hint        = str(  data.get("tier_hint",         "wide1")).lower()
 
     def generate():
         try:
@@ -2479,10 +2481,18 @@ def suggest_locations():
                 else:
                     tier2 = _hp_result[0] or []
 
-            # Merge, deduplicate, cap
+            # Merge, deduplicate, cap.
+            # For WIDE2 (backbone) mode: put tier2 elevation highpoints first so they
+            # fill the MAX_CANDIDATES budget before lower road points; also sort by
+            # descending elevation so the tallest hilltops are scored first.
+            if tier_hint == "wide2":
+                tier2_sorted = sorted(tier2, key=lambda c: c.get("elev_m", 0), reverse=True)
+                merged_order = tier2_sorted + tier1
+            else:
+                merged_order = tier1 + tier2
             seen_keys: set[tuple[float, float]] = set()
             candidates: list[dict] = []
-            for c in tier1 + tier2:
+            for c in merged_order:
                 k = (round(c["lat"], 4), round(c["lon"], 4))
                 if k not in seen_keys:
                     seen_keys.add(k)

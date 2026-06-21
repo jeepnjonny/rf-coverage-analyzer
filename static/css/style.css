@@ -129,6 +129,14 @@ html, body {
   letter-spacing: .08em; color: var(--text-dim); margin-bottom: 6px; }
 .legend-entry { display: flex; align-items: center; gap: 7px; font-size: 12px; margin: 3px 0; }
 .legend-swatch { width: 14px; height: 8px; border-radius: 3px; flex-shrink: 0; }
+/* Marker-shape swatches in legend */
+.legend-marker { width: 14px; height: 14px; flex-shrink: 0; border: 2px solid currentColor; box-sizing: border-box; }
+.legend-marker.lm-circle  { border-radius: 50%; }
+.legend-marker.lm-diamond { clip-path: polygon(50% 0%,100% 50%,50% 100%,0% 50%); border-radius: 0; }
+.legend-marker.lm-square  { border-radius: 3px; }
+.legend-marker.lm-ia      { border-radius: 3px; background: #f57c00; border-color: #f57c00; color: #fff;
+  font-size: 9px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+.legend-sep { height: 1px; background: var(--border); margin: 6px 0; }
 
 /* ─── Bottom bar ─────────────────────────────────────────── */
 
@@ -439,6 +447,11 @@ html, body {
   border-radius: 3px; color: var(--text); padding: 3px 5px; font-size: 12px;
 }
 .editor-input:focus { outline: none; border-color: var(--accent); background: var(--bg); }
+.editor-select {
+  width: 100%; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 3px; color: var(--text); padding: 3px 4px; font-size: 12px;
+}
+.editor-select:focus { outline: none; border-color: var(--accent); }
 .del-row-btn {
   background: none; border: none; color: var(--danger); cursor: pointer; font-size: 14px; padding: 2px 5px;
 }

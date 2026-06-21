@@ -49,8 +49,8 @@
         <label class="param-label">Frequency</label>
         <select id="freq-select" class="ctrl-select full-width">
           <option value="144">144 MHz (2m VHF)</option>
-          <option value="433">433 MHz (70cm UHF)</option>
-          <option value="915" selected>915 MHz (33cm UHF)</option>
+          <option value="433" selected>433 MHz (70cm UHF / LoRa APRS)</option>
+          <option value="915">915 MHz (33cm UHF)</option>
         </select>
       </div>
 
@@ -230,6 +230,9 @@
 
       <!-- Signal panel — shown on mousemove when path results exist -->
       <div class="map-signal-panel hidden" id="map-signal-panel"></div>
+
+      <!-- Map legend -->
+      <div class="map-legend" id="map-legend"></div>
     </main>
 
     <!-- Bottom bar -->
