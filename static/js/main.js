@@ -574,6 +574,17 @@ function renderFmEditorTable() {
         td.style.textAlign = 'center';
         cb.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.checked ? '1' : '0'; });
         td.appendChild(cb);
+      } else if (col === 'role') {
+        const sel = document.createElement('select');
+        sel.className = 'editor-select';
+        [['wide1', 'WIDE1 fill-in'], ['wide2', 'WIDE2 backbone'], ['igate', 'iGate']].forEach(([v, label]) => {
+          const opt = document.createElement('option');
+          opt.value = v; opt.textContent = label;
+          if ((row[col] || 'wide1') === v) opt.selected = true;
+          sel.appendChild(opt);
+        });
+        sel.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.value; });
+        td.appendChild(sel);
       } else {
         const inp = document.createElement('input');
         inp.className = 'editor-input'; inp.value = row[col] ?? '';
@@ -928,7 +939,39 @@ async function updateReceiverPosition(rxIdx, lat, lon, markerObj) {
   }
 }
 
-function updateLegend() { /* legend removed — receivers identified by marker color */ }
+function updateLegend() {
+  const el = document.getElementById('map-legend');
+  if (!el) return;
+  const hasRx       = state.receivers && state.receivers.length > 0;
+  const hasCoverage = state.pathResults && state.pathResults.length > 0;
+  const hasIa       = state.iaSuggestions && state.iaSuggestions.length > 0;
+  if (!hasRx && !hasCoverage && !hasIa) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const lines = [];
+  if (hasRx) {
+    lines.push('<div class="legend-title">Receivers</div>');
+    const roles = new Set(state.receivers.map(r => _rxRole(r)));
+    if (roles.has('wide1'))
+      lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#4f8ef7;background:rgba(79,142,247,0.25)"></div><span>WIDE1 fill-in</span></div>');
+    if (roles.has('wide2'))
+      lines.push('<div class="legend-entry"><div class="legend-marker lm-diamond" style="color:#4f8ef7;background:rgba(79,142,247,0.25)"></div><span>WIDE2 backbone</span></div>');
+    if (roles.has('igate'))
+      lines.push('<div class="legend-entry"><div class="legend-marker lm-square" style="color:#4f8ef7;background:rgba(79,142,247,0.25)"></div><span>iGate</span></div>');
+  }
+  if (hasCoverage) {
+    if (hasRx) lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-title">Track Coverage</div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#4caf7d"></div><span>Covered</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#e05252"></div><span>Not covered</span></div>');
+  }
+  if (hasIa) {
+    if (hasRx || hasCoverage) lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-title">Suggested Sites</div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-ia">1</div><span>Road (Tier 1)</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-ia" style="background:#ff8f00;border-color:#ff8f00">1</div><span>Hilltop (Tier 2)</span></div>');
+  }
+  el.innerHTML = lines.join('');
+}
 
 function checkReady() {
   const trackBtn = document.getElementById('analyze-track-btn');
@@ -2425,6 +2468,7 @@ function startInfraAdvisor() {
     max_walk_m:           parseFloat(document.getElementById('ia-max-walk').value) || 500,
     max_locations:        parseInt(document.getElementById('ia-max-locs').value) || 5,
     target_coverage_pct:  parseFloat(document.getElementById('ia-target-pct').value) || 90,
+    tier_hint:            document.getElementById('ia-tier-select').value || 'wide1',
   };
 
   fetch('/api/suggest-locations', {
@@ -2494,6 +2538,7 @@ function _handleIaSSE(evt) {
       _appendIaResultItem(evt, state.iaSuggestions.length - 1);
       document.getElementById('ia-results').classList.remove('hidden');
       barEl.style.width = `${85 + (evt.rank / Math.max(evt.rank + 1, 2)) * 12}%`;
+      updateLegend();
       break;
     }
 
