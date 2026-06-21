@@ -2316,13 +2316,14 @@ def greedy_set_cover(
     total_pts: int,
     max_n: int,
     target_pct: float = 100.0,
+    pre_covered: set[int] | None = None,
 ) -> list[dict]:
     """Iteratively select the candidate with the best marginal coverage gain."""
     if not candidates or total_pts == 0:
         return []
 
     remaining = [{**c, "covered_set": set(c["covered_set"])} for c in candidates]
-    covered:  set[int]   = set()
+    covered:  set[int]   = set(pre_covered) if pre_covered else set()
     selected: list[dict] = []
 
     for rank in range(1, max_n + 1):
@@ -2372,7 +2373,9 @@ def suggest_locations():
     max_walk_m       = float(data.get("max_walk_m",           500))
     max_locations    = int(  data.get("max_locations",          5))
     target_cov_pct   = float(data.get("target_coverage_pct",  90))
-    tier_hint        = str(  data.get("tier_hint",         "wide1")).lower()
+    tier_hint           = str(  data.get("tier_hint",         "wide1")).lower()
+    existing_receivers  = [r for r in data.get("receivers", [])
+                           if str(r.get("enabled", "1")) != "0"]
 
     def generate():
         try:
@@ -2424,6 +2427,38 @@ def suggest_locations():
                 time.sleep(0.6)
             tile_thread.join()
             yield sse({"type": "elev_progress", "current": _prog[1], "total": _prog[1]})
+
+            # Pre-score existing receivers so greedy set-cover only fills gaps
+            pre_covered: set[int] = set()
+            if existing_receivers:
+                yield sse({"type": "status",
+                           "message": f"Scoring {len(existing_receivers)} existing receiver(s)…"})
+                pre_args = [
+                    (i, float(r["latitude"]), float(r["longitude"]),
+                     float(r.get("height_agl_m") or 2),
+                     track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+                     sensitivity_dbm, veg_type, fade_margin_db)
+                    for i, r in enumerate(existing_receivers)
+                ]
+                pool = _get_analysis_pool()
+                pre_pending = {pool.submit(score_candidate, a) for a in pre_args}
+                while pre_pending:
+                    just_done, pre_pending = cf_wait(pre_pending, timeout=8)
+                    if not just_done:
+                        yield sse({"type": "status",
+                                   "message": f"Scoring {len(existing_receivers)} existing receiver(s)…"})
+                        continue
+                    for fut in just_done:
+                        try:
+                            res = fut.result()
+                            pre_covered |= set(res["covered_set"])
+                        except Exception as exc:
+                            app.logger.warning("pre-score failed: %s", exc)
+                yield sse({
+                    "type":           "existing_coverage",
+                    "coverage_pct":   round(len(pre_covered) / total_pts * 100, 1),
+                    "receiver_count": len(existing_receivers),
+                })
 
             # Fetch OSM road/trail network — run in a thread so we can keep
             # yielding keepalive events and avoid proxy / browser timeouts.
@@ -2562,18 +2597,24 @@ def suggest_locations():
             # Greedy set-cover to select the best combination
             yield sse({"type": "status",
                        "message": "Selecting optimal location combination…"})
-            selected = greedy_set_cover(scored, total_pts, max_locations, target_cov_pct)
+            selected = greedy_set_cover(
+                scored, total_pts, max_locations, target_cov_pct,
+                pre_covered=pre_covered,
+            )
 
             for loc in selected:
                 yield sse({"type": "suggestion", **loc})
 
-            final_pct = selected[-1]["cumulative_pct"] if selected else 0.0
+            final_pct    = selected[-1]["cumulative_pct"] if selected else \
+                           round(len(pre_covered) / total_pts * 100, 1)
+            existing_pct = round(len(pre_covered) / total_pts * 100, 1)
             yield sse({
-                "type":               "complete",
-                "selected_count":     len(selected),
-                "total_candidates":   len(candidates),
-                "final_coverage_pct": final_pct,
-                "locations":          selected,
+                "type":                  "complete",
+                "selected_count":        len(selected),
+                "total_candidates":      len(candidates),
+                "final_coverage_pct":    final_pct,
+                "existing_coverage_pct": existing_pct,
+                "locations":             selected,
             })
 
         except GeneratorExit:
