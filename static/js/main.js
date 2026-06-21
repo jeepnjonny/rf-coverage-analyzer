@@ -2662,7 +2662,7 @@ function _deleteIaSuggestion(idx) {
   }
 }
 
-function _addSingleIaSuggestion(idx) {
+async function _addSingleIaSuggestion(idx) {
   const s    = state.iaSuggestions[idx];
   if (!s) return;
   const antH = parseFloat(document.getElementById('ia-ant-height').value) || 4;
@@ -2681,8 +2681,62 @@ function _addSingleIaSuggestion(idx) {
   state.receivers.push(rx);
   _addRxMarker(rx, rxIdx);
   updateLegend();
-  setStatus(`Added ${rx.name} to receivers.`);
   checkReady();
+
+  const csvRows = state.receivers;
+
+  if (state.csvFile) {
+    showTransferSpinner(`Saving ${state.csvFile}…`);
+    try {
+      const res  = await fetch(`/api/csv/${encodeURIComponent(state.csvFile)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rows: csvRows }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        fm.editorFile = state.csvFile;
+        fm.editorRows = csvRows.map(r => ({ ...r }));
+        setStatus(`Added ${rx.name} to receivers and saved to ${state.csvFile}.`);
+      } else {
+        setStatus(`${rx.name} added to map — CSV save failed.`);
+      }
+    } catch (err) {
+      setStatus(`${rx.name} added to map — save error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
+    }
+  } else {
+    showTransferSpinner('Creating receivers CSV…');
+    try {
+      const lines = [CSV_COLS.join(',')];
+      csvRows.forEach(row => {
+        lines.push(CSV_COLS.map(c => {
+          const v = String(row[c] ?? '');
+          return v.includes(',') ? `"${v.replace(/"/g, '""')}"` : v;
+        }).join(','));
+      });
+      const ts       = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+      const filename = `advisor-${ts}.csv`;
+      const blob     = new Blob([lines.join('\n')], { type: 'text/csv' });
+      const fd       = new FormData();
+      fd.append('file', new File([blob], filename, { type: 'text/csv' }));
+      const res  = await fetch('/api/upload/csv', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.filename) {
+        state.csvFile  = data.filename;
+        fm.editorFile  = data.filename;
+        fm.editorRows  = csvRows.map(r => ({ ...r }));
+        fm.selCsv      = data.filename;
+        await loadFmFiles();
+        updateSidebarBtns();
+        setStatus(`Added ${rx.name} — created ${data.filename}.`);
+      }
+    } catch (err) {
+      setStatus(`${rx.name} added to map — CSV create error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
+    }
+  }
 }
 
 function _iaClear() {
