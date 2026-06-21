@@ -1839,13 +1839,19 @@ def score_candidate(args: tuple) -> dict:
     Module-level (picklable) so it can run inside ProcessPoolExecutor workers.
     Uses the same RF pipeline as _point_task but treats the candidate as the
     fixed infrastructure and each track point as the mobile device.
+
+    If backbone_pts is provided (12th element), the candidate is only credited
+    with coverage if it can also relay to at least one backbone receiver via a
+    viable RF link — enforcing the APRS WIDE1→WIDE2/iGate chain requirement.
     """
     (cand_idx, cand_lat, cand_lon, cand_height_agl,
      track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
-     sensitivity_dbm, veg_type, fade_margin_db) = args
+     sensitivity_dbm, veg_type, fade_margin_db,
+     backbone_pts) = args   # backbone_pts: tuple of (lat,lon,height) or None
 
     TRACKER_H = 1.5
-    rx_total  = _get_elev(cand_lat, cand_lon) + cand_height_agl
+    rx_elev   = _get_elev(cand_lat, cand_lon)
+    rx_total  = rx_elev + cand_height_agl
     covered: list[int] = []
 
     for idx, (plat, plon) in enumerate(track_pts):
@@ -1865,13 +1871,38 @@ def score_candidate(args: tuple) -> dict:
             covered.append(idx)
 
     total = len(track_pts)
-    return {
+    base  = {
         "cand_idx":    cand_idx,
         "covered_set": covered,
         "coverage_pct": round(len(covered) / total * 100, 1) if total else 0.0,
         "lat":          cand_lat,
         "lon":          cand_lon,
     }
+
+    # Chain check: WIDE1 candidate must also reach at least one WIDE2/iGate
+    if backbone_pts and covered:
+        can_relay = False
+        for (blat, blon, bh) in backbone_pts:
+            b_total = _get_elev(blat, blon) + bh
+            profile_b, dist_b = _terrain_profile_cached(
+                _rc(cand_lat), _rc(cand_lon), _rc(blat), _rc(blon)
+            )
+            diff_b = deygout_loss_db(profile_b, rx_total, b_total, dist_b, freq_mhz)
+            if diff_b >= HARD_FAIL_DB:
+                continue
+            veg_b  = vegetation_loss_db(profile_b, rx_total, b_total, dist_b, freq_mhz, veg_type)
+            if veg_b >= HARD_FAIL_DB:
+                continue
+            rssi_b = tx_power_dbm + tx_gain_dbi - fspl_db(freq_mhz, dist_b) - diff_b - veg_b
+            if rssi_b >= (sensitivity_dbm + fade_margin_db):
+                can_relay = True
+                break
+        if not can_relay:
+            base["covered_set"]   = []
+            base["coverage_pct"]  = 0.0
+            base["backbone_blocked"] = True
+
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -2384,6 +2415,20 @@ def suggest_locations():
 
     def generate():
         try:
+            # Determine backbone anchors for chain-aware WIDE1 scoring
+            backbone_pts: tuple | None = None
+            if tier_hint == "wide1" and existing_receivers:
+                backbone_rxs = [
+                    r for r in existing_receivers
+                    if str(r.get("role", "wide1")).lower() in ("wide2", "igate")
+                ]
+                if backbone_rxs:
+                    backbone_pts = tuple(
+                        (_rc(float(r["latitude"])), _rc(float(r["longitude"])),
+                         float(r.get("height_agl_m") or 4))
+                        for r in backbone_rxs
+                    )
+
             yield sse({"type": "status", "message": "Parsing track file…"})
 
             if not kml_file:
@@ -2442,7 +2487,8 @@ def suggest_locations():
                     (i, float(r["latitude"]), float(r["longitude"]),
                      float(r.get("height_agl_m") or 2),
                      track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
-                     sensitivity_dbm, veg_type, fade_margin_db)
+                     sensitivity_dbm, veg_type, fade_margin_db,
+                     None)   # no backbone check for existing receivers
                     for i, r in enumerate(existing_receivers)
                 ]
                 pool = _get_analysis_pool()
@@ -2585,13 +2631,23 @@ def suggest_locations():
 
             # Parallel RF scoring via the analysis process pool
             n_cands = len(candidates)
-            yield sse({"type": "status",
-                       "message": f"Scoring {n_cands} candidate sites via RF model…"})
+            if backbone_pts:
+                yield sse({"type": "status",
+                           "message": (f"Chain mode: {len(backbone_pts)} backbone anchor(s) found — "
+                                       f"scoring {n_cands} WIDE1 candidates for relay viability…")})
+            elif tier_hint == "wide1" and existing_receivers and not backbone_pts:
+                yield sse({"type": "status",
+                           "message": (f"No WIDE2/iGate receivers loaded — "
+                                       f"scoring {n_cands} candidates for direct coverage only.")})
+            else:
+                yield sse({"type": "status",
+                           "message": f"Scoring {n_cands} candidate sites via RF model…"})
 
             score_args = [
                 (i, c["lat"], c["lon"], antenna_height_m,
                  track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
-                 sensitivity_dbm, veg_type, fade_margin_db)
+                 sensitivity_dbm, veg_type, fade_margin_db,
+                 backbone_pts)
                 for i, c in enumerate(candidates)
             ]
 

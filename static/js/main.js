@@ -1014,32 +1014,6 @@ document.getElementById('analyze-links-btn').addEventListener('click', () => {
   else startAnalysis('links');
 });
 
-// ---------------------------------------------------------------------------
-// Map PNG download
-// ---------------------------------------------------------------------------
-
-document.getElementById('download-map-btn').addEventListener('click', async () => {
-  const btn = document.getElementById('download-map-btn');
-  btn.textContent = '…';
-  btn.disabled = true;
-  try {
-    const canvas = await html2canvas(document.getElementById('map'), {
-      useCORS:    true,
-      allowTaint: false,
-      logging:    false,
-      scale:      window.devicePixelRatio || 1,
-    });
-    const a = document.createElement('a');
-    a.download = `rf-coverage-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.png`;
-    a.href = canvas.toDataURL('image/png');
-    a.click();
-  } catch (err) {
-    alert(`Screenshot failed: ${err.message}\nTry switching to USGS Topo basemap (supports CORS).`);
-  } finally {
-    btn.textContent = '⬇ PNG';
-    btn.disabled = false;
-  }
-});
 
 function startAnalysis(mode, opts = {}) {
   if (state.analysisRunning) return;
