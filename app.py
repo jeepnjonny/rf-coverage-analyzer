@@ -2493,11 +2493,13 @@ def suggest_locations():
                 ]
                 pool = _get_analysis_pool()
                 pre_pending = {pool.submit(score_candidate, a) for a in pre_args}
+                n_pre = len(existing_receivers)
+                pre_done_count = 0
                 while pre_pending:
                     just_done, pre_pending = cf_wait(pre_pending, timeout=8)
                     if not just_done:
                         yield sse({"type": "status",
-                                   "message": f"Scoring {len(existing_receivers)} existing receiver(s)…"})
+                                   "message": f"Scoring existing receivers… {pre_done_count}/{n_pre}"})
                         continue
                     for fut in just_done:
                         try:
@@ -2505,6 +2507,9 @@ def suggest_locations():
                             pre_covered |= set(res["covered_set"])
                         except Exception as exc:
                             app.logger.warning("pre-score failed: %s", exc)
+                        pre_done_count += 1
+                    yield sse({"type": "status",
+                               "message": f"Scoring existing receivers… {pre_done_count}/{n_pre}"})
                 yield sse({
                     "type":           "existing_coverage",
                     "coverage_pct":   round(len(pre_covered) / total_pts * 100, 1),
