@@ -1111,7 +1111,7 @@ GPX_NS = [
     "",
 ]
 
-CSV_COLUMNS = ["name", "longitude", "latitude", "height_agl_m", "antenna_gain_dbi", "tx_power_dbm", "enabled"]
+CSV_COLUMNS = ["name", "longitude", "latitude", "height_agl_m", "antenna_gain_dbi", "tx_power_dbm", "enabled", "role"]
 
 
 def _parse_coord_text(text: str) -> list[tuple[float, float]]:
@@ -1753,7 +1753,8 @@ def _point_task(args: tuple) -> dict:
     """Compute RF coverage for one path point against all receivers. Designed to run in a thread pool."""
     (idx, plat, plon, receivers,
      freq_mhz, tx_power_dbm, tx_gain_dbi,
-     sensitivity_dbm, veg_type, fade_margin_db) = args
+     sensitivity_dbm, veg_type, fade_margin_db,
+     chain_mode, viable_w1_idxs) = args
 
     TRACKER_H = 1.5
     t_total   = _get_elev(plat, plon) + TRACKER_H
@@ -1799,6 +1800,26 @@ def _point_task(args: tuple) -> dict:
 
     covered      = best_rx_idx >= 0
     pt_hard_fail = overall_hard_fail and not covered
+
+    # In APRS chain mode a point is covered only when the full uplink path exists:
+    # tracker → WIDE1 (that has a verified backbone link to a WIDE2/iGate)
+    #        OR tracker → WIDE2/iGate directly (WIDE2-2 alias path)
+    if chain_mode:
+        chain_best_rssi = float("-inf")
+        chain_best_rx   = -1
+        for rr in rx_results:
+            if rr["hard_fail"]: continue
+            if rr["rssi"] < (sensitivity_dbm + fade_margin_db): continue
+            rx_role = str(receivers[rr["rx_idx"]].get("role", "wide1")).lower()
+            viable  = (rr["rx_idx"] in viable_w1_idxs) or rx_role in ("wide2", "igate")
+            if viable and rr["rssi"] > chain_best_rssi:
+                chain_best_rssi = rr["rssi"]
+                chain_best_rx   = rr["rx_idx"]
+        covered      = chain_best_rx >= 0
+        pt_hard_fail = overall_hard_fail and not covered
+        best_rx_idx  = chain_best_rx
+        best_rssi    = chain_best_rssi
+
     return {
         "idx":         idx,
         "lat":         plat,
@@ -1868,6 +1889,7 @@ def analyze():
     veg_type         = data.get("veg_type",                "none")  # vegetation class
     fade_margin_db   = float(data.get("fade_margin_db",       0))   # extra link margin required
     mode             = data.get("mode", "both")   # "track" | "links" | "both"
+    chain_mode       = bool(data.get("chain_mode", False))
     # Client may send receivers directly so the server always sees the live UI state
     # (enabled/disabled, dragged positions) without requiring an explicit CSV save first.
     body_receivers   = data.get("receivers")       # list[dict] | None
@@ -2010,8 +2032,16 @@ def analyze():
                 api_thread.join()
 
             # ---- Inter-receiver analysis ----
-            if mode in ("links", "both"):
-                yield sse({"type": "status", "message": "Analyzing inter-receiver links…"})
+            # Always run when mode includes "links"/"both", OR when chain_mode is on
+            # (need link results to determine which WIDE1s have backbone to WIDE2/iGate).
+            link_results_cache: list[dict] = []
+            if mode in ("links", "both") or chain_mode:
+                status_msg = (
+                    "Building APRS backbone map for chain analysis…"
+                    if chain_mode and mode not in ("links", "both")
+                    else "Analyzing inter-receiver links…"
+                )
+                yield sse({"type": "status", "message": status_msg})
                 link_args = [
                     (i, rx1, j, rx2, freq_mhz, sensitivity_dbm, fade_margin_db, veg_type)
                     for i, rx1 in enumerate(receivers)
@@ -2022,7 +2052,33 @@ def analyze():
                 pool = _get_analysis_pool()
                 chunksize = max(1, len(link_args) // (_POOL_WORKERS * 4)) if link_args else 1
                 for result in pool.map(_link_task, link_args, chunksize=chunksize):
-                    yield sse(result)
+                    link_results_cache.append(result)
+                    if mode in ("links", "both"):
+                        yield sse(result)
+
+            # Build the set of WIDE1 receivers with a viable backbone link to a WIDE2/iGate.
+            # Used by _point_task when chain_mode is True.
+            viable_w1_idxs: frozenset[int] = frozenset()
+            if chain_mode:
+                _w1: set[int] = set()
+                for _res in link_results_cache:
+                    if not _res.get("good_link"):
+                        continue
+                    _r1 = str(receivers[_res["rx1_idx"]].get("role", "wide1")).lower()
+                    _r2 = str(receivers[_res["rx2_idx"]].get("role", "wide1")).lower()
+                    if _r1 == "wide1" and _r2 in ("wide2", "igate"):
+                        _w1.add(_res["rx1_idx"])
+                    if _r2 == "wide1" and _r1 in ("wide2", "igate"):
+                        _w1.add(_res["rx2_idx"])
+                viable_w1_idxs = frozenset(_w1)
+                if not any(
+                    str(rx.get("role", "wide1")).lower() in ("wide2", "igate")
+                    for rx in receivers
+                    if str(rx.get("enabled", "1")).strip() != "0"
+                ):
+                    yield sse({"type": "status",
+                               "message": "⚠ Chain mode: no WIDE2 or iGate receivers found — "
+                                          "add receivers with role=wide2 or role=igate in the CSV."})
 
             # ---- Per-path-point RF analysis ----
             if mode in ("track", "both"):
@@ -2040,7 +2096,8 @@ def analyze():
                 point_args = [
                     (idx, plat, plon, receivers,
                      freq_mhz, tx_power_dbm, tx_gain_dbi,
-                     sensitivity_dbm, veg_type, fade_margin_db)
+                     sensitivity_dbm, veg_type, fade_margin_db,
+                     chain_mode, viable_w1_idxs)
                     for idx, (plat, plon) in enumerate(path_pts)
                 ]
 
@@ -2090,12 +2147,14 @@ def analyze():
                 yield sse({
                     "type":               "complete",
                     "mode":               mode,
+                    "chain_mode":         chain_mode,
                     "stats":              stats,
                     "total_coverage_pct": round(total_covered / total_pts * 100, 1) if total_pts else 0,
                 })
             else:
                 # Links-only: no coverage stats to report
-                yield sse({"type": "complete", "mode": mode, "stats": [], "total_coverage_pct": 0})
+                yield sse({"type": "complete", "mode": mode, "chain_mode": chain_mode,
+                           "stats": [], "total_coverage_pct": 0})
 
         except GeneratorExit:
             pass

@@ -107,6 +107,14 @@
       <h3 class="panel-title">Infrastructure Advisor</h3>
 
       <div class="param-group">
+        <label class="param-label">Suggest Sites For</label>
+        <select id="ia-tier-select" class="ctrl-select full-width">
+          <option value="wide1">WIDE1 — fill-in (road / short hike)</option>
+          <option value="wide2">WIDE2 — backbone (hilltop elevation)</option>
+        </select>
+      </div>
+
+      <div class="param-group">
         <label class="param-label hint-label" title="Antenna height above ground at each suggested infrastructure site. Taller is better for RF but may require a mast.">
           Antenna Height AGL <span class="hint-icon">?</span>
         </label>
@@ -152,9 +160,22 @@
       <div class="status-msg" id="ia-status-msg"></div>
 
       <div id="ia-results" class="ia-results hidden"></div>
+      <button class="btn btn-full hidden" id="ia-import-btn"
+              style="margin-top:8px;background:var(--success);color:#fff;border-color:var(--success)">
+        + Add to Receivers
+      </button>
     </section>
 
     <section class="panel">
+      <div style="display:flex;align-items:center;gap:8px;padding:2px 0 6px">
+        <input type="checkbox" id="chain-mode-toggle"
+               style="width:14px;height:14px;cursor:pointer;flex-shrink:0;accent-color:var(--accent)">
+        <label for="chain-mode-toggle" class="param-label hint-label"
+               style="margin:0;cursor:pointer;user-select:none"
+               title="APRS chain mode: a track point is covered only when the full uplink path exists — tracker → WIDE1 (with a working backbone link) → WIDE2 or iGate. Requires receivers with the 'role' column set in the CSV.">
+          APRS Chain Analysis <span class="hint-icon">?</span>
+        </label>
+      </div>
       <div style="display:flex;gap:6px">
         <button id="analyze-track-btn" class="btn btn-primary btn-full" disabled>▶ Track Coverage</button>
         <button id="analyze-links-btn" class="btn btn-primary btn-full" disabled>▶ Receiver Links</button>

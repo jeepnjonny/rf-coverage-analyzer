@@ -14,7 +14,9 @@ const RX_COLORS = [
   '#8bc34a', '#ff5722',
 ];
 
-const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled'];
+const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled','role'];
+
+const ROLE_LABEL  = { wide1: 'WIDE1 fill-in', wide2: 'WIDE2 backbone', igate: 'iGate' };
 const COORD_DP    = 6;   // decimal places — matches server _rc()
 
 function rc(v) { return parseFloat(v.toFixed(COORD_DP)); }
@@ -791,22 +793,27 @@ function clearReceivers() {
 
 function _rxEnabled(rx) { return (rx.enabled ?? '1') !== '0'; }
 
+function _rxRole(rx) { return (rx.role || 'wide1').toLowerCase(); }
+
 function _rxTooltip(rx, i) {
-  const name    = rx.name || `RX${i + 1}`;
-  const enabled = _rxEnabled(rx);
-  const badge   = enabled ? '' : '<br><span style="color:#e05252;font-size:10px">⊘ disabled — excluded from analysis</span>';
-  return `<b>${name}</b>${badge}<br>${rx.height_agl_m || 0} m AGL · ${rx.antenna_gain_dbi || 0} dBi gain<br><span style="color:#7a82a0;font-size:10px">drag to reposition</span>`;
+  const name      = rx.name || `RX${i + 1}`;
+  const enabled   = _rxEnabled(rx);
+  const roleLabel = ROLE_LABEL[_rxRole(rx)] || _rxRole(rx).toUpperCase();
+  const badge     = enabled ? '' : '<br><span style="color:#e05252;font-size:10px">⊘ disabled — excluded from analysis</span>';
+  return `<b>${name}</b> <span style="font-size:10px;color:#a0a8c0">[${roleLabel}]</span>${badge}<br>${rx.height_agl_m || 0} m AGL · ${rx.antenna_gain_dbi || 0} dBi gain<br><span style="color:#7a82a0;font-size:10px">drag to reposition</span>`;
 }
 
 // Create and add a single receiver marker at index i (no bounds change)
 function _addRxMarker(rx, i) {
-  const lat      = parseFloat(rx.latitude);
-  const lon      = parseFloat(rx.longitude);
-  const color    = RX_COLORS[i % RX_COLORS.length];
-  const disabled = !_rxEnabled(rx);
+  const lat       = parseFloat(rx.latitude);
+  const lon       = parseFloat(rx.longitude);
+  const color     = RX_COLORS[i % RX_COLORS.length];
+  const disabled  = !_rxEnabled(rx);
+  const role      = _rxRole(rx);
+  const roleClass = role === 'wide2' ? ' rx-wide2' : role === 'igate' ? ' rx-igate' : '';
   const icon  = L.divIcon({
     className:     '',
-    html:          `<div class="rx-marker${disabled ? ' rx-disabled' : ''}" id="rx-dot-${i}" style="background:${color}"></div>`,
+    html:          `<div class="rx-marker${disabled ? ' rx-disabled' : ''}${roleClass}" id="rx-dot-${i}" style="background:${color}"></div>`,
     iconSize:      [20, 20],
     iconAnchor:    [10, 10],
     tooltipAnchor: [0, -12],
@@ -1062,6 +1069,7 @@ function startAnalysis(mode, opts = {}) {
     veg_type:        document.getElementById('veg-loss').value,
     fade_margin_db:  parseFloat(document.getElementById('fade-margin').value) || 0,
     mode,
+    chain_mode:      document.getElementById('chain-mode-toggle').checked,
   };
 
   // Segment drawing state
@@ -1202,14 +1210,30 @@ function handleSSE(evt, ctx) {
       if (!rx1 || !rx2) break;
       // Defensive: never draw a link involving a disabled receiver
       if (!_rxEnabled(rx1) || !_rxEnabled(rx2)) break;
-      const color = RX_COLORS[evt.rx1_idx % RX_COLORS.length];
+
+      // Backbone links (WIDE1 ↔ WIDE2 or WIDE1 ↔ iGate) get a distinct amber dashed style
+      const r1 = _rxRole(rx1);
+      const r2 = _rxRole(rx2);
+      const isBackbone = (r1 === 'wide1' && (r2 === 'wide2' || r2 === 'igate'))
+                      || (r2 === 'wide1' && (r1 === 'wide2' || r1 === 'igate'));
+      const color  = isBackbone ? '#ffb300' : RX_COLORS[evt.rx1_idx % RX_COLORS.length];
+      const weight = isBackbone ? 3.5 : 2.5;
+      const opts   = { color, weight, opacity: isBackbone ? 0.95 : 0.75,
+                       rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx };
+      if (isBackbone) opts.dashArray = '9 5';
+
+      const roleDesc = r => (ROLE_LABEL[r] || r.toUpperCase());
+      const linkLabel = isBackbone
+        ? `Backbone: ${rx1.name} (${roleDesc(r1)}) ↔ ${rx2.name} (${roleDesc(r2)})`
+        : `${rx1.name} ↔ ${rx2.name}`;
+
       const pl = L.polyline(
         [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
          [parseFloat(rx2.latitude), parseFloat(rx2.longitude)]],
-        { color, weight: 2.5, opacity: 0.75, rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx }
+        opts
       );
       pl.bindTooltip(
-        `${rx1.name} ↔ ${rx2.name}<br>${evt.rssi} dBm · ${evt.dist_km} km · diff: ${evt.diff_db} dB`,
+        `${linkLabel}<br>${evt.rssi} dBm · ${evt.dist_km} km · diff: ${evt.diff_db} dB`,
         { sticky: true }
       );
       pl.on('click', () => showTerrainProfile(rx1, rx2, evt.rx1_idx, evt.rx2_idx));
@@ -1223,7 +1247,9 @@ function handleSSE(evt, ctx) {
       setProgress('Complete', 100);
       setStatus(evt.mode === 'links'
         ? 'Receiver link analysis complete.'
-        : 'Track coverage complete. Click an inter-receiver link to view terrain profile.');
+        : evt.chain_mode
+          ? 'APRS chain analysis complete. Covered = tracker → WIDE1 → WIDE2/iGate path. Backbone links shown in amber.'
+          : 'Track coverage complete. Click an inter-receiver link to view terrain profile.');
       // Store stats and show save row
       state.lastAnalysisStats    = evt.stats || [];
       state.lastAnalysisTotalPct = evt.total_coverage_pct ?? null;
@@ -2324,6 +2350,17 @@ state.iaSelectedIdx = -1;
 state.iaMarkerLayer = L.layerGroup().addTo(map);
 state.iaMarkers     = [];   // Leaflet marker refs, parallel to iaSuggestions
 
+// Update advisor defaults when tier changes
+document.getElementById('ia-tier-select').addEventListener('change', function () {
+  if (this.value === 'wide2') {
+    document.getElementById('ia-ant-height').value = '6';
+    document.getElementById('ia-max-walk').value   = '1000';
+  } else {
+    document.getElementById('ia-ant-height').value = '4';
+    document.getElementById('ia-max-walk').value   = '500';
+  }
+});
+
 // Patch checkReady() to also gate the advisor button
 const _origCheckReady = checkReady;
 checkReady = function () {
@@ -2370,6 +2407,10 @@ function startInfraAdvisor() {
   statusEl.textContent = '';
   document.getElementById('ia-progress-bar').style.width = '0%';
   document.getElementById('ia-progress-label').textContent = 'Initializing…';
+  const importBtn = document.getElementById('ia-import-btn');
+  importBtn.classList.add('hidden');
+  importBtn.disabled = false;
+  importBtn.textContent = '+ Add to Receivers';
   checkReady();
 
   const params = {
@@ -2462,6 +2503,8 @@ function _handleIaSSE(evt) {
         `Done — ${evt.selected_count} location${evt.selected_count !== 1 ? 's' : ''}, ` +
         `${evt.final_coverage_pct}% coverage`;
       statusEl.textContent = '';
+      if (state.iaSuggestions.length > 0)
+        document.getElementById('ia-import-btn').classList.remove('hidden');
       _iaFinish();
       break;
 
@@ -2553,4 +2596,91 @@ function _iaFinish() {
   setTimeout(() => {
     document.getElementById('ia-progress-container').classList.add('hidden');
   }, 1500);
+}
+
+document.getElementById('ia-import-btn').addEventListener('click', _iaImportReceivers);
+
+async function _iaImportReceivers() {
+  if (!state.iaSuggestions.length) return;
+
+  const antH  = parseFloat(document.getElementById('ia-ant-height').value) || 4;
+  const tier  = document.getElementById('ia-tier-select').value || 'wide1';
+  const added = [];
+
+  state.iaSuggestions.forEach((s, i) => {
+    const rx = {
+      name:             `Advisor-${s.rank}`,
+      latitude:         s.lat.toFixed(6),
+      longitude:        s.lon.toFixed(6),
+      height_agl_m:     String(antH),
+      antenna_gain_dbi: '0',
+      tx_power_dbm:     '22',
+      enabled:          '1',
+      role:             tier,
+    };
+    const idx = state.receivers.length;
+    state.receivers.push(rx);
+    _addRxMarker(rx, idx);
+    added.push(rx.name);
+  });
+
+  checkReady();
+  document.getElementById('ia-import-btn').disabled = true;
+  document.getElementById('ia-import-btn').textContent = 'Added!';
+
+  const csvRows = state.receivers;
+
+  if (state.csvFile) {
+    showTransferSpinner(`Saving ${state.csvFile}…`);
+    try {
+      const res  = await fetch(`/api/csv/${encodeURIComponent(state.csvFile)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rows: csvRows }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        fm.editorFile = state.csvFile;
+        fm.editorRows = csvRows.map(r => ({ ...r }));
+        setStatus(`Added ${added.length} advisor site(s) to ${state.csvFile}.`);
+      } else {
+        setStatus('Receivers added to map — CSV save failed.');
+      }
+    } catch (err) {
+      setStatus(`Receivers added — save error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
+    }
+  } else {
+    // No CSV loaded — create a new one
+    showTransferSpinner('Creating receivers CSV…');
+    try {
+      const lines = [CSV_COLS.join(',')];
+      csvRows.forEach(row => {
+        lines.push(CSV_COLS.map(c => {
+          const v = String(row[c] ?? '');
+          return v.includes(',') ? `"${v.replace(/"/g, '""')}"` : v;
+        }).join(','));
+      });
+      const ts       = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+      const filename = `advisor-${ts}.csv`;
+      const blob     = new Blob([lines.join('\n')], { type: 'text/csv' });
+      const fd       = new FormData();
+      fd.append('file', new File([blob], filename, { type: 'text/csv' }));
+      const res  = await fetch('/api/upload/csv', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.filename) {
+        state.csvFile  = data.filename;
+        fm.editorFile  = data.filename;
+        fm.editorRows  = csvRows.map(r => ({ ...r }));
+        fm.selCsv      = data.filename;
+        await loadFmFiles();
+        updateSidebarBtns();
+        setStatus(`Created ${data.filename} with ${added.length} advisor site(s).`);
+      }
+    } catch (err) {
+      setStatus(`Receivers added to map — CSV create error: ${err.message}`);
+    } finally {
+      hideTransferSpinner();
+    }
+  }
 }
