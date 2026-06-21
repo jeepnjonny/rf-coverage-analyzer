@@ -116,7 +116,7 @@ html, body {
 .map-legend {
   position: absolute;
   bottom: 26px;
-  right: 10px;
+  left: 10px;
   z-index: 500;
   background: rgba(26, 29, 39, 0.9);
   border: 1px solid var(--border);

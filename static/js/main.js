@@ -2470,6 +2470,9 @@ function startInfraAdvisor() {
     target_coverage_pct:  parseFloat(document.getElementById('ia-target-pct').value) || 90,
     tier_hint:            document.getElementById('ia-tier-select').value || 'wide1',
   };
+  if (document.getElementById('ia-use-existing').checked && state.receivers.length) {
+    params.receivers = state.receivers.filter(r => (r.enabled ?? '1') !== '0');
+  }
 
   fetch('/api/suggest-locations', {
     method:  'POST',
@@ -2527,6 +2530,12 @@ function _handleIaSSE(evt) {
       }
       break;
 
+    case 'existing_coverage':
+      statusEl.textContent =
+        `Existing ${evt.receiver_count} receiver(s) cover ${evt.coverage_pct}% — finding gaps…`;
+      barEl.style.width = '28%';
+      break;
+
     case 'scoring_progress':
       progressEl.textContent = `Scoring: ${evt.current}/${evt.total}`;
       barEl.style.width = `${30 + (evt.current / evt.total) * 55}%`;
@@ -2542,20 +2551,31 @@ function _handleIaSSE(evt) {
       break;
     }
 
-    case 'complete':
+    case 'complete': {
       barEl.style.width = '100%';
-      progressEl.textContent =
-        `Done — ${evt.selected_count} location${evt.selected_count !== 1 ? 's' : ''}, ` +
-        `${evt.final_coverage_pct}% coverage`;
-      if (evt.selected_count === 0) {
-        statusEl.textContent =
-          'No viable sites found. Try lower fade margin, higher TX power, or check that roads exist near the course.';
+      const existing = evt.existing_coverage_pct ?? 0;
+      const n = evt.selected_count;
+      const nLabel = `${n} new site${n !== 1 ? 's' : ''}`;
+      if (existing > 0) {
+        const gain = Math.max(0, evt.final_coverage_pct - existing).toFixed(1);
+        progressEl.textContent = n > 0
+          ? `Done — ${nLabel}, +${gain}% (${evt.final_coverage_pct}% total)`
+          : `Done — existing receivers already cover ${existing}%`;
+      } else {
+        progressEl.textContent =
+          `Done — ${n} location${n !== 1 ? 's' : ''}, ${evt.final_coverage_pct}% coverage`;
+      }
+      if (n === 0) {
+        statusEl.textContent = existing > 0
+          ? `Target coverage already met by existing receivers (${existing}%).`
+          : 'No viable sites found. Try lower fade margin, higher TX power, or check that roads exist near the course.';
       } else {
         statusEl.textContent = '';
         document.getElementById('ia-import-btn').classList.remove('hidden');
       }
       _iaFinish();
       break;
+    }
 
     case 'error':
       statusEl.textContent = `Error: ${evt.message.split('\n')[0]}`;
