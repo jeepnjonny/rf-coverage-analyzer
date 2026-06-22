@@ -965,7 +965,6 @@ function updateLegend() {
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#4caf7d"></div><span>Covered</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#e05252"></div><span>Not covered</span></div>');
   }
-  const hasIaTrack = state.iaAdvisorTrackPts && state.iaAdvisorTrackPts.length > 0;
   if (hasIaTrack) {
     if (hasRx || hasCoverage) lines.push('<div class="legend-sep"></div>');
     lines.push('<div class="legend-title">Advisor Coverage</div>');
@@ -3022,7 +3021,7 @@ window._iaAddTestSite = async function (lat, lon) {
       if (d.filename) {
         state.csvFile = d.filename; fm.editorFile = d.filename;
         fm.editorRows = state.receivers.map(r => ({...r})); fm.selCsv = d.filename;
-        await loadFmFiles(); updateSidebarBtns();
+        await refreshFmFileLists(); updateSidebarBtns();
         setStatus(`Added test site — created ${d.filename}.`);
       }
     } catch (e) { setStatus(`Added to map — CSV error: ${e.message}`); }
@@ -3115,7 +3114,7 @@ async function _addSingleIaSuggestion(idx) {
         fm.editorFile  = data.filename;
         fm.editorRows  = csvRows.map(r => ({ ...r }));
         fm.selCsv      = data.filename;
-        await loadFmFiles();
+        await refreshFmFileLists();
         updateSidebarBtns();
         setStatus(`Added ${rx.name} — created ${data.filename}.`);
       }
@@ -3243,7 +3242,7 @@ async function _iaImportReceivers() {
         fm.editorFile  = data.filename;
         fm.editorRows  = csvRows.map(r => ({ ...r }));
         fm.selCsv      = data.filename;
-        await loadFmFiles();
+        await refreshFmFileLists();
         updateSidebarBtns();
         setStatus(`Created ${data.filename} with ${added.length} advisor site(s).`);
       }
