@@ -2610,8 +2610,9 @@ def suggest_locations():
             except (ValueError, ZeroDivisionError):
                 max_range_m = float("inf")
 
+            pre_fspl_count = len(candidates)
             if math.isfinite(max_range_m):
-                raw_count = len(candidates)
+                raw_count = pre_fspl_count
                 candidates = [
                     c for c in candidates
                     if any(haversine(c["lat"], c["lon"], tp[0], tp[1]) <= max_range_m
@@ -2626,6 +2627,15 @@ def suggest_locations():
             candidates = candidates[:MAX_CANDIDATES]
 
             if not candidates:
+                if pre_fspl_count > 0:
+                    yield sse({
+                        "type":    "error",
+                        "message": (
+                            f"Range pre-filter eliminated all {pre_fspl_count} candidates — "
+                            f"link budget too tight for this frequency/power combination. "
+                            f"Try increasing TX power, reducing fade margin, or checking frequency."
+                        ),
+                    }); return
                 yield sse({
                     "type":    "error",
                     "message": ("No road/trail candidates found in the course area. "
@@ -2664,6 +2674,7 @@ def suggest_locations():
             ]
 
             scored: list[dict] = []
+            backbone_blocked_count = 0
             pool = _get_analysis_pool()
             futures = {pool.submit(score_candidate, a): a[0] for a in score_args}
             done_count  = 0
@@ -2686,6 +2697,8 @@ def suggest_locations():
                         c = candidates[result["cand_idx"]]
                         result["tier"]    = c.get("tier", 1)
                         result["highway"] = c.get("highway", "")
+                        if result.get("backbone_blocked"):
+                            backbone_blocked_count += 1
                         scored.append(result)
                     done_count += 1
                 yield sse({"type": "scoring_progress",
@@ -2694,6 +2707,21 @@ def suggest_locations():
             if skip_count:
                 yield sse({"type": "status",
                            "message": f"{skip_count} candidate(s) skipped due to scoring errors."})
+
+            # Compute best possible marginal before applying min_contribution filter,
+            # so the failure message can tell the user how much headroom they have.
+            pre_covered_snap = set(pre_covered)
+            best_marginal_pct = 0.0
+            if scored:
+                best_marginal_pts = max(
+                    len(set(c["covered_set"]) - pre_covered_snap) for c in scored
+                )
+                best_marginal_pct = round(best_marginal_pts / total_pts * 100, 1)
+
+            zero_coverage_count = sum(
+                1 for c in scored
+                if c.get("coverage_pct", 0) == 0 and not c.get("backbone_blocked")
+            )
 
             # Greedy set-cover to select the best combination
             yield sse({"type": "status",
@@ -2711,12 +2739,16 @@ def suggest_locations():
                            round(len(pre_covered) / total_pts * 100, 1)
             existing_pct = round(len(pre_covered) / total_pts * 100, 1)
             yield sse({
-                "type":                  "complete",
-                "selected_count":        len(selected),
-                "total_candidates":      len(candidates),
-                "final_coverage_pct":    final_pct,
-                "existing_coverage_pct": existing_pct,
-                "locations":             selected,
+                "type":                    "complete",
+                "selected_count":          len(selected),
+                "total_candidates":        len(scored),
+                "final_coverage_pct":      final_pct,
+                "existing_coverage_pct":   existing_pct,
+                "backbone_blocked_count":  backbone_blocked_count,
+                "zero_coverage_count":     zero_coverage_count,
+                "best_marginal_pct":       best_marginal_pct,
+                "min_contribution_pct":    min_contribution_pct,
+                "locations":               selected,
             })
 
         except GeneratorExit:

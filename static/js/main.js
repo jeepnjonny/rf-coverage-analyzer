@@ -2542,9 +2542,29 @@ function _handleIaSSE(evt) {
           `Done — ${n} location${n !== 1 ? 's' : ''}, ${evt.final_coverage_pct}% coverage`;
       }
       if (n === 0) {
-        statusEl.textContent = existing > 0
-          ? `Target coverage already met by existing receivers (${existing}%).`
-          : 'No viable sites found. Try lower fade margin, higher TX power, or check that roads exist near the course.';
+        const total      = evt.total_candidates ?? 0;
+        const blocked    = evt.backbone_blocked_count ?? 0;
+        const zeroCov    = evt.zero_coverage_count ?? 0;
+        const bestMarg   = evt.best_marginal_pct ?? 0;
+        const minContrib = evt.min_contribution_pct ?? 0;
+        if (existing > 0 && evt.final_coverage_pct >= (evt.target_coverage_pct ?? 0)) {
+          statusEl.textContent = `Target coverage already met by existing receivers (${existing}%).`;
+        } else if (blocked > 0 && blocked === total) {
+          statusEl.textContent =
+            `No sites found — all ${total} candidates were backbone-blocked (no relay path to a WIDE2/iGate receiver). Add WIDE2/iGate receivers closer to the course, or switch to WIDE2 advisor mode.`;
+        } else if (blocked > 0 && (blocked + zeroCov) === total) {
+          statusEl.textContent =
+            `No sites found — ${blocked} candidate${blocked !== 1 ? 's' : ''} backbone-blocked, remaining have no line-of-sight to the tracker. Terrain may be too obstructed.`;
+        } else if (zeroCov === total && total > 0) {
+          statusEl.textContent =
+            `No sites found — terrain blocked all ${total} candidates from hearing the tracker. Try increasing antenna height or TX power.`;
+        } else if (minContrib > 0 && bestMarg < minContrib) {
+          statusEl.textContent =
+            `No sites found — best available site only adds ${bestMarg}% coverage, below the ${minContrib}% minimum contribution threshold. Lower Min. Site Contribution and retry.`;
+        } else {
+          statusEl.textContent =
+            'No viable sites found. Try lower fade margin, higher TX power, or check that roads exist near the course.';
+        }
       } else {
         statusEl.textContent = '';
         document.getElementById('ia-import-btn').classList.remove('hidden');
