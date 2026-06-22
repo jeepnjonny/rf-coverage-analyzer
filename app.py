@@ -947,7 +947,7 @@ TIER1_HIGHWAYS: set[str] = {
 }
 ROAD_SAMPLE_SPACING_M  = 250   # metres between sampled road candidates
 MAX_CANDIDATES         = 200   # hard cap on candidates sent to full RF scoring
-RAW_CANDIDATES_CAP     = 1000  # raw pool size before FSPL pre-filter
+RAW_CANDIDATES_CAP     = 5000  # raw pool size before FSPL pre-filter (large for 100+ mile courses)
 HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
 MAX_HIKE_SLOPE_DEG     = 40    # steeper than 40° (≈84% grade) → reject as physically inaccessible
 
@@ -2645,7 +2645,30 @@ def suggest_locations():
                                "message": (f"Range pre-filter: {removed} out-of-range "
                                            f"candidates removed, {len(candidates)} remain.")})
 
-            candidates = candidates[:MAX_CANDIDATES]
+            # Gap-focus + geographic diversity pass.
+            # Step 1: For each candidate, find its nearest track point (cheap — runs
+            # only on the FSPL-filtered subset, typically 200-600 entries).
+            for c in candidates:
+                best_d, best_i = float('inf'), 0
+                for ti, tp in enumerate(track_pts):
+                    d = haversine(c["lat"], c["lon"], tp[0], tp[1])
+                    if d < best_d:
+                        best_d, best_i = d, ti
+                c["_ntidx"] = best_i
+
+            # Step 2: Drop candidates whose nearest track point is already covered by
+            # existing receivers — scoring them cannot improve marginal coverage.
+            gap_candidates = [c for c in candidates if c["_ntidx"] not in pre_covered]
+            work = gap_candidates if gap_candidates else candidates  # fallback: keep all
+
+            # Step 3: Sort by position along course, then stride-subsample to
+            # MAX_CANDIDATES so scoring slots are spread across the full gap.
+            work.sort(key=lambda c: c["_ntidx"])
+            if len(work) > MAX_CANDIDATES:
+                step = len(work) / MAX_CANDIDATES
+                candidates = [work[int(i * step)] for i in range(MAX_CANDIDATES)]
+            else:
+                candidates = work
 
             if candidates:
                 yield sse({"type": "candidates", "candidates": [
