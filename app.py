@@ -2399,6 +2399,7 @@ def greedy_set_cover(
             "rank":             rank,
             "lat":              best["lat"],
             "lon":              best["lon"],
+            "cand_idx":         best.get("cand_idx"),
             "tier":             best.get("tier", 1),
             "highway":          best.get("highway", ""),
             "coverage_pct":     best["coverage_pct"],
@@ -2646,6 +2647,12 @@ def suggest_locations():
 
             candidates = candidates[:MAX_CANDIDATES]
 
+            if candidates:
+                yield sse({"type": "candidates", "candidates": [
+                    {"idx": i, "lat": c["lat"], "lon": c["lon"], "tier": c.get("tier", 1)}
+                    for i, c in enumerate(candidates)
+                ]})
+
             if not candidates:
                 if pre_fspl_count > 0:
                     yield sse({
@@ -2720,6 +2727,10 @@ def suggest_locations():
                         if result.get("backbone_blocked"):
                             backbone_blocked_count += 1
                         scored.append(result)
+                        yield sse({"type": "candidate_scored",
+                                   "idx": result["cand_idx"],
+                                   "coverage_pct": result["coverage_pct"],
+                                   "backbone_blocked": result.get("backbone_blocked", False)})
                     done_count += 1
                 yield sse({"type": "scoring_progress",
                            "current": done_count, "total": n_cands})

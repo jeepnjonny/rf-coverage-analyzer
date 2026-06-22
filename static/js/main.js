@@ -2383,6 +2383,9 @@ state.iaTestLayer        = L.layerGroup().addTo(map);
 state.iaTestMarker       = null;
 // Cached complete-event data for summary bar updates
 state.iaCompleteEvt      = null;
+// Candidate site dots (shown during scoring, cleared after complete)
+state.iaCandidateLayer   = L.layerGroup().addTo(map);
+state.iaCandidateMarkers = {};  // keyed by cand_idx → L.circleMarker
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -2628,7 +2631,36 @@ function _handleIaSSE(evt) {
       barEl.style.width = `${30 + (evt.current / evt.total) * 55}%`;
       break;
 
+    case 'candidates':
+      (evt.candidates || []).forEach(c => {
+        const m = L.circleMarker([c.lat, c.lon], {
+          radius: 5, color: '#888', fillColor: '#888',
+          fillOpacity: 0.55, weight: 1,
+        }).addTo(state.iaCandidateLayer);
+        m.bindTooltip(`Candidate (${c.tier === 2 ? 'Hike' : 'Road'})`, {permanent: false});
+        state.iaCandidateMarkers[c.idx] = m;
+      });
+      break;
+
+    case 'candidate_scored': {
+      const cm = state.iaCandidateMarkers[evt.idx];
+      if (cm) {
+        const pct = evt.coverage_pct || 0;
+        const clr = evt.backbone_blocked ? '#555'
+                  : pct >= 40            ? '#4caf50'
+                  : pct >= 15            ? '#ff9800'
+                  :                        '#e05252';
+        cm.setStyle({color: clr, fillColor: clr, fillOpacity: 0.7});
+      }
+      break;
+    }
+
     case 'suggestion': {
+      // Remove candidate dot for this site before adding the ranked marker
+      if (evt.cand_idx != null && state.iaCandidateMarkers[evt.cand_idx]) {
+        state.iaCandidateLayer.removeLayer(state.iaCandidateMarkers[evt.cand_idx]);
+        delete state.iaCandidateMarkers[evt.cand_idx];
+      }
       state.iaSuggestions.push(evt);
       _addIaMarker(evt, state.iaSuggestions.length - 1);
       _appendIaResultItem(evt, state.iaSuggestions.length - 1);
@@ -2685,6 +2717,8 @@ function _handleIaSSE(evt) {
         statusEl.textContent = '';
         document.getElementById('ia-import-btn').classList.remove('hidden');
       }
+      state.iaCandidateLayer.clearLayers();
+      state.iaCandidateMarkers = {};
       _iaUpdateSummary();
       _iaFinish();
       break;
@@ -2692,6 +2726,8 @@ function _handleIaSSE(evt) {
 
     case 'error':
       statusEl.textContent = `Error: ${evt.message.split('\n')[0]}`;
+      state.iaCandidateLayer.clearLayers();
+      state.iaCandidateMarkers = {};
       _iaFinish();
       break;
   }
@@ -3132,6 +3168,8 @@ function _iaClear() {
   }
   state.iaMarkerLayer.clearLayers();
   state.iaCoverageLayer.clearLayers();
+  state.iaCandidateLayer.clearLayers();
+  state.iaCandidateMarkers = {};
   state.iaTestLayer.clearLayers();
   if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
   _hideIaTestMenu();
