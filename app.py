@@ -950,6 +950,7 @@ MAX_CANDIDATES         = 200   # hard cap on candidates sent to full RF scoring
 RAW_CANDIDATES_CAP     = 5000  # raw pool size before FSPL pre-filter (large for 100+ mile courses)
 HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
 MAX_HIKE_SLOPE_DEG     = 40    # steeper than 40° (≈84% grade) → reject as physically inaccessible
+WIDE_APRS_RX_GAIN_DBI  = 2.4   # typical omni vertical (J-pole / collinear) for WIDE1/WIDE2/iGate
 
 # ---------------------------------------------------------------------------
 # ProcessPoolExecutor — true multi-core parallelism for RF analysis
@@ -2532,10 +2533,18 @@ def suggest_locations():
             if existing_receivers:
                 yield sse({"type": "status",
                            "message": f"Scoring {len(existing_receivers)} existing receiver(s)…"})
+                def _rx_site_gain(r: dict) -> float:
+                    # Use the CSV value; fall back to WIDE_APRS_RX_GAIN_DBI for
+                    # WIDE1/WIDE2/iGate when the CSV entry was left at zero.
+                    raw = float(r.get("antenna_gain_dbi") or 0)
+                    if raw == 0.0 and str(r.get("role", "")).lower() in ("wide1", "wide2", "igate"):
+                        return WIDE_APRS_RX_GAIN_DBI
+                    return raw
                 pre_args = [
                     (i, float(r["latitude"]), float(r["longitude"]),
                      float(r.get("height_agl_m") or 2),
-                     track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+                     track_pts, freq_mhz, tx_power_dbm,
+                     tx_gain_dbi + _rx_site_gain(r),   # tracker TX gain + site RX gain
                      sensitivity_dbm, veg_type, fade_margin_db,
                      None)   # no backbone check for existing receivers
                     for i, r in enumerate(existing_receivers)
@@ -2646,7 +2655,7 @@ def suggest_locations():
             # even under ideal free-space conditions.  Runs in milliseconds and
             # lets us draw from a 1000-candidate raw pool while only passing the
             # spatially relevant subset to the expensive terrain/diffraction model.
-            fspl_budget_db = (tx_power_dbm + tx_gain_dbi
+            fspl_budget_db = (tx_power_dbm + tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI
                               - sensitivity_dbm - fade_margin_db)
             try:
                 max_range_m = (10 ** ((fspl_budget_db - 32.44
@@ -2767,7 +2776,8 @@ def suggest_locations():
 
             score_args = [
                 (i, c["lat"], c["lon"], antenna_height_m,
-                 track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+                 track_pts, freq_mhz, tx_power_dbm,
+                 tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI,   # tracker TX gain + proposed site RX gain
                  sensitivity_dbm, veg_type, fade_margin_db,
                  backbone_pts)
                 for i, c in enumerate(candidates)
