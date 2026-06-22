@@ -2645,24 +2645,33 @@ def suggest_locations():
                                "message": (f"Range pre-filter: {removed} out-of-range "
                                            f"candidates removed, {len(candidates)} remain.")})
 
-            # Gap-focus + geographic diversity pass.
-            # Step 1: For each candidate, find its nearest track point (cheap — runs
-            # only on the FSPL-filtered subset, typically 200-600 entries).
+            # Geographically spread pre-cap: bounds the O(n×m) ntidx computation
+            # below. Sort by lat gives rough N→S ordering; stride sampling
+            # distributes candidates across the full course before gap-focus.
+            _PRE_GAP_CAP = 800
+            if len(candidates) > _PRE_GAP_CAP:
+                candidates.sort(key=lambda c: c["lat"])
+                _step = len(candidates) / _PRE_GAP_CAP
+                candidates = [candidates[int(i * _step)] for i in range(_PRE_GAP_CAP)]
+
+            # Gap-focus: find each candidate's nearest track point using squared
+            # Euclidean (no trig — ordering accuracy is all that matters here).
             for c in candidates:
-                best_d, best_i = float('inf'), 0
-                for ti, tp in enumerate(track_pts):
-                    d = haversine(c["lat"], c["lon"], tp[0], tp[1])
-                    if d < best_d:
-                        best_d, best_i = d, ti
+                clat, clon = c["lat"], c["lon"]
+                best_d2, best_i = float('inf'), 0
+                for ti, (tlat, tlon) in enumerate(track_pts):
+                    d2 = (clat - tlat) ** 2 + (clon - tlon) ** 2
+                    if d2 < best_d2:
+                        best_d2, best_i = d2, ti
                 c["_ntidx"] = best_i
 
-            # Step 2: Drop candidates whose nearest track point is already covered by
-            # existing receivers — scoring them cannot improve marginal coverage.
+            # Drop candidates whose nearest track point is already covered — they
+            # cannot improve marginal coverage, so scoring them wastes RF budget.
             gap_candidates = [c for c in candidates if c["_ntidx"] not in pre_covered]
             work = gap_candidates if gap_candidates else candidates  # fallback: keep all
 
-            # Step 3: Sort by position along course, then stride-subsample to
-            # MAX_CANDIDATES so scoring slots are spread across the full gap.
+            # Sort by track position, then stride-subsample to MAX_CANDIDATES so
+            # scoring slots are spread across the uncovered sections of the course.
             work.sort(key=lambda c: c["_ntidx"])
             if len(work) > MAX_CANDIDATES:
                 step = len(work) / MAX_CANDIDATES
