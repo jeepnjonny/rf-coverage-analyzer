@@ -2299,6 +2299,29 @@ def sample_road_candidates(ways: list[dict], spacing_m: float) -> list[dict]:
     return candidates
 
 
+def terrain_los_clear(
+    clat: float, clon: float, c_agl: float,
+    tlat: float, tlon: float, t_agl: float = 1.5,
+    n_samples: int = 8,
+) -> bool:
+    """Return True if terrain does not block the straight-line path between a
+    candidate site (c_agl metres AGL) and a track point (t_agl AGL).
+
+    Walks n_samples evenly spaced interior points along the path and checks
+    whether any terrain reading rises above the LOS elevation at that fraction.
+    Coarse but fast — intended as a cheap pre-screen before full RF analysis.
+    """
+    c_elev = _get_elev(clat, clon) + c_agl
+    t_elev = _get_elev(tlat, tlon) + t_agl
+    for si in range(1, n_samples):
+        f = si / n_samples
+        mlat, mlon = intermediate_point(clat, clon, tlat, tlon, f)
+        terrain = _get_elev(mlat, mlon)
+        if terrain > c_elev + f * (t_elev - c_elev):
+            return False
+    return True
+
+
 def find_highpoint_candidates(
     tier1_pts: list[dict],
     max_dist_m: float,
@@ -2664,6 +2687,24 @@ def suggest_locations():
                     if d2 < best_d2:
                         best_d2, best_i = d2, ti
                 c["_ntidx"] = best_i
+
+            # Terrain LOS pre-filter: reject candidates that have no clear
+            # line-of-sight to any of their nearest LOS_CHECK_PTS track points.
+            # Catches "wrong valley / ridge-blocked" sites cheaply using the
+            # already-loaded elevation tiles before full RF analysis runs.
+            # Cost: ~n_candidates × LOS_CHECK_PTS × 8 elevation lookups ≈ <100ms.
+            _LOS_CHECK_PTS = 6
+            _los_survivors: list[dict] = []
+            for c in candidates:
+                ni    = c["_ntidx"]
+                start = max(0, ni - _LOS_CHECK_PTS // 2)
+                end   = min(len(track_pts), start + _LOS_CHECK_PTS)
+                if any(terrain_los_clear(c["lat"], c["lon"], antenna_height_m,
+                                         track_pts[ti][0], track_pts[ti][1])
+                       for ti in range(start, end)):
+                    _los_survivors.append(c)
+            if _los_survivors:      # fallback: keep all if elevation tiles sparse
+                candidates = _los_survivors
 
             # Drop candidates whose nearest track point is already covered — they
             # cannot improve marginal coverage, so scoring them wastes RF budget.
