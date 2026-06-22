@@ -2379,6 +2379,59 @@ state.iaCoverageLayer    = L.layerGroup().addTo(map);
 state.iaAdvisorTrackPts  = [];   // 300-pt track sent by backend
 state.iaCoveredExisting  = new Set();   // indices covered by existing receivers
 state.iaCoveredSuggested = new Set();   // indices covered by accepted suggestions
+// Manual placement tester
+state.iaTestLayer        = L.layerGroup().addTo(map);
+state.iaTestMarker       = null;
+// Cached complete-event data for summary bar updates
+state.iaCompleteEvt      = null;
+
+// Haversine distance in km between two [lat,lon] points
+function _haversineKm(lat1, lon1, lat2, lon2) {
+  const R  = 6371;
+  const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const a  = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// Longest contiguous uncovered stretch (km) given current coverage state
+function _iaLongestGapKm() {
+  const pts = state.iaAdvisorTrackPts;
+  if (pts.length < 2) return 0;
+  let longest = 0, current = 0, lastPt = null;
+  for (let i = 0; i < pts.length; i++) {
+    if (!state.iaCoveredSuggested.has(i) && !state.iaCoveredExisting.has(i)) {
+      if (lastPt !== null) {
+        current += _haversineKm(lastPt[0], lastPt[1], pts[i][0], pts[i][1]);
+        longest  = Math.max(longest, current);
+      }
+      lastPt = pts[i];
+    } else {
+      current = 0; lastPt = null;
+    }
+  }
+  return longest;
+}
+
+// Refresh coverage summary bar below the progress bar
+function _iaUpdateSummary() {
+  const bar = document.getElementById('ia-summary-bar');
+  if (!bar || !state.iaAdvisorTrackPts.length) return;
+  const evt      = state.iaCompleteEvt;
+  const existing = evt ? (evt.existing_coverage_pct ?? 0) : 0;
+  const total    = evt ? (evt.final_coverage_pct   ?? 0) : 0;
+  const gap      = _iaLongestGapKm();
+  const added    = Math.max(0, total - existing).toFixed(1);
+  bar.innerHTML  =
+    (existing > 0
+      ? `<span class="ia-summary-stat">Existing: <strong>${existing}%</strong></span>` +
+        `<span class="ia-summary-stat">Suggested: <strong>+${added}%</strong></span>`
+      : '') +
+    `<span class="ia-summary-stat">Total: <strong>${total}%</strong></span>` +
+    `<span class="ia-summary-stat">Longest gap: <strong>${gap.toFixed(1)} km</strong></span>`;
+  bar.classList.remove('hidden');
+}
 
 function _iaCoverageState(idx) {
   if (state.iaCoveredSuggested.has(idx)) return 'suggested';
@@ -2592,6 +2645,7 @@ function _handleIaSSE(evt) {
 
     case 'complete': {
       barEl.style.width = '100%';
+      state.iaCompleteEvt = evt;
       const existing = evt.existing_coverage_pct ?? 0;
       const n = evt.selected_count;
       const nLabel = `${n} new site${n !== 1 ? 's' : ''}`;
@@ -2632,6 +2686,7 @@ function _handleIaSSE(evt) {
         statusEl.textContent = '';
         document.getElementById('ia-import-btn').classList.remove('hidden');
       }
+      _iaUpdateSummary();
       _iaFinish();
       break;
     }
@@ -2680,6 +2735,19 @@ function _appendIaResultItem(suggestion, idx) {
   const covColor = coverageColor(suggestion.cumulative_pct);
   const tierLabel = suggestion.tier === 2 ? 'Hike' : (suggestion.highway || 'Road');
 
+  const alts    = suggestion.alternatives || [];
+  const altHTML = alts.length
+    ? `<div class="ia-alts">
+        <span class="ia-alt-label">Alts:</span>` +
+        alts.map((a, ai) => {
+          const label = String.fromCharCode(65 + ai); // A, B
+          return `<button class="ia-alt-pin" data-lat="${a.lat}" data-lon="${a.lon}"
+                          title="${a.lat.toFixed(5)}, ${a.lon.toFixed(5)} (+${a.marginal_pct}%)"
+                  >${label}: +${a.marginal_pct}% 📍</button>`;
+        }).join('') +
+       `</div>`
+    : '';
+
   el.innerHTML = `
     <div class="ia-item-header">
       <span class="ia-rank-badge">#${suggestion.rank}</span>
@@ -2703,6 +2771,7 @@ function _appendIaResultItem(suggestion, idx) {
         <div class="ia-cov-bar-fill" style="width:${suggestion.cumulative_pct}%;background:${covColor}"></div>
       </div>
     </div>
+    ${altHTML}
   `;
   el.querySelector('.ia-add-btn').addEventListener('click', e => {
     e.stopPropagation();
@@ -2711,6 +2780,14 @@ function _appendIaResultItem(suggestion, idx) {
   el.querySelector('.ia-del-btn').addEventListener('click', e => {
     e.stopPropagation();
     _deleteIaSuggestion(parseInt(e.currentTarget.dataset.idx));
+  });
+  el.querySelectorAll('.ia-alt-pin').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const lat = parseFloat(btn.dataset.lat);
+      const lon = parseFloat(btn.dataset.lon);
+      _iaShowAltPin(lat, lon, btn.title);
+    });
   });
   el.addEventListener('click', () => _selectIaSuggestion(idx));
   document.getElementById('ia-results').appendChild(el);
@@ -2734,6 +2811,226 @@ function _selectIaSuggestion(idx) {
   if (s) map.panTo([s.lat, s.lon]);
 }
 
+// Show a temporary pin for an alternative location
+let _altPinMarker = null;
+function _iaShowAltPin(lat, lon, tooltip) {
+  if (_altPinMarker) { map.removeLayer(_altPinMarker); _altPinMarker = null; }
+  _altPinMarker = L.marker([lat, lon], {
+    icon: L.divIcon({
+      className: '',
+      html: '<div class="ia-test-marker" style="border-color:#ff9800;box-shadow:0 0 0 3px rgba(255,152,0,0.25)">📍</div>',
+      iconSize: [28, 28], iconAnchor: [14, 14],
+    }),
+  })
+  .bindTooltip(tooltip, { permanent: false, direction: 'top', offset: [0, -14] })
+  .addTo(map)
+  .openTooltip();
+  map.panTo([lat, lon]);
+  // Auto-remove after 6 seconds
+  setTimeout(() => {
+    if (_altPinMarker) { map.removeLayer(_altPinMarker); _altPinMarker = null; }
+  }, 6000);
+}
+
+// Draw test-site coverage on iaTestLayer in cyan
+function _iaDrawTestCoverage(coveredIndices, trackPts) {
+  state.iaTestLayer.clearLayers();
+  if (!trackPts || trackPts.length < 2) return;
+  const covered = new Set(coveredIndices);
+  let runPts = [trackPts[0]], runCov = covered.has(0);
+  for (let i = 1; i < trackPts.length; i++) {
+    const c = covered.has(i);
+    if (c === runCov) {
+      runPts.push(trackPts[i]);
+    } else {
+      runPts.push(trackPts[i]);
+      L.polyline(runPts, { color: runCov ? '#4dd0e1' : '#2a2e45', weight: runCov ? 5 : 2, opacity: runCov ? 0.9 : 0.6 })
+        .addTo(state.iaTestLayer);
+      runCov = c; runPts = [trackPts[i]];
+    }
+  }
+  if (runPts.length >= 2) {
+    L.polyline(runPts, { color: runCov ? '#4dd0e1' : '#2a2e45', weight: runCov ? 5 : 2, opacity: runCov ? 0.9 : 0.6 })
+      .addTo(state.iaTestLayer);
+  }
+}
+
+// Right-click context menu for manual placement testing
+function _hideIaTestMenu() {
+  const el = document.getElementById('ia-test-menu');
+  if (el) el.remove();
+}
+
+map.on('contextmenu', (e) => {
+  if (!state.kmlFile) return;
+  e.originalEvent.preventDefault();
+  _hideIaTestMenu();
+  if (_altPinMarker) { map.removeLayer(_altPinMarker); _altPinMarker = null; }
+
+  const div = document.createElement('div');
+  div.id = 'ia-test-menu';
+  div.className = 'ia-test-popup';
+  div.style.left = e.originalEvent.clientX + 'px';
+  div.style.top  = e.originalEvent.clientY + 'px';
+  div.innerHTML  =
+    `<div class="ia-test-coords">${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}</div>` +
+    `<button class="btn btn-primary" id="ia-test-go">📡 Test site here</button>` +
+    `<button class="btn" id="ia-test-cancel">Cancel</button>`;
+  document.body.appendChild(div);
+
+  div.querySelector('#ia-test-go').addEventListener('click', () => {
+    _hideIaTestMenu();
+    _iaTestLocation(e.latlng);
+  });
+  div.querySelector('#ia-test-cancel').addEventListener('click', _hideIaTestMenu);
+
+  // Dismiss on next map click or outside click
+  setTimeout(() => document.addEventListener('click', _hideIaTestMenu, { once: true }), 10);
+});
+
+async function _iaTestLocation(latlng) {
+  // Remove previous test
+  state.iaTestLayer.clearLayers();
+  if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
+
+  // Spinner marker while loading
+  state.iaTestMarker = L.marker([latlng.lat, latlng.lng], {
+    icon: L.divIcon({
+      className: '',
+      html: '<div class="ia-test-marker">⏳</div>',
+      iconSize: [28, 28], iconAnchor: [14, 14],
+    }),
+  }).addTo(map);
+
+  const antH = parseFloat(document.getElementById('ia-ant-height')?.value) || 4;
+  const params = {
+    lat:             latlng.lat,
+    lon:             latlng.lng,
+    height_agl_m:    antH,
+    kml_file:        state.kmlFile,
+    freq_mhz:        parseFloat(document.getElementById('freq').value)         || 433,
+    tx_power_dbm:    parseFloat(document.getElementById('tx-power').value)     || 22,
+    tx_gain_dbi:     parseFloat(document.getElementById('tx-gain').value)      || 0,
+    sensitivity_dbm: parseFloat(document.getElementById('sensitivity').value)  || -135,
+    veg_type:        document.getElementById('veg-type').value                 || 'none',
+    fade_margin_db:  parseFloat(document.getElementById('fade-margin').value)  || 0,
+  };
+
+  try {
+    const res  = await fetch('/api/test-location', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+
+    map.removeLayer(state.iaTestMarker);
+
+    if (data.error) {
+      setStatus(`Test error: ${data.error}`);
+      state.iaTestMarker = null;
+      return;
+    }
+
+    _iaDrawTestCoverage(data.covered_indices, data.track_pts);
+
+    // Result marker with popup
+    state.iaTestMarker = L.marker([latlng.lat, latlng.lng], {
+      icon: L.divIcon({
+        className: '',
+        html: '<div class="ia-test-marker">📡</div>',
+        iconSize: [28, 28], iconAnchor: [14, 14],
+      }),
+    }).addTo(map);
+
+    const popup = L.popup({ maxWidth: 220 })
+      .setLatLng([latlng.lat, latlng.lng])
+      .setContent(
+        `<b>Test Site</b><br>` +
+        `Coverage: <b>${data.coverage_pct}%</b><br>` +
+        `Longest uncovered gap: <b>${data.longest_gap_km} km</b><br>` +
+        `<div style="display:flex;gap:6px;margin-top:6px">` +
+        `<button onclick="window._iaAddTestSite(${latlng.lat},${latlng.lng})" ` +
+        `style="flex:1;padding:3px 0;background:#4caf7d;color:#fff;border:none;border-radius:4px;cursor:pointer">` +
+        `+ Add as Receiver</button>` +
+        `<button onclick="window._iaClearTest()" ` +
+        `style="flex:1;padding:3px 0;background:#2a2e45;color:#dde1f0;border:1px solid #2e3350;border-radius:4px;cursor:pointer">` +
+        `Clear</button></div>`
+      )
+      .openOn(map);
+
+    // Store result data for the Add button
+    state.iaTestMarker._testData = { lat: latlng.lat, lon: latlng.lng, coverage_pct: data.coverage_pct };
+
+  } catch (err) {
+    if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
+    setStatus(`Test failed: ${err.message}`);
+  }
+}
+
+// Global handlers for popup onclick (Leaflet popup can't use closures)
+window._iaClearTest = function () {
+  state.iaTestLayer.clearLayers();
+  if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
+  map.closePopup();
+};
+
+window._iaAddTestSite = async function (lat, lon) {
+  map.closePopup();
+  const antH = parseFloat(document.getElementById('ia-ant-height')?.value) || 4;
+  const tier  = document.getElementById('ia-tier-select')?.value || 'wide1';
+  const rx = {
+    name:             `Test-${lat.toFixed(4)},${lon.toFixed(4)}`,
+    latitude:         lat.toFixed(6),
+    longitude:        lon.toFixed(6),
+    height_agl_m:     String(antH),
+    antenna_gain_dbi: '0',
+    tx_power_dbm:     '22',
+    enabled:          '1',
+    role:             tier,
+  };
+  const rxIdx = state.receivers.length;
+  state.receivers.push(rx);
+  _addRxMarker(rx, rxIdx);
+  updateLegend();
+  checkReady();
+
+  if (state.csvFile) {
+    showTransferSpinner(`Saving ${state.csvFile}…`);
+    try {
+      const res  = await fetch(`/api/csv/${encodeURIComponent(state.csvFile)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rows: state.receivers }),
+      });
+      const d = await res.json();
+      if (d.ok) { fm.editorFile = state.csvFile; fm.editorRows = state.receivers.map(r => ({...r})); }
+      setStatus(`Added test site to ${state.csvFile}.`);
+    } catch (e) { setStatus(`Added to map — save error: ${e.message}`); }
+    finally { hideTransferSpinner(); }
+  } else {
+    showTransferSpinner('Creating receivers CSV…');
+    try {
+      const lines = [CSV_COLS.join(',')];
+      state.receivers.forEach(row => {
+        lines.push(CSV_COLS.map(c => { const v = String(row[c] ?? ''); return v.includes(',') ? `"${v.replace(/"/g,'""')}"` : v; }).join(','));
+      });
+      const ts = new Date().toISOString().slice(0,19).replace(/[T:]/g,'-');
+      const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+      const fd   = new FormData();
+      fd.append('file', new File([blob], `advisor-${ts}.csv`, { type: 'text/csv' }));
+      const res  = await fetch('/api/upload/csv', { method: 'POST', body: fd });
+      const d    = await res.json();
+      if (d.filename) {
+        state.csvFile = d.filename; fm.editorFile = d.filename;
+        fm.editorRows = state.receivers.map(r => ({...r})); fm.selCsv = d.filename;
+        await loadFmFiles(); updateSidebarBtns();
+        setStatus(`Added test site — created ${d.filename}.`);
+      }
+    } catch (e) { setStatus(`Added to map — CSV error: ${e.message}`); }
+    finally { hideTransferSpinner(); }
+  }
+  _iaClearTest();
+};
+
 function _deleteIaSuggestion(idx) {
   if (state.iaMarkers[idx]) {
     state.iaMarkerLayer.removeLayer(state.iaMarkers[idx]);
@@ -2746,6 +3043,7 @@ function _deleteIaSuggestion(idx) {
     (s.marginal_indices || []).forEach(i => state.iaCoveredSuggested.add(i));
   });
   _iaDrawCoverageTrack();
+  _iaUpdateSummary();
   _renderIaResults();
   if (!state.iaSuggestions.length) {
     document.getElementById('ia-import-btn').classList.add('hidden');
@@ -2835,6 +3133,9 @@ function _iaClear() {
   }
   state.iaMarkerLayer.clearLayers();
   state.iaCoverageLayer.clearLayers();
+  state.iaTestLayer.clearLayers();
+  if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
+  _hideIaTestMenu();
   state.iaSuggestions      = [];
   state.iaMarkers          = [];
   state.iaSelectedIdx      = null;
@@ -2843,10 +3144,12 @@ function _iaClear() {
   state.iaAdvisorTrackPts  = [];
   state.iaCoveredExisting  = new Set();
   state.iaCoveredSuggested = new Set();
+  state.iaCompleteEvt      = null;
   document.getElementById('ia-results').innerHTML = '';
   document.getElementById('ia-results').classList.add('hidden');
   document.getElementById('ia-import-btn').classList.add('hidden');
   document.getElementById('ia-progress-container').classList.add('hidden');
+  document.getElementById('ia-summary-bar').classList.add('hidden');
   document.getElementById('ia-status-msg').textContent  = '';
   document.getElementById('ia-progress-label').textContent = 'Initializing…';
   document.getElementById('ia-progress-bar').style.width = '0%';

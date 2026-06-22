@@ -949,6 +949,7 @@ ROAD_SAMPLE_SPACING_M  = 250   # metres between sampled road candidates
 MAX_CANDIDATES         = 200   # hard cap on candidates sent to full RF scoring
 RAW_CANDIDATES_CAP     = 1000  # raw pool size before FSPL pre-filter
 HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
+MAX_HIKE_SLOPE_DEG     = 40    # steeper than 40° (≈84% grade) → reject as physically inaccessible
 
 # ---------------------------------------------------------------------------
 # ProcessPoolExecutor — true multi-core parallelism for RF analysis
@@ -2333,6 +2334,9 @@ def find_highpoint_candidates(
                 lo = _rc(lon0 + (dist * math.sin(bearing))
                          / (111_000.0 * max(cos_lat, 0.001)))
                 elev = _get_elev(la, lo)
+                # Skip terrain that is steeper than MAX_HIKE_SLOPE_DEG
+                if (elev - road_elev) / max(dist, 1) > math.tan(math.radians(MAX_HIKE_SLOPE_DEG)):
+                    continue
                 if elev > best_elev:
                     best_elev = elev
                     best_la, best_lo = la, lo
@@ -2380,6 +2384,17 @@ def greedy_set_cover(
             break
 
         covered |= marginal
+        alternatives = []
+        for alt in remaining[:2]:
+            alt_marginal = len(alt["covered_set"] - covered)
+            if alt_marginal > 0:
+                alternatives.append({
+                    "lat":         alt["lat"],
+                    "lon":         alt["lon"],
+                    "tier":        alt.get("tier", 1),
+                    "highway":     alt.get("highway", ""),
+                    "marginal_pct": round(alt_marginal / total_pts * 100, 1),
+                })
         selected.append({
             "rank":             rank,
             "lat":              best["lat"],
@@ -2391,6 +2406,7 @@ def greedy_set_cover(
             "marginal_pct":     round(len(marginal) / total_pts * 100, 1),
             "cumulative_pct":   round(len(covered)  / total_pts * 100, 1),
             "marginal_indices": sorted(marginal),
+            "alternatives":     alternatives,
         })
 
     return selected
@@ -2770,6 +2786,77 @@ def suggest_locations():
             "Connection":        "keep-alive",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Route – Single-location RF tester (synchronous JSON, for map right-click)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/test-location", methods=["POST"])
+def test_location():
+    data             = request.get_json()
+    lat              = float(data["lat"])
+    lon              = float(data["lon"])
+    height_agl       = float(data.get("height_agl_m",      4))
+    kml_file         = data.get("kml_file")
+    freq_mhz         = float(data.get("freq_mhz",        915))
+    tx_power_dbm     = float(data.get("tx_power_dbm",     22))
+    tx_gain_dbi      = float(data.get("tx_gain_dbi",       0))
+    sensitivity_dbm  = float(data.get("sensitivity_dbm", -135))
+    veg_type         = data.get("veg_type",             "none")
+    fade_margin_db   = float(data.get("fade_margin_db",    0))
+
+    if not kml_file:
+        return jsonify({"error": "kml_file required"}), 400
+    kml_p = KML_DIR / secure_filename(kml_file)
+    if not kml_p.exists():
+        return jsonify({"error": "Track file not found"}), 404
+
+    try:
+        waypoints = parse_track_file(
+            kml_p.read_text(encoding="utf-8", errors="replace"), kml_p.name
+        )
+    except Exception as exc:
+        return jsonify({"error": f"Parse error: {exc}"}), 400
+    if not waypoints:
+        return jsonify({"error": "No track coordinates found"}), 400
+
+    track_pts = interpolate_path(waypoints, max_pts=300)
+
+    pool = _get_analysis_pool()
+    fut  = pool.submit(score_candidate, (
+        0, lat, lon, height_agl,
+        track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+        sensitivity_dbm, veg_type, fade_margin_db,
+        None,
+    ))
+    try:
+        result = fut.result(timeout=90)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    covered_set = set(result["covered_set"])
+
+    # Compute longest contiguous uncovered stretch (km)
+    longest_gap_m = 0.0
+    current_gap_m = 0.0
+    last_uncov: tuple | None = None
+    for i, pt in enumerate(track_pts):
+        if i not in covered_set:
+            if last_uncov is not None:
+                current_gap_m += haversine(last_uncov[0], last_uncov[1], pt[0], pt[1])
+                longest_gap_m  = max(longest_gap_m, current_gap_m)
+            last_uncov = pt
+        else:
+            current_gap_m = 0.0
+            last_uncov    = None
+
+    return jsonify({
+        "coverage_pct":    result["coverage_pct"],
+        "covered_indices": sorted(covered_set),
+        "track_pts":       [[round(p[0], 5), round(p[1], 5)] for p in track_pts],
+        "longest_gap_km":  round(longest_gap_m / 1000, 1),
+    })
 
 
 # ---------------------------------------------------------------------------
