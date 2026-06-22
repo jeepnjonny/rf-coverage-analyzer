@@ -949,6 +949,7 @@ ROAD_SAMPLE_SPACING_M  = 250   # metres between sampled road candidates
 MAX_CANDIDATES         = 200   # hard cap on candidates sent to full RF scoring
 RAW_CANDIDATES_CAP     = 1000  # raw pool size before FSPL pre-filter
 HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
+MAX_HIKE_SLOPE_DEG     = 40    # steeper than 40° (≈84% grade) → reject as physically inaccessible
 
 # ---------------------------------------------------------------------------
 # ProcessPoolExecutor — true multi-core parallelism for RF analysis
@@ -2333,6 +2334,9 @@ def find_highpoint_candidates(
                 lo = _rc(lon0 + (dist * math.sin(bearing))
                          / (111_000.0 * max(cos_lat, 0.001)))
                 elev = _get_elev(la, lo)
+                # Skip terrain that is steeper than MAX_HIKE_SLOPE_DEG
+                if (elev - road_elev) / max(dist, 1) > math.tan(math.radians(MAX_HIKE_SLOPE_DEG)):
+                    continue
                 if elev > best_elev:
                     best_elev = elev
                     best_la, best_lo = la, lo
@@ -2380,16 +2384,29 @@ def greedy_set_cover(
             break
 
         covered |= marginal
+        alternatives = []
+        for alt in remaining[:2]:
+            alt_marginal = len(alt["covered_set"] - covered)
+            if alt_marginal > 0:
+                alternatives.append({
+                    "lat":         alt["lat"],
+                    "lon":         alt["lon"],
+                    "tier":        alt.get("tier", 1),
+                    "highway":     alt.get("highway", ""),
+                    "marginal_pct": round(alt_marginal / total_pts * 100, 1),
+                })
         selected.append({
-            "rank":           rank,
-            "lat":            best["lat"],
-            "lon":            best["lon"],
-            "tier":           best.get("tier", 1),
-            "highway":        best.get("highway", ""),
-            "coverage_pct":   best["coverage_pct"],
-            "marginal_pts":   len(marginal),
-            "marginal_pct":   round(len(marginal) / total_pts * 100, 1),
-            "cumulative_pct": round(len(covered)  / total_pts * 100, 1),
+            "rank":             rank,
+            "lat":              best["lat"],
+            "lon":              best["lon"],
+            "tier":             best.get("tier", 1),
+            "highway":          best.get("highway", ""),
+            "coverage_pct":     best["coverage_pct"],
+            "marginal_pts":     len(marginal),
+            "marginal_pct":     round(len(marginal) / total_pts * 100, 1),
+            "cumulative_pct":   round(len(covered)  / total_pts * 100, 1),
+            "marginal_indices": sorted(marginal),
+            "alternatives":     alternatives,
         })
 
     return selected
@@ -2458,6 +2475,8 @@ def suggest_locations():
 
             yield sse({"type": "status",
                        "message": f"Track: {total_pts} scoring points. Fetching terrain…"})
+            yield sse({"type": "track_pts",
+                       "pts": [[round(p[0], 5), round(p[1], 5)] for p in track_pts]})
 
             all_lats = [p[0] for p in track_pts]
             all_lons = [p[1] for p in track_pts]
@@ -2517,9 +2536,10 @@ def suggest_locations():
                     yield sse({"type": "status",
                                "message": f"Scoring existing receivers… {pre_done_count}/{n_pre}"})
                 yield sse({
-                    "type":           "existing_coverage",
-                    "coverage_pct":   round(len(pre_covered) / total_pts * 100, 1),
-                    "receiver_count": len(existing_receivers),
+                    "type":            "existing_coverage",
+                    "coverage_pct":    round(len(pre_covered) / total_pts * 100, 1),
+                    "receiver_count":  len(existing_receivers),
+                    "covered_indices": sorted(pre_covered),
                 })
 
             # Fetch OSM road/trail network — run in a thread so we can keep
@@ -2610,8 +2630,9 @@ def suggest_locations():
             except (ValueError, ZeroDivisionError):
                 max_range_m = float("inf")
 
+            pre_fspl_count = len(candidates)
             if math.isfinite(max_range_m):
-                raw_count = len(candidates)
+                raw_count = pre_fspl_count
                 candidates = [
                     c for c in candidates
                     if any(haversine(c["lat"], c["lon"], tp[0], tp[1]) <= max_range_m
@@ -2626,6 +2647,15 @@ def suggest_locations():
             candidates = candidates[:MAX_CANDIDATES]
 
             if not candidates:
+                if pre_fspl_count > 0:
+                    yield sse({
+                        "type":    "error",
+                        "message": (
+                            f"Range pre-filter eliminated all {pre_fspl_count} candidates — "
+                            f"link budget too tight for this frequency/power combination. "
+                            f"Try increasing TX power, reducing fade margin, or checking frequency."
+                        ),
+                    }); return
                 yield sse({
                     "type":    "error",
                     "message": ("No road/trail candidates found in the course area. "
@@ -2664,6 +2694,7 @@ def suggest_locations():
             ]
 
             scored: list[dict] = []
+            backbone_blocked_count = 0
             pool = _get_analysis_pool()
             futures = {pool.submit(score_candidate, a): a[0] for a in score_args}
             done_count  = 0
@@ -2686,6 +2717,8 @@ def suggest_locations():
                         c = candidates[result["cand_idx"]]
                         result["tier"]    = c.get("tier", 1)
                         result["highway"] = c.get("highway", "")
+                        if result.get("backbone_blocked"):
+                            backbone_blocked_count += 1
                         scored.append(result)
                     done_count += 1
                 yield sse({"type": "scoring_progress",
@@ -2694,6 +2727,21 @@ def suggest_locations():
             if skip_count:
                 yield sse({"type": "status",
                            "message": f"{skip_count} candidate(s) skipped due to scoring errors."})
+
+            # Compute best possible marginal before applying min_contribution filter,
+            # so the failure message can tell the user how much headroom they have.
+            pre_covered_snap = set(pre_covered)
+            best_marginal_pct = 0.0
+            if scored:
+                best_marginal_pts = max(
+                    len(set(c["covered_set"]) - pre_covered_snap) for c in scored
+                )
+                best_marginal_pct = round(best_marginal_pts / total_pts * 100, 1)
+
+            zero_coverage_count = sum(
+                1 for c in scored
+                if c.get("coverage_pct", 0) == 0 and not c.get("backbone_blocked")
+            )
 
             # Greedy set-cover to select the best combination
             yield sse({"type": "status",
@@ -2711,12 +2759,16 @@ def suggest_locations():
                            round(len(pre_covered) / total_pts * 100, 1)
             existing_pct = round(len(pre_covered) / total_pts * 100, 1)
             yield sse({
-                "type":                  "complete",
-                "selected_count":        len(selected),
-                "total_candidates":      len(candidates),
-                "final_coverage_pct":    final_pct,
-                "existing_coverage_pct": existing_pct,
-                "locations":             selected,
+                "type":                    "complete",
+                "selected_count":          len(selected),
+                "total_candidates":        len(scored),
+                "final_coverage_pct":      final_pct,
+                "existing_coverage_pct":   existing_pct,
+                "backbone_blocked_count":  backbone_blocked_count,
+                "zero_coverage_count":     zero_coverage_count,
+                "best_marginal_pct":       best_marginal_pct,
+                "min_contribution_pct":    min_contribution_pct,
+                "locations":               selected,
             })
 
         except GeneratorExit:
@@ -2734,6 +2786,77 @@ def suggest_locations():
             "Connection":        "keep-alive",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Route – Single-location RF tester (synchronous JSON, for map right-click)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/test-location", methods=["POST"])
+def test_location():
+    data             = request.get_json()
+    lat              = float(data["lat"])
+    lon              = float(data["lon"])
+    height_agl       = float(data.get("height_agl_m",      4))
+    kml_file         = data.get("kml_file")
+    freq_mhz         = float(data.get("freq_mhz",        915))
+    tx_power_dbm     = float(data.get("tx_power_dbm",     22))
+    tx_gain_dbi      = float(data.get("tx_gain_dbi",       0))
+    sensitivity_dbm  = float(data.get("sensitivity_dbm", -135))
+    veg_type         = data.get("veg_type",             "none")
+    fade_margin_db   = float(data.get("fade_margin_db",    0))
+
+    if not kml_file:
+        return jsonify({"error": "kml_file required"}), 400
+    kml_p = KML_DIR / secure_filename(kml_file)
+    if not kml_p.exists():
+        return jsonify({"error": "Track file not found"}), 404
+
+    try:
+        waypoints = parse_track_file(
+            kml_p.read_text(encoding="utf-8", errors="replace"), kml_p.name
+        )
+    except Exception as exc:
+        return jsonify({"error": f"Parse error: {exc}"}), 400
+    if not waypoints:
+        return jsonify({"error": "No track coordinates found"}), 400
+
+    track_pts = interpolate_path(waypoints, max_pts=300)
+
+    pool = _get_analysis_pool()
+    fut  = pool.submit(score_candidate, (
+        0, lat, lon, height_agl,
+        track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+        sensitivity_dbm, veg_type, fade_margin_db,
+        None,
+    ))
+    try:
+        result = fut.result(timeout=90)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    covered_set = set(result["covered_set"])
+
+    # Compute longest contiguous uncovered stretch (km)
+    longest_gap_m = 0.0
+    current_gap_m = 0.0
+    last_uncov: tuple | None = None
+    for i, pt in enumerate(track_pts):
+        if i not in covered_set:
+            if last_uncov is not None:
+                current_gap_m += haversine(last_uncov[0], last_uncov[1], pt[0], pt[1])
+                longest_gap_m  = max(longest_gap_m, current_gap_m)
+            last_uncov = pt
+        else:
+            current_gap_m = 0.0
+            last_uncov    = None
+
+    return jsonify({
+        "coverage_pct":    result["coverage_pct"],
+        "covered_indices": sorted(covered_set),
+        "track_pts":       [[round(p[0], 5), round(p[1], 5)] for p in track_pts],
+        "longest_gap_km":  round(longest_gap_m / 1000, 1),
+    })
 
 
 # ---------------------------------------------------------------------------
