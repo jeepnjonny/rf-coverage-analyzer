@@ -945,7 +945,8 @@ function updateLegend() {
   const hasRx       = state.receivers && state.receivers.length > 0;
   const hasCoverage = state.pathResults && state.pathResults.length > 0;
   const hasIa       = state.iaSuggestions && state.iaSuggestions.length > 0;
-  if (!hasRx && !hasCoverage && !hasIa) { el.style.display = 'none'; return; }
+  const hasIaTrack  = state.iaAdvisorTrackPts && state.iaAdvisorTrackPts.length > 0;
+  if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack) { el.style.display = 'none'; return; }
   el.style.display = '';
   const lines = [];
   if (hasRx) {
@@ -964,8 +965,16 @@ function updateLegend() {
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#4caf7d"></div><span>Covered</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#e05252"></div><span>Not covered</span></div>');
   }
-  if (hasIa) {
+  const hasIaTrack = state.iaAdvisorTrackPts && state.iaAdvisorTrackPts.length > 0;
+  if (hasIaTrack) {
     if (hasRx || hasCoverage) lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-title">Advisor Coverage</div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#4caf50"></div><span>Covered by suggestions</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ff9800"></div><span>Covered by existing</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#e05252"></div><span>Uncovered</span></div>');
+  }
+  if (hasIa) {
+    if (hasRx || hasCoverage || hasIaTrack) lines.push('<div class="legend-sep"></div>');
     lines.push('<div class="legend-title">Suggested Sites</div>');
     lines.push('<div class="legend-entry"><div class="legend-marker lm-ia">1</div><span>Road (Tier 1)</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-marker lm-ia" style="background:#ff8f00;border-color:#ff8f00">1</div><span>Hilltop (Tier 2)</span></div>');
@@ -2360,12 +2369,53 @@ refreshFmFileLists();
 // ---------------------------------------------------------------------------
 
 // Extend state for the advisor
-state.iaRunning     = false;
-state.iaAbortCtrl   = null;
-state.iaSuggestions = [];
-state.iaSelectedIdx = -1;
-state.iaMarkerLayer = L.layerGroup().addTo(map);
-state.iaMarkers     = [];   // Leaflet marker refs, parallel to iaSuggestions
+state.iaRunning          = false;
+state.iaAbortCtrl        = null;
+state.iaSuggestions      = [];
+state.iaSelectedIdx      = -1;
+state.iaMarkerLayer      = L.layerGroup().addTo(map);
+state.iaMarkers          = [];   // Leaflet marker refs, parallel to iaSuggestions
+state.iaCoverageLayer    = L.layerGroup().addTo(map);
+state.iaAdvisorTrackPts  = [];   // 300-pt track sent by backend
+state.iaCoveredExisting  = new Set();   // indices covered by existing receivers
+state.iaCoveredSuggested = new Set();   // indices covered by accepted suggestions
+
+function _iaCoverageState(idx) {
+  if (state.iaCoveredSuggested.has(idx)) return 'suggested';
+  if (state.iaCoveredExisting.has(idx))  return 'existing';
+  return 'uncovered';
+}
+
+function _iaDrawCoverageTrack() {
+  state.iaCoverageLayer.clearLayers();
+  const pts = state.iaAdvisorTrackPts;
+  if (pts.length < 2) return;
+
+  // Colors: uncovered=red, existing=amber, suggested=green
+  const COLOR = { uncovered: '#e05252', existing: '#ff9800', suggested: '#4caf50' };
+
+  let runState = _iaCoverageState(0);
+  let runPts   = [pts[0]];
+
+  for (let i = 1; i < pts.length; i++) {
+    const s = _iaCoverageState(i);
+    if (s === runState) {
+      runPts.push(pts[i]);
+    } else {
+      // Close current run (include this point so segments join cleanly)
+      runPts.push(pts[i]);
+      L.polyline(runPts, { color: COLOR[runState], weight: 5, opacity: 0.85 })
+        .addTo(state.iaCoverageLayer);
+      runState = s;
+      runPts   = [pts[i]];
+    }
+  }
+  // Flush last run
+  if (runPts.length >= 2) {
+    L.polyline(runPts, { color: COLOR[runState], weight: 5, opacity: 0.85 })
+      .addTo(state.iaCoverageLayer);
+  }
+}
 
 // Update advisor defaults when tier changes
 document.getElementById('ia-tier-select').addEventListener('change', function () {
@@ -2506,10 +2556,19 @@ function _handleIaSSE(evt) {
       }
       break;
 
+    case 'track_pts':
+      state.iaAdvisorTrackPts = evt.pts || [];
+      updateLegend();
+      break;
+
     case 'existing_coverage':
       statusEl.textContent =
         `Existing ${evt.receiver_count} receiver(s) cover ${evt.coverage_pct}% — finding gaps…`;
       barEl.style.width = '28%';
+      if (evt.covered_indices) {
+        state.iaCoveredExisting = new Set(evt.covered_indices);
+        _iaDrawCoverageTrack();
+      }
       break;
 
     case 'scoring_progress':
@@ -2523,6 +2582,10 @@ function _handleIaSSE(evt) {
       _appendIaResultItem(evt, state.iaSuggestions.length - 1);
       document.getElementById('ia-results').classList.remove('hidden');
       barEl.style.width = `${85 + (evt.rank / Math.max(evt.rank + 1, 2)) * 12}%`;
+      if (evt.marginal_indices) {
+        evt.marginal_indices.forEach(i => state.iaCoveredSuggested.add(i));
+        _iaDrawCoverageTrack();
+      }
       updateLegend();
       break;
     }
@@ -2677,6 +2740,12 @@ function _deleteIaSuggestion(idx) {
   }
   state.iaSuggestions.splice(idx, 1);
   state.iaMarkers.splice(idx, 1);
+  // Recompute covered-by-suggestions from remaining suggestions' marginal_indices
+  state.iaCoveredSuggested = new Set();
+  state.iaSuggestions.forEach(s => {
+    (s.marginal_indices || []).forEach(i => state.iaCoveredSuggested.add(i));
+  });
+  _iaDrawCoverageTrack();
   _renderIaResults();
   if (!state.iaSuggestions.length) {
     document.getElementById('ia-import-btn').classList.add('hidden');
@@ -2765,11 +2834,15 @@ function _iaClear() {
     state.iaAbortCtrl.abort();
   }
   state.iaMarkerLayer.clearLayers();
-  state.iaSuggestions = [];
-  state.iaMarkers     = [];
-  state.iaSelectedIdx = null;
-  state.iaRunning     = false;
-  state.iaAbortCtrl   = null;
+  state.iaCoverageLayer.clearLayers();
+  state.iaSuggestions      = [];
+  state.iaMarkers          = [];
+  state.iaSelectedIdx      = null;
+  state.iaRunning          = false;
+  state.iaAbortCtrl        = null;
+  state.iaAdvisorTrackPts  = [];
+  state.iaCoveredExisting  = new Set();
+  state.iaCoveredSuggested = new Set();
   document.getElementById('ia-results').innerHTML = '';
   document.getElementById('ia-results').classList.add('hidden');
   document.getElementById('ia-import-btn').classList.add('hidden');

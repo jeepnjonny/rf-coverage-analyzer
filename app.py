@@ -2381,15 +2381,16 @@ def greedy_set_cover(
 
         covered |= marginal
         selected.append({
-            "rank":           rank,
-            "lat":            best["lat"],
-            "lon":            best["lon"],
-            "tier":           best.get("tier", 1),
-            "highway":        best.get("highway", ""),
-            "coverage_pct":   best["coverage_pct"],
-            "marginal_pts":   len(marginal),
-            "marginal_pct":   round(len(marginal) / total_pts * 100, 1),
-            "cumulative_pct": round(len(covered)  / total_pts * 100, 1),
+            "rank":             rank,
+            "lat":              best["lat"],
+            "lon":              best["lon"],
+            "tier":             best.get("tier", 1),
+            "highway":          best.get("highway", ""),
+            "coverage_pct":     best["coverage_pct"],
+            "marginal_pts":     len(marginal),
+            "marginal_pct":     round(len(marginal) / total_pts * 100, 1),
+            "cumulative_pct":   round(len(covered)  / total_pts * 100, 1),
+            "marginal_indices": sorted(marginal),
         })
 
     return selected
@@ -2458,6 +2459,8 @@ def suggest_locations():
 
             yield sse({"type": "status",
                        "message": f"Track: {total_pts} scoring points. Fetching terrain…"})
+            yield sse({"type": "track_pts",
+                       "pts": [[round(p[0], 5), round(p[1], 5)] for p in track_pts]})
 
             all_lats = [p[0] for p in track_pts]
             all_lons = [p[1] for p in track_pts]
@@ -2517,9 +2520,10 @@ def suggest_locations():
                     yield sse({"type": "status",
                                "message": f"Scoring existing receivers… {pre_done_count}/{n_pre}"})
                 yield sse({
-                    "type":           "existing_coverage",
-                    "coverage_pct":   round(len(pre_covered) / total_pts * 100, 1),
-                    "receiver_count": len(existing_receivers),
+                    "type":            "existing_coverage",
+                    "coverage_pct":    round(len(pre_covered) / total_pts * 100, 1),
+                    "receiver_count":  len(existing_receivers),
+                    "covered_indices": sorted(pre_covered),
                 })
 
             # Fetch OSM road/trail network — run in a thread so we can keep
