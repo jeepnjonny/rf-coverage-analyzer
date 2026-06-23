@@ -99,6 +99,16 @@
           <span class="param-derived" id="rx-sens-uv">≈ 0.04 µV</span>
         </div>
       </div>
+
+      <div class="param-group">
+        <label class="param-label hint-label" title="Practical maximum RF range. Limits candidate scoring to track points within this distance — the FSPL budget is often much larger than real-world terrain allows. Use ~75 km for VHF APRS hilltop sites, ~30 km for LoRa APRS in mountains.">
+          Max practical range <span class="hint-icon">?</span>
+        </label>
+        <div class="param-row">
+          <input type="number" id="max-range-km" class="ctrl-input" value="75" step="5" min="5" max="500" />
+          <span class="param-unit">km</span>
+        </div>
+      </div>
     </section>
 
     <section class="panel" id="infra-advisor-panel">

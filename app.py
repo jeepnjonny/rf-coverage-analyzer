@@ -1851,14 +1851,32 @@ def score_candidate(args: tuple) -> dict:
     (cand_idx, cand_lat, cand_lon, cand_height_agl,
      track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
      sensitivity_dbm, veg_type, fade_margin_db,
-     backbone_pts) = args   # backbone_pts: tuple of (lat,lon,height) or None
+     backbone_pts, max_practical_range_m) = args
 
     TRACKER_H = 1.5
     rx_elev   = _get_elev(cand_lat, cand_lon)
     rx_total  = rx_elev + cand_height_agl
     covered: list[int] = []
 
-    for idx, (plat, plon) in enumerate(track_pts):
+    # Vectorized range mask: only run expensive Deygout on track points within
+    # practical range. Skips ~30–50% of calls on long courses where the candidate
+    # is near one end of the route.
+    if math.isfinite(max_practical_range_m):
+        _tl = np.radians(np.array([tp[0] for tp in track_pts]))
+        _tg = np.radians(np.array([tp[1] for tp in track_pts]))
+        _cl = math.radians(cand_lat)
+        _cg = math.radians(cand_lon)
+        _dl = _tl - _cl
+        _dg = _tg - _cg
+        _a  = np.sin(_dl / 2)**2 + math.cos(_cl) * np.cos(_tl) * np.sin(_dg / 2)**2
+        _reachable = np.where(
+            2 * EARTH_R * np.arcsin(np.sqrt(np.clip(_a, 0, 1))) <= max_practical_range_m
+        )[0]
+    else:
+        _reachable = range(len(track_pts))
+
+    for idx in _reachable:
+        plat, plon = track_pts[idx]
         t_total   = _get_elev(plat, plon) + TRACKER_H
         profile, dist = _terrain_profile_cached(
             _rc(plat), _rc(plon), _rc(cand_lat), _rc(cand_lon)
@@ -2500,6 +2518,7 @@ def suggest_locations():
     tier_hint              = str(  data.get("tier_hint",            "wide1")).lower()
     min_contribution_pct   = float(data.get("min_contribution_pct",    1.0))
     include_foot_trails    = bool( data.get("include_foot_trails",   False))
+    max_practical_range_m  = float(data.get("max_practical_range_m", 75_000))
     existing_receivers     = [r for r in data.get("receivers", [])
                               if str(r.get("enabled", "1")) != "0"]
 
@@ -2588,7 +2607,8 @@ def suggest_locations():
                      track_pts, freq_mhz, tx_power_dbm,
                      tx_gain_dbi + _rx_site_gain(r),   # tracker TX gain + site RX gain
                      sensitivity_dbm, veg_type, fade_margin_db,
-                     None)   # no backbone check for existing receivers
+                     None,                             # no backbone check for existing receivers
+                     max_practical_range_m)
                     for i, r in enumerate(existing_receivers)
                 ]
                 pool = _get_analysis_pool()
@@ -2711,8 +2731,13 @@ def suggest_locations():
             except (ValueError, ZeroDivisionError):
                 max_range_m = float("inf")
 
+            # Clamp theoretical FSPL range to the user's practical limit.
+            # For APRS the FSPL budget gives thousands of km (free-space ideal),
+            # but real-world terrain and propagation cap usable range far lower.
+            effective_range_m = min(max_range_m, max_practical_range_m)
+
             pre_fspl_count = len(candidates)
-            if math.isfinite(max_range_m) and candidates:
+            if math.isfinite(effective_range_m) and candidates:
                 _c_lats_r = np.radians([c["lat"] for c in candidates])
                 _c_lons_r = np.radians([c["lon"] for c in candidates])
                 _t_lats_r = np.radians([tp[0] for tp in track_pts])
@@ -2723,7 +2748,7 @@ def suggest_locations():
                          + np.cos(_c_lats_r)[:, None] * np.cos(_t_lats_r)[None, :]
                          * np.sin(_dlon / 2)**2)
                 _dist_m   = 2 * EARTH_R * np.arcsin(np.sqrt(np.clip(_a, 0, 1)))
-                _in_range = np.any(_dist_m <= max_range_m, axis=1)
+                _in_range = np.any(_dist_m <= effective_range_m, axis=1)
                 raw_count = len(candidates)
                 candidates = [c for c, ok in zip(candidates, _in_range) if ok]
                 removed = raw_count - len(candidates)
@@ -2834,7 +2859,7 @@ def suggest_locations():
                  track_pts, freq_mhz, tx_power_dbm,
                  tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI,   # tracker TX gain + proposed site RX gain
                  sensitivity_dbm, veg_type, fade_margin_db,
-                 backbone_pts)
+                 backbone_pts, max_practical_range_m)
                 for i, c in enumerate(candidates)
             ]
 

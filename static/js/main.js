@@ -2561,6 +2561,7 @@ function startInfraAdvisor() {
     tier_hint:             document.getElementById('ia-tier-select').value || 'wide1',
     min_contribution_pct:  parseFloat(document.getElementById('ia-min-contrib').value) || 0,
     include_foot_trails:   document.getElementById('ia-foot-trails').checked,
+    max_practical_range_m: (parseFloat(document.getElementById('max-range-km').value) || 75) * 1000,
   };
   if (document.getElementById('ia-use-existing').checked && state.receivers.length) {
     params.receivers = state.receivers.filter(r => (r.enabled ?? '1') !== '0');
