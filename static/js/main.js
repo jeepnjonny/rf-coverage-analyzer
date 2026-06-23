@@ -942,11 +942,12 @@ async function updateReceiverPosition(rxIdx, lat, lon, markerObj) {
 function updateLegend() {
   const el = document.getElementById('map-legend');
   if (!el) return;
-  const hasRx       = state.receivers && state.receivers.length > 0;
-  const hasCoverage = state.pathResults && state.pathResults.length > 0;
-  const hasIa       = state.iaSuggestions && state.iaSuggestions.length > 0;
-  const hasIaTrack  = state.iaAdvisorTrackPts && state.iaAdvisorTrackPts.length > 0;
-  if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack) { el.style.display = 'none'; return; }
+  const hasRx            = state.receivers && state.receivers.length > 0;
+  const hasCoverage      = state.pathResults && state.pathResults.length > 0;
+  const hasIa            = state.iaSuggestions && state.iaSuggestions.length > 0;
+  const hasIaTrack       = state.iaAdvisorTrackPts && state.iaAdvisorTrackPts.length > 0;
+  const hasIaCandidates  = state.iaCandidateMarkers && Object.keys(state.iaCandidateMarkers).length > 0;
+  if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack && !hasIaCandidates) { el.style.display = 'none'; return; }
   el.style.display = '';
   const lines = [];
   if (hasRx) {
@@ -977,6 +978,16 @@ function updateLegend() {
     lines.push('<div class="legend-title">Suggested Sites</div>');
     lines.push('<div class="legend-entry"><div class="legend-marker lm-ia">1</div><span>Road (Tier 1)</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-marker lm-ia" style="background:#ff8f00;border-color:#ff8f00">1</div><span>Hilltop (Tier 2)</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-ia" style="background:#2e7d32;border-color:#2e7d32">1</div><span>On-Route (Tier 3)</span></div>');
+  }
+  if (hasIaCandidates) {
+    if (hasRx || hasCoverage || hasIaTrack || hasIa) lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-title">Candidate Sites</div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#888;background:rgba(136,136,136,0.55)"></div><span>Pending</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#4caf50;background:rgba(76,175,80,0.7)"></div><span>Good (&ge;40%)</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#ff9800;background:rgba(255,152,0,0.7)"></div><span>Moderate (&ge;15%)</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#e05252;background:rgba(224,82,82,0.7)"></div><span>Low coverage</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#555;background:rgba(85,85,85,0.7)"></div><span>Backbone blocked</span></div>');
   }
   el.innerHTML = lines.join('');
 }
@@ -2550,6 +2561,7 @@ function startInfraAdvisor() {
     tier_hint:             document.getElementById('ia-tier-select').value || 'wide1',
     min_contribution_pct:  parseFloat(document.getElementById('ia-min-contrib').value) || 0,
     include_foot_trails:   document.getElementById('ia-foot-trails').checked,
+    max_practical_range_m: (parseFloat(document.getElementById('max-range-km').value) || 75) * 1000,
   };
   if (document.getElementById('ia-use-existing').checked && state.receivers.length) {
     params.receivers = state.receivers.filter(r => (r.enabled ?? '1') !== '0');

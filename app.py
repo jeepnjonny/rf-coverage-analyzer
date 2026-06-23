@@ -34,6 +34,7 @@ import functools
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait as cf_wait
 from pathlib import Path
 
+import numpy as np
 import requests
 from flask import Flask, Response, jsonify, request, send_file, stream_with_context
 from werkzeug.utils import secure_filename
@@ -1850,14 +1851,32 @@ def score_candidate(args: tuple) -> dict:
     (cand_idx, cand_lat, cand_lon, cand_height_agl,
      track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
      sensitivity_dbm, veg_type, fade_margin_db,
-     backbone_pts) = args   # backbone_pts: tuple of (lat,lon,height) or None
+     backbone_pts, max_practical_range_m) = args
 
     TRACKER_H = 1.5
     rx_elev   = _get_elev(cand_lat, cand_lon)
     rx_total  = rx_elev + cand_height_agl
     covered: list[int] = []
 
-    for idx, (plat, plon) in enumerate(track_pts):
+    # Vectorized range mask: only run expensive Deygout on track points within
+    # practical range. Skips ~30–50% of calls on long courses where the candidate
+    # is near one end of the route.
+    if math.isfinite(max_practical_range_m):
+        _tl = np.radians(np.array([tp[0] for tp in track_pts]))
+        _tg = np.radians(np.array([tp[1] for tp in track_pts]))
+        _cl = math.radians(cand_lat)
+        _cg = math.radians(cand_lon)
+        _dl = _tl - _cl
+        _dg = _tg - _cg
+        _a  = np.sin(_dl / 2)**2 + math.cos(_cl) * np.cos(_tl) * np.sin(_dg / 2)**2
+        _reachable = np.where(
+            2 * EARTH_R * np.arcsin(np.sqrt(np.clip(_a, 0, 1))) <= max_practical_range_m
+        )[0]
+    else:
+        _reachable = range(len(track_pts))
+
+    for idx in _reachable:
+        plat, plon = track_pts[idx]
         t_total   = _get_elev(plat, plon) + TRACKER_H
         profile, dist = _terrain_profile_cached(
             _rc(plat), _rc(plon), _rc(cand_lat), _rc(cand_lon)
@@ -2499,6 +2518,7 @@ def suggest_locations():
     tier_hint              = str(  data.get("tier_hint",            "wide1")).lower()
     min_contribution_pct   = float(data.get("min_contribution_pct",    1.0))
     include_foot_trails    = bool( data.get("include_foot_trails",   False))
+    max_practical_range_m  = float(data.get("max_practical_range_m", 75_000))
     existing_receivers     = [r for r in data.get("receivers", [])
                               if str(r.get("enabled", "1")) != "0"]
 
@@ -2587,7 +2607,8 @@ def suggest_locations():
                      track_pts, freq_mhz, tx_power_dbm,
                      tx_gain_dbi + _rx_site_gain(r),   # tracker TX gain + site RX gain
                      sensitivity_dbm, veg_type, fade_margin_db,
-                     None)   # no backbone check for existing receivers
+                     None,                             # no backbone check for existing receivers
+                     max_practical_range_m)
                     for i, r in enumerate(existing_receivers)
                 ]
                 pool = _get_analysis_pool()
@@ -2710,14 +2731,26 @@ def suggest_locations():
             except (ValueError, ZeroDivisionError):
                 max_range_m = float("inf")
 
+            # Clamp theoretical FSPL range to the user's practical limit.
+            # For APRS the FSPL budget gives thousands of km (free-space ideal),
+            # but real-world terrain and propagation cap usable range far lower.
+            effective_range_m = min(max_range_m, max_practical_range_m)
+
             pre_fspl_count = len(candidates)
-            if math.isfinite(max_range_m):
-                raw_count = pre_fspl_count
-                candidates = [
-                    c for c in candidates
-                    if any(haversine(c["lat"], c["lon"], tp[0], tp[1]) <= max_range_m
-                           for tp in track_pts)
-                ]
+            if math.isfinite(effective_range_m) and candidates:
+                _c_lats_r = np.radians([c["lat"] for c in candidates])
+                _c_lons_r = np.radians([c["lon"] for c in candidates])
+                _t_lats_r = np.radians([tp[0] for tp in track_pts])
+                _t_lons_r = np.radians([tp[1] for tp in track_pts])
+                _dlat = _c_lats_r[:, None] - _t_lats_r[None, :]
+                _dlon = _c_lons_r[:, None] - _t_lons_r[None, :]
+                _a    = (np.sin(_dlat / 2)**2
+                         + np.cos(_c_lats_r)[:, None] * np.cos(_t_lats_r)[None, :]
+                         * np.sin(_dlon / 2)**2)
+                _dist_m   = 2 * EARTH_R * np.arcsin(np.sqrt(np.clip(_a, 0, 1)))
+                _in_range = np.any(_dist_m <= effective_range_m, axis=1)
+                raw_count = len(candidates)
+                candidates = [c for c, ok in zip(candidates, _in_range) if ok]
                 removed = raw_count - len(candidates)
                 if removed:
                     yield sse({"type": "status",
@@ -2733,16 +2766,16 @@ def suggest_locations():
                 _step = len(candidates) / _PRE_GAP_CAP
                 candidates = [candidates[int(i * _step)] for i in range(_PRE_GAP_CAP)]
 
-            # Gap-focus: find each candidate's nearest track point using squared
-            # Euclidean (no trig — ordering accuracy is all that matters here).
-            for c in candidates:
-                clat, clon = c["lat"], c["lon"]
-                best_d2, best_i = float('inf'), 0
-                for ti, (tlat, tlon) in enumerate(track_pts):
-                    d2 = (clat - tlat) ** 2 + (clon - tlon) ** 2
-                    if d2 < best_d2:
-                        best_d2, best_i = d2, ti
-                c["_ntidx"] = best_i
+            # Vectorized nearest-track-point index: one numpy argmin over the full
+            # squared-degrees distance matrix replaces the O(n×m) Python loop.
+            _gc_lats = np.array([c["lat"] for c in candidates])
+            _gc_lons = np.array([c["lon"] for c in candidates])
+            _gt_lats = np.array([tp[0] for tp in track_pts])
+            _gt_lons = np.array([tp[1] for tp in track_pts])
+            _gd2     = ((_gc_lats[:, None] - _gt_lats[None, :])**2
+                        + (_gc_lons[:, None] - _gt_lons[None, :])**2)
+            for c, ni in zip(candidates, np.argmin(_gd2, axis=1)):
+                c["_ntidx"] = int(ni)
 
             # Terrain LOS pre-filter: reject candidates that have no clear
             # line-of-sight to any of their nearest LOS_CHECK_PTS track points.
@@ -2826,7 +2859,7 @@ def suggest_locations():
                  track_pts, freq_mhz, tx_power_dbm,
                  tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI,   # tracker TX gain + proposed site RX gain
                  sensitivity_dbm, veg_type, fade_margin_db,
-                 backbone_pts)
+                 backbone_pts, max_practical_range_m)
                 for i, c in enumerate(candidates)
             ]
 
