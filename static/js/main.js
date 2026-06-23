@@ -3291,3 +3291,9 @@ async function _iaImportReceivers() {
     }
   }
 }
+
+// Accordion toggles for collapsible panels
+['rf-params-toggle', 'ia-panel-toggle'].forEach(id => {
+  const h3 = document.getElementById(id);
+  if (h3) h3.addEventListener('click', () => h3.closest('.panel').classList.toggle('collapsed'));
+});

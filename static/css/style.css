@@ -329,6 +329,22 @@ html, body {
   letter-spacing: .08em; color: var(--text-dim);
   padding-bottom: 6px; border-bottom: 1px solid var(--border);
 }
+.panel-toggle {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.panel-chevron {
+  font-size: 9px;
+  color: var(--text-dim);
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+.panel.collapsed .panel-chevron { transform: rotate(-90deg); }
+.panel.collapsed > *:not(.panel-title) { display: none !important; }
+.panel.collapsed .panel-title { padding-bottom: 0; border-bottom: none; }
 
 /* ─── File sections ──────────────────────────────────────── */
 
