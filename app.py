@@ -951,6 +951,7 @@ RAW_CANDIDATES_CAP     = 5000  # raw pool size before FSPL pre-filter (large for
 HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
 MAX_HIKE_SLOPE_DEG     = 40    # steeper than 40° (≈84% grade) → reject as physically inaccessible
 WIDE_APRS_RX_GAIN_DBI  = 2.4   # typical omni vertical (J-pole / collinear) for WIDE1/WIDE2/iGate
+TRACK_SAMPLE_SPACING_M = 750   # metres between on-route Tier-3 candidates
 
 # ---------------------------------------------------------------------------
 # ProcessPoolExecutor — true multi-core parallelism for RF analysis
@@ -2300,6 +2301,46 @@ def sample_road_candidates(ways: list[dict], spacing_m: float) -> list[dict]:
     return candidates
 
 
+def sample_track_candidates(pts: list, spacing_m: float) -> list[dict]:
+    """Sample candidate sites every spacing_m metres along the course track itself.
+
+    Tier-3 candidates are placed directly on the race route, guaranteeing
+    coverage of sections that have no nearby OSM-mapped roads or trails.
+    """
+    if not pts or spacing_m <= 0:
+        return []
+
+    seen: set[tuple[float, float]] = set()
+    candidates: list[dict] = []
+
+    k = (round(pts[0][0], 4), round(pts[0][1], 4))
+    seen.add(k)
+    candidates.append({"lat": pts[0][0], "lon": pts[0][1], "tier": 3, "highway": "course"})
+
+    dist_since_last = 0.0
+    for i in range(len(pts) - 1):
+        lat1, lon1 = pts[i]
+        lat2, lon2 = pts[i + 1]
+        seg       = haversine(lat1, lon1, lat2, lon2)
+        remaining = spacing_m - dist_since_last
+
+        if seg >= remaining:
+            pos = remaining
+            while pos <= seg:
+                f  = pos / seg
+                la, lo = intermediate_point(lat1, lon1, lat2, lon2, min(f, 1.0))
+                k = (round(la, 4), round(lo, 4))
+                if k not in seen:
+                    seen.add(k)
+                    candidates.append({"lat": la, "lon": lo, "tier": 3, "highway": "course"})
+                pos += spacing_m
+            dist_since_last = seg - (pos - spacing_m)
+        else:
+            dist_since_last += seg
+
+    return candidates
+
+
 def terrain_los_clear(
     clat: float, clon: float, c_agl: float,
     tlat: float, tlon: float, t_agl: float = 1.5,
@@ -2605,6 +2646,12 @@ def suggest_locations():
             # Tier-1: sample points along driveable roads
             tier1 = sample_road_candidates(ways, ROAD_SAMPLE_SPACING_M)
 
+            # Tier-3: sample points directly on the race route.  Uses the
+            # full-resolution waypoints (not the 300-pt scoring grid) so spacing
+            # is consistent regardless of course length.  These guarantee candidates
+            # where OSM road coverage is incomplete (private roads, unmarked trails).
+            tier3 = sample_track_candidates(waypoints, TRACK_SAMPLE_SPACING_M)
+
             # Tier-2: elevated sites reachable by short hike — run in thread
             # so the keepalive yields prevent proxy timeouts during the scan.
             tier2: list[dict] = []
@@ -2633,13 +2680,13 @@ def suggest_locations():
                     tier2 = _hp_result[0] or []
 
             # Merge and deduplicate into raw pool (up to RAW_CANDIDATES_CAP).
-            # For WIDE2 mode put elevation highpoints first so they fill the budget
-            # before lower road points.
+            # WIDE2: elevation highpoints → roads → on-route fallback.
+            # WIDE1: on-route (most course-relevant) → roads → hilltops.
             if tier_hint == "wide2":
                 tier2_sorted = sorted(tier2, key=lambda c: c.get("elev_m", 0), reverse=True)
-                merged_order = tier2_sorted + tier1
+                merged_order = tier2_sorted + tier1 + tier3
             else:
-                merged_order = tier1 + tier2
+                merged_order = tier3 + tier1 + tier2
             seen_keys: set[tuple[float, float]] = set()
             candidates: list[dict] = []
             for c in merged_order:

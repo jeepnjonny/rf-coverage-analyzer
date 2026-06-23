@@ -2734,10 +2734,10 @@ function _handleIaSSE(evt) {
 }
 
 function _addIaMarker(suggestion, idx) {
-  const isHike = suggestion.tier === 2;
+  const tierClass = suggestion.tier === 2 ? ' ia-tier-2' : suggestion.tier === 3 ? ' ia-tier-3' : '';
   const icon = L.divIcon({
     className: '',
-    html: `<div class="ia-marker${isHike ? ' ia-tier-2' : ''}">${suggestion.rank}</div>`,
+    html: `<div class="ia-marker${tierClass}">${suggestion.rank}</div>`,
     iconSize: [22, 22],
     iconAnchor: [11, 11],
   });
@@ -2768,7 +2768,7 @@ function _appendIaResultItem(suggestion, idx) {
   el.dataset.iaIdx = idx;
 
   const covColor = coverageColor(suggestion.cumulative_pct);
-  const tierLabel = suggestion.tier === 2 ? 'Hike' : (suggestion.highway || 'Road');
+  const tierLabel = suggestion.tier === 2 ? 'Hike' : suggestion.tier === 3 ? 'On-Route' : (suggestion.highway || 'Road');
 
   const alts    = suggestion.alternatives || [];
   const altHTML = alts.length
@@ -2786,7 +2786,7 @@ function _appendIaResultItem(suggestion, idx) {
   el.innerHTML = `
     <div class="ia-item-header">
       <span class="ia-rank-badge">#${suggestion.rank}</span>
-      <span class="ia-tier-badge${suggestion.tier === 2 ? ' ia-tier-2' : ''}">${tierLabel}</span>
+      <span class="ia-tier-badge${tierClass}">${tierLabel}</span>
       <span style="flex:1;font-size:11px;color:var(--text-dim)">${suggestion.lat.toFixed(5)}, ${suggestion.lon.toFixed(5)}</span>
       <button class="ia-action-btn ia-add-btn" title="Add this site to receivers" data-idx="${idx}">+</button>
       <button class="ia-action-btn ia-del-btn" title="Remove this suggestion" data-idx="${idx}">🗑</button>
