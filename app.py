@@ -1856,11 +1856,41 @@ def score_candidate(args: tuple) -> dict:
     TRACKER_H = 1.5
     rx_elev   = _get_elev(cand_lat, cand_lon)
     rx_total  = rx_elev + cand_height_agl
-    covered: list[int] = []
+
+    # Early backbone check: verify the relay path to WIDE2/iGate BEFORE scoring
+    # all track points. A backbone-blocked site contributes zero coverage regardless
+    # of local terrain — checking first avoids O(track_pts) Deygout for blocked sites.
+    if backbone_pts:
+        can_relay = False
+        for (blat, blon, bh) in backbone_pts:
+            b_total   = _get_elev(blat, blon) + bh
+            profile_b, dist_b = _terrain_profile_cached(
+                _rc(cand_lat), _rc(cand_lon), _rc(blat), _rc(blon)
+            )
+            diff_b = deygout_loss_db(profile_b, rx_total, b_total, dist_b, freq_mhz)
+            if diff_b >= HARD_FAIL_DB:
+                continue
+            veg_b  = vegetation_loss_db(profile_b, rx_total, b_total, dist_b, freq_mhz, veg_type)
+            if veg_b >= HARD_FAIL_DB:
+                continue
+            rssi_b = tx_power_dbm + tx_gain_dbi - fspl_db(freq_mhz, dist_b) - diff_b - veg_b
+            if rssi_b >= (sensitivity_dbm + fade_margin_db):
+                can_relay = True
+                break
+        if not can_relay:
+            return {
+                "cand_idx":         cand_idx,
+                "covered_set":      [],
+                "coverage_pct":     0.0,
+                "lat":              cand_lat,
+                "lon":              cand_lon,
+                "backbone_blocked": True,
+            }
 
     # Vectorized range mask: only run expensive Deygout on track points within
     # practical range. Skips ~30–50% of calls on long courses where the candidate
     # is near one end of the route.
+    covered: list[int] = []
     if math.isfinite(max_practical_range_m):
         _tl = np.radians(np.array([tp[0] for tp in track_pts]))
         _tg = np.radians(np.array([tp[1] for tp in track_pts]))
@@ -1893,38 +1923,13 @@ def score_candidate(args: tuple) -> dict:
             covered.append(int(idx))  # int(): numpy.intp → Python int for JSON safety
 
     total = len(track_pts)
-    base  = {
-        "cand_idx":    cand_idx,
-        "covered_set": covered,
+    return {
+        "cand_idx":     cand_idx,
+        "covered_set":  covered,
         "coverage_pct": round(len(covered) / total * 100, 1) if total else 0.0,
         "lat":          cand_lat,
         "lon":          cand_lon,
     }
-
-    # Chain check: WIDE1 candidate must also reach at least one WIDE2/iGate
-    if backbone_pts and covered:
-        can_relay = False
-        for (blat, blon, bh) in backbone_pts:
-            b_total = _get_elev(blat, blon) + bh
-            profile_b, dist_b = _terrain_profile_cached(
-                _rc(cand_lat), _rc(cand_lon), _rc(blat), _rc(blon)
-            )
-            diff_b = deygout_loss_db(profile_b, rx_total, b_total, dist_b, freq_mhz)
-            if diff_b >= HARD_FAIL_DB:
-                continue
-            veg_b  = vegetation_loss_db(profile_b, rx_total, b_total, dist_b, freq_mhz, veg_type)
-            if veg_b >= HARD_FAIL_DB:
-                continue
-            rssi_b = tx_power_dbm + tx_gain_dbi - fspl_db(freq_mhz, dist_b) - diff_b - veg_b
-            if rssi_b >= (sensitivity_dbm + fade_margin_db):
-                can_relay = True
-                break
-        if not can_relay:
-            base["covered_set"]   = []
-            base["coverage_pct"]  = 0.0
-            base["backbone_blocked"] = True
-
-    return base
 
 
 # ---------------------------------------------------------------------------

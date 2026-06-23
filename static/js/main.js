@@ -2652,6 +2652,7 @@ function _handleIaSSE(evt) {
         m.bindTooltip(`Candidate (${c.tier === 2 ? 'Hike' : 'Road'})`, {permanent: false});
         state.iaCandidateMarkers[c.idx] = m;
       });
+      updateLegend();
       break;
 
     case 'candidate_scored': {
