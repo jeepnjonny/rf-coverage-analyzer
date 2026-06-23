@@ -1890,7 +1890,7 @@ def score_candidate(args: tuple) -> dict:
         path_loss = fspl_db(freq_mhz, dist)
         rssi      = tx_power_dbm + tx_gain_dbi - path_loss - diff_loss - veg_loss
         if rssi >= (sensitivity_dbm + fade_margin_db):
-            covered.append(idx)
+            covered.append(int(idx))  # int(): numpy.intp → Python int for JSON safety
 
     total = len(track_pts)
     base  = {
