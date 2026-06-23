@@ -329,6 +329,22 @@ html, body {
   letter-spacing: .08em; color: var(--text-dim);
   padding-bottom: 6px; border-bottom: 1px solid var(--border);
 }
+.panel-toggle {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.panel-chevron {
+  font-size: 9px;
+  color: var(--text-dim);
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+.panel.collapsed .panel-chevron { transform: rotate(-90deg); }
+.panel.collapsed > *:not(.panel-title) { display: none !important; }
+.panel.collapsed .panel-title { padding-bottom: 0; border-bottom: none; }
 
 /* ─── File sections ──────────────────────────────────────── */
 
@@ -922,6 +938,7 @@ html, body {
   flex-shrink: 0;
 }
 .ia-tier-badge.ia-tier-2 { color: #ffc107; border-color: #ffc107; }
+.ia-tier-badge.ia-tier-3 { color: #4caf50; border-color: #4caf50; }
 
 .ia-cov-row {
   display: flex;
@@ -959,6 +976,7 @@ html, body {
   transition: transform .1s, box-shadow .1s;
 }
 .ia-marker.ia-tier-2   { background: #b8860b; }
+.ia-marker.ia-tier-3   { background: #2e7d32; }
 .ia-marker.ia-selected {
   transform: scale(1.2);
   box-shadow: 0 0 0 4px rgba(230,126,0,0.45), 0 2px 8px rgba(0,0,0,0.5);

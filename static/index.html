@@ -37,12 +37,11 @@
         <div class="fmb-type">Receiver CSV</div>
         <div class="fmb-name" id="csv-mgr-name">— not loaded —</div>
       </button>
-      <button class="btn btn-secondary btn-full" id="add-rx-btn">＋ Add Receiver</button>
       <button class="btn btn-secondary btn-full" id="saved-mgr-btn">📂 Saved Analyses</button>
     </section>
 
     <section class="panel">
-      <h3 class="panel-title">RF Parameters</h3>
+      <h3 class="panel-title panel-toggle" id="rf-params-toggle">RF Parameters <span class="panel-chevron">▼</span></h3>
 
       <div class="param-group">
         <label class="param-label">Frequency</label>
@@ -103,7 +102,7 @@
     </section>
 
     <section class="panel" id="infra-advisor-panel">
-      <h3 class="panel-title">Infrastructure Advisor</h3>
+      <h3 class="panel-title panel-toggle" id="ia-panel-toggle">Infrastructure Advisor <span class="panel-chevron">▼</span></h3>
 
       <div class="param-group">
         <label class="param-label hint-label"
@@ -201,6 +200,7 @@
           APRS Chain Analysis <span class="hint-icon">?</span>
         </label>
       </div>
+      <button class="btn btn-secondary btn-full" id="add-rx-btn">＋ Add Receiver</button>
       <div style="display:flex;gap:6px">
         <button id="analyze-track-btn" class="btn btn-primary btn-full" disabled>▶ Track Coverage</button>
         <button id="analyze-links-btn" class="btn btn-primary btn-full" disabled>▶ Receiver Links</button>

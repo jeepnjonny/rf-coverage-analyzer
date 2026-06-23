@@ -950,6 +950,8 @@ MAX_CANDIDATES         = 200   # hard cap on candidates sent to full RF scoring
 RAW_CANDIDATES_CAP     = 5000  # raw pool size before FSPL pre-filter (large for 100+ mile courses)
 HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
 MAX_HIKE_SLOPE_DEG     = 40    # steeper than 40° (≈84% grade) → reject as physically inaccessible
+WIDE_APRS_RX_GAIN_DBI  = 2.4   # typical omni vertical (J-pole / collinear) for WIDE1/WIDE2/iGate
+TRACK_SAMPLE_SPACING_M = 750   # metres between on-route Tier-3 candidates
 
 # ---------------------------------------------------------------------------
 # ProcessPoolExecutor — true multi-core parallelism for RF analysis
@@ -2299,6 +2301,69 @@ def sample_road_candidates(ways: list[dict], spacing_m: float) -> list[dict]:
     return candidates
 
 
+def sample_track_candidates(pts: list, spacing_m: float) -> list[dict]:
+    """Sample candidate sites every spacing_m metres along the course track itself.
+
+    Tier-3 candidates are placed directly on the race route, guaranteeing
+    coverage of sections that have no nearby OSM-mapped roads or trails.
+    """
+    if not pts or spacing_m <= 0:
+        return []
+
+    seen: set[tuple[float, float]] = set()
+    candidates: list[dict] = []
+
+    k = (round(pts[0][0], 4), round(pts[0][1], 4))
+    seen.add(k)
+    candidates.append({"lat": pts[0][0], "lon": pts[0][1], "tier": 3, "highway": "course"})
+
+    dist_since_last = 0.0
+    for i in range(len(pts) - 1):
+        lat1, lon1 = pts[i]
+        lat2, lon2 = pts[i + 1]
+        seg       = haversine(lat1, lon1, lat2, lon2)
+        remaining = spacing_m - dist_since_last
+
+        if seg >= remaining:
+            pos = remaining
+            while pos <= seg:
+                f  = pos / seg
+                la, lo = intermediate_point(lat1, lon1, lat2, lon2, min(f, 1.0))
+                k = (round(la, 4), round(lo, 4))
+                if k not in seen:
+                    seen.add(k)
+                    candidates.append({"lat": la, "lon": lo, "tier": 3, "highway": "course"})
+                pos += spacing_m
+            dist_since_last = seg - (pos - spacing_m)
+        else:
+            dist_since_last += seg
+
+    return candidates
+
+
+def terrain_los_clear(
+    clat: float, clon: float, c_agl: float,
+    tlat: float, tlon: float, t_agl: float = 1.5,
+    n_samples: int = 8,
+) -> bool:
+    """Return True if terrain does not block the straight-line path between a
+    candidate site (c_agl metres AGL) and a track point (t_agl AGL).
+
+    Walks n_samples evenly spaced interior points along the path and checks
+    whether any terrain reading rises above the LOS elevation at that fraction.
+    Coarse but fast — intended as a cheap pre-screen before full RF analysis.
+    """
+    c_elev = _get_elev(clat, clon) + c_agl
+    t_elev = _get_elev(tlat, tlon) + t_agl
+    for si in range(1, n_samples):
+        f = si / n_samples
+        mlat, mlon = intermediate_point(clat, clon, tlat, tlon, f)
+        terrain = _get_elev(mlat, mlon)
+        if terrain > c_elev + f * (t_elev - c_elev):
+            return False
+    return True
+
+
 def find_highpoint_candidates(
     tier1_pts: list[dict],
     max_dist_m: float,
@@ -2509,10 +2574,18 @@ def suggest_locations():
             if existing_receivers:
                 yield sse({"type": "status",
                            "message": f"Scoring {len(existing_receivers)} existing receiver(s)…"})
+                def _rx_site_gain(r: dict) -> float:
+                    # Use the CSV value; fall back to WIDE_APRS_RX_GAIN_DBI for
+                    # WIDE1/WIDE2/iGate when the CSV entry was left at zero.
+                    raw = float(r.get("antenna_gain_dbi") or 0)
+                    if raw == 0.0 and str(r.get("role", "")).lower() in ("wide1", "wide2", "igate"):
+                        return WIDE_APRS_RX_GAIN_DBI
+                    return raw
                 pre_args = [
                     (i, float(r["latitude"]), float(r["longitude"]),
                      float(r.get("height_agl_m") or 2),
-                     track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+                     track_pts, freq_mhz, tx_power_dbm,
+                     tx_gain_dbi + _rx_site_gain(r),   # tracker TX gain + site RX gain
                      sensitivity_dbm, veg_type, fade_margin_db,
                      None)   # no backbone check for existing receivers
                     for i, r in enumerate(existing_receivers)
@@ -2573,6 +2646,12 @@ def suggest_locations():
             # Tier-1: sample points along driveable roads
             tier1 = sample_road_candidates(ways, ROAD_SAMPLE_SPACING_M)
 
+            # Tier-3: sample points directly on the race route.  Uses the
+            # full-resolution waypoints (not the 300-pt scoring grid) so spacing
+            # is consistent regardless of course length.  These guarantee candidates
+            # where OSM road coverage is incomplete (private roads, unmarked trails).
+            tier3 = sample_track_candidates(waypoints, TRACK_SAMPLE_SPACING_M)
+
             # Tier-2: elevated sites reachable by short hike — run in thread
             # so the keepalive yields prevent proxy timeouts during the scan.
             tier2: list[dict] = []
@@ -2601,13 +2680,13 @@ def suggest_locations():
                     tier2 = _hp_result[0] or []
 
             # Merge and deduplicate into raw pool (up to RAW_CANDIDATES_CAP).
-            # For WIDE2 mode put elevation highpoints first so they fill the budget
-            # before lower road points.
+            # WIDE2: elevation highpoints → roads → on-route fallback.
+            # WIDE1: on-route (most course-relevant) → roads → hilltops.
             if tier_hint == "wide2":
                 tier2_sorted = sorted(tier2, key=lambda c: c.get("elev_m", 0), reverse=True)
-                merged_order = tier2_sorted + tier1
+                merged_order = tier2_sorted + tier1 + tier3
             else:
-                merged_order = tier1 + tier2
+                merged_order = tier3 + tier1 + tier2
             seen_keys: set[tuple[float, float]] = set()
             candidates: list[dict] = []
             for c in merged_order:
@@ -2623,7 +2702,7 @@ def suggest_locations():
             # even under ideal free-space conditions.  Runs in milliseconds and
             # lets us draw from a 1000-candidate raw pool while only passing the
             # spatially relevant subset to the expensive terrain/diffraction model.
-            fspl_budget_db = (tx_power_dbm + tx_gain_dbi
+            fspl_budget_db = (tx_power_dbm + tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI
                               - sensitivity_dbm - fade_margin_db)
             try:
                 max_range_m = (10 ** ((fspl_budget_db - 32.44
@@ -2664,6 +2743,24 @@ def suggest_locations():
                     if d2 < best_d2:
                         best_d2, best_i = d2, ti
                 c["_ntidx"] = best_i
+
+            # Terrain LOS pre-filter: reject candidates that have no clear
+            # line-of-sight to any of their nearest LOS_CHECK_PTS track points.
+            # Catches "wrong valley / ridge-blocked" sites cheaply using the
+            # already-loaded elevation tiles before full RF analysis runs.
+            # Cost: ~n_candidates × LOS_CHECK_PTS × 8 elevation lookups ≈ <100ms.
+            _LOS_CHECK_PTS = 6
+            _los_survivors: list[dict] = []
+            for c in candidates:
+                ni    = c["_ntidx"]
+                start = max(0, ni - _LOS_CHECK_PTS // 2)
+                end   = min(len(track_pts), start + _LOS_CHECK_PTS)
+                if any(terrain_los_clear(c["lat"], c["lon"], antenna_height_m,
+                                         track_pts[ti][0], track_pts[ti][1])
+                       for ti in range(start, end)):
+                    _los_survivors.append(c)
+            if _los_survivors:      # fallback: keep all if elevation tiles sparse
+                candidates = _los_survivors
 
             # Drop candidates whose nearest track point is already covered — they
             # cannot improve marginal coverage, so scoring them wastes RF budget.
@@ -2726,7 +2823,8 @@ def suggest_locations():
 
             score_args = [
                 (i, c["lat"], c["lon"], antenna_height_m,
-                 track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
+                 track_pts, freq_mhz, tx_power_dbm,
+                 tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI,   # tracker TX gain + proposed site RX gain
                  sensitivity_dbm, veg_type, fade_margin_db,
                  backbone_pts)
                 for i, c in enumerate(candidates)
