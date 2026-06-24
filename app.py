@@ -946,13 +946,26 @@ TIER1_HIGHWAYS: set[str] = {
     "motorway", "trunk", "primary", "secondary", "tertiary",
     "residential", "unclassified", "service", "track",
 }
-ROAD_SAMPLE_SPACING_M  = 250   # metres between sampled road candidates
-MAX_CANDIDATES         = 200   # hard cap on candidates sent to full RF scoring
-RAW_CANDIDATES_CAP     = 5000  # raw pool size before FSPL pre-filter (large for 100+ mile courses)
-HIGHPOINT_GRID_M       = 100   # radial scan grid spacing for hike-accessible sites
-MAX_HIKE_SLOPE_DEG     = 40    # steeper than 40° (≈84% grade) → reject as physically inaccessible
-WIDE_APRS_RX_GAIN_DBI  = 2.4   # typical omni vertical (J-pole / collinear) for WIDE1/WIDE2/iGate
-TRACK_SAMPLE_SPACING_M = 750   # metres between on-route Tier-3 candidates
+ROAD_SAMPLE_SPACING_M  = 150    # metres between sampled road candidates
+MAX_CANDIDATES         = 300    # hard cap on candidates sent to full RF scoring
+RAW_CANDIDATES_CAP     = 10000  # raw pool size before FSPL pre-filter
+HIGHPOINT_GRID_M       = 75     # radial scan grid spacing for hike-accessible sites
+MAX_HIKE_SLOPE_DEG     = 40     # steeper than 40° (≈84% grade) → reject as physically inaccessible
+WIDE_APRS_RX_GAIN_DBI  = 2.4    # typical omni vertical (J-pole / collinear) for WIDE1/WIDE2/iGate
+TRACK_SAMPLE_SPACING_M = 400    # metres between on-route Tier-3 candidates
+HIGHPOINT_N_BEARINGS   = 24     # radial scan directions for Tier-2 elevated sites
+# Coarse scoring — cheap in-process pass before expensive parallel RF model
+COARSE_SCORE_SUBSAMPLE = 8      # score every Nth track point (300 pts → ~37 samples)
+COARSE_TERRAIN_SAMPLES = 6      # interior terrain check points per coarse LOS path
+COARSE_REJECT_BOTTOM   = 0.50   # discard bottom 50 % of candidates by coarse score
+# Heat-map expansion — micro-candidates in geographically dense coarse-survivor zones
+HOT_ZONE_CELL_M        = 400.0  # spatial grid cell size (metres) for clustering
+HOT_ZONE_MIN_DENSITY   = 2      # min coarse survivors per cell to declare a hot zone
+HOT_ZONE_EXPAND_M      = 200.0  # expansion radius (m) around each hot zone centre
+HOT_ZONE_STEP_M        = 50.0   # micro-candidate grid step (m) inside hot zones
+# Local refinement — fine spatial search around each greedy-selected site
+REFINE_RADIUS_M        = 150.0  # search radius (m) around each selected site
+REFINE_STEP_M          = 50.0   # grid step (m) for local refinement
 
 # ---------------------------------------------------------------------------
 # ProcessPoolExecutor — true multi-core parallelism for RF analysis
@@ -2388,6 +2401,130 @@ def terrain_los_clear(
     return True
 
 
+def coarse_score_candidate(
+    clat: float, clon: float, c_agl: float,
+    track_pts: list,
+    freq_mhz: float, tx_power_dbm: float, tx_gain_dbi: float,
+    sensitivity_dbm: float, fade_margin_db: float,
+    subsample: int = COARSE_SCORE_SUBSAMPLE,
+    n_terrain: int = COARSE_TERRAIN_SAMPLES,
+) -> float:
+    """Fast coarse coverage fraction using FSPL + simplified binary LOS check.
+
+    Scores the candidate against every `subsample`-th track point using
+    COARSE_TERRAIN_SAMPLES interior terrain checks per link (no Deygout
+    diffraction).  Runs in the main process from the already-cached tile
+    store — roughly 20× faster than full scoring — and is used to rank and
+    prune the candidate pool before the expensive parallel RF pass.
+
+    Returns estimated fraction of sampled track points covered [0.0–1.0].
+    """
+    c_elev    = _get_elev(clat, clon)
+    rx_height = c_elev + c_agl
+    covered   = 0
+    total     = 0
+
+    for pt_lat, pt_lon in track_pts[::subsample]:
+        dist_m = haversine(clat, clon, pt_lat, pt_lon)
+        if dist_m < 1.0:
+            covered += 1
+            total   += 1
+            continue
+
+        dist_km   = dist_m / 1000.0
+        tx_elev   = _get_elev(pt_lat, pt_lon)
+        tx_height = tx_elev + 1.5  # tracker AGL
+
+        # FSPL ceiling — if the link can't close in free space, skip terrain work
+        fspl = 32.44 + 20.0 * math.log10(max(freq_mhz, 1.0)) + 20.0 * math.log10(max(dist_km, 0.001))
+        if tx_power_dbm + tx_gain_dbi - fspl < sensitivity_dbm + fade_margin_db:
+            total += 1
+            continue
+
+        # Binary terrain check at n_terrain interior fractions (5 m clearance)
+        blocked = False
+        for si in range(1, n_terrain + 1):
+            f      = si / (n_terrain + 1)
+            mlat, mlon = intermediate_point(clat, clon, pt_lat, pt_lon, f)
+            terrain    = _get_elev(mlat, mlon)
+            los_height = rx_height + f * (tx_height - rx_height)
+            if terrain > los_height + 5.0:
+                blocked = True
+                break
+
+        total += 1
+        if not blocked:
+            covered += 1
+
+    return covered / max(total, 1)
+
+
+def compute_hot_zones(
+    candidates: list[dict],
+    cell_m: float = HOT_ZONE_CELL_M,
+    min_density: int = HOT_ZONE_MIN_DENSITY,
+) -> list[tuple[float, float, int]]:
+    """Return geographic cells containing >= min_density coarse-surviving candidates.
+
+    Cells are approximately cell_m × cell_m on the ground.  Returns
+    (centre_lat, centre_lon, count) for each qualifying cell.  Hot zones
+    indicate areas where the terrain geometry makes many nearby sites viable —
+    good candidates for dense micro-sampling.
+    """
+    cell_deg = cell_m / 111_000.0
+    grid: dict[tuple[int, int], list[dict]] = {}
+    for c in candidates:
+        ci = (int(c["lat"] / cell_deg), int(c["lon"] / cell_deg))
+        grid.setdefault(ci, []).append(c)
+
+    zones: list[tuple[float, float, int]] = []
+    for cell_cands in grid.values():
+        if len(cell_cands) >= min_density:
+            avg_lat = sum(c["lat"] for c in cell_cands) / len(cell_cands)
+            avg_lon = sum(c["lon"] for c in cell_cands) / len(cell_cands)
+            zones.append((avg_lat, avg_lon, len(cell_cands)))
+
+    return zones
+
+
+def expand_hot_zones(
+    hot_zones: list[tuple[float, float, int]],
+    expand_m: float = HOT_ZONE_EXPAND_M,
+    step_m: float = HOT_ZONE_STEP_M,
+) -> list[dict]:
+    """Generate a fine grid of Tier-4 micro-candidates around each hot zone centre.
+
+    Creates candidates at step_m resolution within expand_m radius.  These
+    micro-candidates let the optimizer explore small spatial variations —
+    exact ridge position, alternate road access points — that the sparser
+    initial sweep may have missed in a zone that already demonstrated good
+    RF geometry during coarse scoring.
+    """
+    micro: list[dict] = []
+    seen:  set[tuple[float, float]] = set()
+    n_steps = max(1, int(expand_m / step_m))
+
+    for centre_lat, centre_lon, _density in hot_zones:
+        cos_lat       = math.cos(math.radians(centre_lat))
+        m_per_deg_lat = 111_000.0
+        m_per_deg_lon = 111_000.0 * max(cos_lat, 0.001)
+
+        for di in range(-n_steps, n_steps + 1):
+            for dj in range(-n_steps, n_steps + 1):
+                offset_m = math.sqrt((di * step_m) ** 2 + (dj * step_m) ** 2)
+                if offset_m > expand_m or offset_m < 1.0:
+                    continue
+                lat = centre_lat + (di * step_m) / m_per_deg_lat
+                lon = centre_lon + (dj * step_m) / m_per_deg_lon
+                key = (round(lat, 4), round(lon, 4))
+                if key not in seen:
+                    seen.add(key)
+                    micro.append({"lat": lat, "lon": lon,
+                                  "tier": 4, "highway": "hot_zone"})
+
+    return micro
+
+
 def find_highpoint_candidates(
     tier1_pts: list[dict],
     max_dist_m: float,
@@ -2395,15 +2532,15 @@ def find_highpoint_candidates(
 ) -> list[dict]:
     """For each Tier-1 road point find the highest terrain point reachable by hike.
 
-    Scans radially in 12 directions out to max_dist_m at grid_m intervals.
-    Returns each best-elevated point that is higher than its corresponding road
-    point (deduplicated across all road points).
+    Scans radially in HIGHPOINT_N_BEARINGS directions out to max_dist_m at
+    grid_m intervals.  Returns each best-elevated point that is higher than
+    its corresponding road point (deduplicated across all road points).
     """
     if not tier1_pts or max_dist_m <= 0:
         return []
 
     n_rings  = max(1, int(max_dist_m / grid_m))
-    n_angles = 12
+    n_angles = HIGHPOINT_N_BEARINGS
     seen: set[tuple[float, float]] = set()
     candidates: list[dict] = []
 
@@ -2762,17 +2899,74 @@ def suggest_locations():
                                "message": (f"Range pre-filter: {removed} out-of-range "
                                            f"candidates removed, {len(candidates)} remain.")})
 
-            # Geographically spread pre-cap: bounds the O(n×m) ntidx computation
-            # below. Sort by lat gives rough N→S ordering; stride sampling
-            # distributes candidates across the full course before gap-focus.
-            _PRE_GAP_CAP = 800
-            if len(candidates) > _PRE_GAP_CAP:
+            # ── Phase 1: Coarse RF scoring ───────────────────────────────────
+            # Cheap in-process pass using FSPL + binary LOS (no Deygout).
+            # Scores every COARSE_SCORE_SUBSAMPLE-th track point with
+            # COARSE_TERRAIN_SAMPLES interior terrain checks — ~20× faster than
+            # the full model.  Lets us evaluate the full FSPL-survivor pool
+            # (up to RAW_CANDIDATES_CAP) before committing to the expensive
+            # parallel RF scoring pass.
+            _PRE_COARSE_CAP = 1500
+            if len(candidates) > _PRE_COARSE_CAP:
                 candidates.sort(key=lambda c: c["lat"])
-                _step = len(candidates) / _PRE_GAP_CAP
-                candidates = [candidates[int(i * _step)] for i in range(_PRE_GAP_CAP)]
+                _step = len(candidates) / _PRE_COARSE_CAP
+                candidates = [candidates[int(i * _step)] for i in range(_PRE_COARSE_CAP)]
 
-            # Vectorized nearest-track-point index: one numpy argmin over the full
-            # squared-degrees distance matrix replaces the O(n×m) Python loop.
+            yield sse({"type": "status",
+                       "message": f"Coarse scoring {len(candidates)} candidates…"})
+
+            _rx_gain_total = tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI
+            for c in candidates:
+                c["_coarse"] = coarse_score_candidate(
+                    c["lat"], c["lon"], antenna_height_m,
+                    track_pts, freq_mhz,
+                    tx_power_dbm, _rx_gain_total,
+                    sensitivity_dbm, fade_margin_db,
+                )
+
+            # Drop bottom COARSE_REJECT_BOTTOM fraction — keep at least 50 candidates
+            candidates.sort(key=lambda c: c["_coarse"], reverse=True)
+            n_coarse_keep = max(50, int(len(candidates) * (1.0 - COARSE_REJECT_BOTTOM)))
+            coarse_survivors = candidates[:n_coarse_keep]
+
+            # ── Phase 2: Heat-map expansion ──────────────────────────────────
+            # Find geographic clusters where multiple coarse survivors are
+            # concentrated (= terrain geometry works in this area), then seed
+            # a fine grid of Tier-4 micro-candidates around each cluster centre.
+            hot_zones = compute_hot_zones(coarse_survivors)
+            micro_cands = expand_hot_zones(hot_zones)
+
+            if micro_cands:
+                yield sse({"type": "status",
+                           "message": (f"Hot-zone analysis: {len(hot_zones)} active zone(s) → "
+                                       f"coarse-scoring {len(micro_cands)} micro-candidates…")})
+                _micro_survivors = []
+                _existing_keys = {(round(c["lat"], 4), round(c["lon"], 4))
+                                  for c in coarse_survivors}
+                for mc in micro_cands:
+                    mk = (round(mc["lat"], 4), round(mc["lon"], 4))
+                    if mk in _existing_keys:
+                        continue
+                    mc["_coarse"] = coarse_score_candidate(
+                        mc["lat"], mc["lon"], antenna_height_m,
+                        track_pts, freq_mhz,
+                        tx_power_dbm, _rx_gain_total,
+                        sensitivity_dbm, fade_margin_db,
+                    )
+                    if mc["_coarse"] > 0.0:
+                        _micro_survivors.append(mc)
+                        _existing_keys.add(mk)
+
+                coarse_survivors = coarse_survivors + _micro_survivors
+                yield sse({"type": "status",
+                           "message": (f"{len(_micro_survivors)} micro-candidates added from "
+                                       f"hot zones. Total pool: {len(coarse_survivors)}.")})
+
+            candidates = coarse_survivors
+
+            # ── Phase 3: Vectorized nearest-track-point index ────────────────
+            # One numpy argmin over the full squared-degrees distance matrix
+            # replaces an O(n×m) Python loop.
             _gc_lats = np.array([c["lat"] for c in candidates])
             _gc_lons = np.array([c["lon"] for c in candidates])
             _gt_lats = np.array([tp[0] for tp in track_pts])
@@ -2782,11 +2976,10 @@ def suggest_locations():
             for c, ni in zip(candidates, np.argmin(_gd2, axis=1)):
                 c["_ntidx"] = int(ni)
 
-            # Terrain LOS pre-filter: reject candidates that have no clear
-            # line-of-sight to any of their nearest LOS_CHECK_PTS track points.
-            # Catches "wrong valley / ridge-blocked" sites cheaply using the
-            # already-loaded elevation tiles before full RF analysis runs.
-            # Cost: ~n_candidates × LOS_CHECK_PTS × 8 elevation lookups ≈ <100ms.
+            # ── Phase 4: Terrain LOS pre-filter ─────────────────────────────
+            # Belt-and-suspenders: reject candidates with no clear LOS to any
+            # of their nearest LOS_CHECK_PTS track points using the 8-sample
+            # full LOS check (catches coarse-scoring edge cases).
             _LOS_CHECK_PTS = 6
             _los_survivors: list[dict] = []
             for c in candidates:
@@ -2797,20 +2990,29 @@ def suggest_locations():
                                          track_pts[ti][0], track_pts[ti][1])
                        for ti in range(start, end)):
                     _los_survivors.append(c)
-            if _los_survivors:      # fallback: keep all if elevation tiles sparse
+            if _los_survivors:
                 candidates = _los_survivors
 
-            # Drop candidates whose nearest track point is already covered — they
-            # cannot improve marginal coverage, so scoring them wastes RF budget.
+            # Drop candidates whose nearest track point is already covered.
             gap_candidates = [c for c in candidates if c["_ntidx"] not in pre_covered]
-            work = gap_candidates if gap_candidates else candidates  # fallback: keep all
+            work = gap_candidates if gap_candidates else candidates
 
-            # Sort by track position, then stride-subsample to MAX_CANDIDATES so
-            # scoring slots are spread across the uncovered sections of the course.
+            # ── Phase 5: Quality-aware geographic stride ─────────────────────
+            # Divide work into MAX_CANDIDATES geographic buckets (by track
+            # position) and within each bucket select the candidate with the
+            # highest coarse score.  This preserves full-course geographic
+            # spread while preferring sites that already demonstrated good RF
+            # geometry in the coarse pass.
             work.sort(key=lambda c: c["_ntidx"])
             if len(work) > MAX_CANDIDATES:
-                step = len(work) / MAX_CANDIDATES
-                candidates = [work[int(i * step)] for i in range(MAX_CANDIDATES)]
+                bucket_size = len(work) / MAX_CANDIDATES
+                candidates = []
+                for bi in range(MAX_CANDIDATES):
+                    bstart = int(bi * bucket_size)
+                    bend   = int((bi + 1) * bucket_size)
+                    bucket = work[bstart:bend]
+                    if bucket:
+                        candidates.append(max(bucket, key=lambda c: c.get("_coarse", 0.0)))
             else:
                 candidates = work
 
@@ -2836,13 +3038,16 @@ def suggest_locations():
                                 "Ensure the course overlaps an area with OSM road data."),
                 }); return
 
+            _tier4_count = sum(1 for c in candidates if c.get("tier") == 4)
             yield sse({
                 "type":            "osm_status",
-                "message":         f"{len(candidates)} candidate sites ready to score.",
+                "message":         f"{len(candidates)} candidate sites ready to score "
+                                   f"({_tier4_count} from hot-zone expansion).",
                 "way_count":       len(ways),
                 "candidate_count": len(candidates),
                 "tier1_count":     len(tier1),
                 "tier2_count":     len(tier2),
+                "tier4_count":     _tier4_count,
             })
 
             # Parallel RF scoring via the analysis process pool
@@ -2930,6 +3135,82 @@ def suggest_locations():
                 pre_covered=pre_covered,
                 min_contribution_pct=min_contribution_pct,
             )
+
+            # ── Phase 6: Local refinement ────────────────────────────────────
+            # For each greedy-selected site, score a fine grid of micro-
+            # candidates within REFINE_RADIUS_M at REFINE_STEP_M resolution
+            # using the full RF model.  If any neighbour outperforms the
+            # selected site on individual coverage_pct, replace the lat/lon.
+            # This catches small positional improvements (50–150 m shifts)
+            # missed by the coarser initial sweep.
+            if selected:
+                yield sse({"type": "status",
+                           "message": f"Refining {len(selected)} selected site position(s)…"})
+                _refine_args  = []
+                _refine_meta  = {}   # abs_idx → selected list index
+                _refine_base  = len(candidates)  # offset so idx doesn't clash
+
+                for sel_i, site in enumerate(selected):
+                    clat, clon  = site["lat"], site["lon"]
+                    cos_lat     = math.cos(math.radians(clat))
+                    m_per_dlat  = 111_000.0
+                    m_per_dlon  = 111_000.0 * max(cos_lat, 0.001)
+                    n_steps     = max(1, int(REFINE_RADIUS_M / REFINE_STEP_M))
+                    for di in range(-n_steps, n_steps + 1):
+                        for dj in range(-n_steps, n_steps + 1):
+                            off_m = math.sqrt((di * REFINE_STEP_M)**2
+                                              + (dj * REFINE_STEP_M)**2)
+                            if off_m > REFINE_RADIUS_M or off_m < 1.0:
+                                continue
+                            rlat  = clat + (di * REFINE_STEP_M) / m_per_dlat
+                            rlon  = clon + (dj * REFINE_STEP_M) / m_per_dlon
+                            ridx  = len(_refine_args) + _refine_base
+                            _refine_args.append((
+                                ridx, rlat, rlon, antenna_height_m,
+                                track_pts, freq_mhz, tx_power_dbm,
+                                tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI,
+                                sensitivity_dbm, veg_type, fade_margin_db,
+                                backbone_pts, max_practical_range_m,
+                            ))
+                            _refine_meta[ridx] = sel_i
+
+                if _refine_args:
+                    _refine_pool    = _get_analysis_pool()
+                    _refine_futures = {_refine_pool.submit(score_candidate, a): a[0]
+                                       for a in _refine_args}
+                    _refine_pending = set(_refine_futures.keys())
+                    _refine_best    = {i: site.get("coverage_pct", 0.0)
+                                       for i, site in enumerate(selected)}
+                    _refine_winner  = {}   # sel_i → best result dict
+
+                    while _refine_pending:
+                        _rdone, _refine_pending = cf_wait(_refine_pending, timeout=8)
+                        if not _rdone:
+                            yield sse({"type": "status",
+                                       "message": "Refining site positions…"})
+                            continue
+                        for rfut in _rdone:
+                            try:
+                                rres = rfut.result()
+                                if rres.get("backbone_blocked"):
+                                    continue
+                                sel_i = _refine_meta.get(rres["cand_idx"])
+                                if sel_i is None:
+                                    continue
+                                if rres["coverage_pct"] > _refine_best[sel_i]:
+                                    _refine_best[sel_i]  = rres["coverage_pct"]
+                                    _refine_winner[sel_i] = rres
+                            except Exception as rexc:
+                                app.logger.warning("refine_candidate failed: %s", rexc)
+
+                    for sel_i, rres in _refine_winner.items():
+                        site = selected[sel_i]
+                        site["original_lat"] = site["lat"]
+                        site["original_lon"] = site["lon"]
+                        site["lat"]          = rres["lat"]
+                        site["lon"]          = rres["lon"]
+                        site["coverage_pct"] = rres["coverage_pct"]
+                        site["refined"]      = True
 
             for loc in selected:
                 yield sse({"type": "suggestion", **loc})
