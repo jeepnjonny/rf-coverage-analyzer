@@ -2605,7 +2605,8 @@ function _handleIaSSE(evt) {
 
   switch (evt.type) {
     case 'status':
-      statusEl.textContent = evt.message;
+      statusEl.textContent  = evt.message;
+      progressEl.textContent = evt.message;
       break;
 
     case 'elev_progress':
@@ -2623,6 +2624,7 @@ function _handleIaSSE(evt) {
         barEl.style.width = '53%';
       } else {
         // Initial road/exclusion fetch complete
+        progressEl.textContent = evt.message;
         barEl.style.width = '22%';
       }
       break;
