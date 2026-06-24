@@ -2298,6 +2298,165 @@ def fetch_osm_roads(lat_min: float, lat_max: float,
     return ways
 
 
+# ---------------------------------------------------------------------------
+# Terrain / land-use exclusion helpers
+# ---------------------------------------------------------------------------
+
+# Slope check offset (metres) — elevation is sampled this far in each
+# cardinal direction to estimate local gradient.
+_SLOPE_PROBE_M = 15.0
+
+# Maximum terrain slope (degrees) allowed for any candidate placement.
+# Applies to ALL tiers (not just Tier-2 hike sites).
+MAX_SITE_SLOPE_DEG = 35
+
+
+def _local_slope_deg(lat: float, lon: float, probe_m: float = _SLOPE_PROBE_M) -> float:
+    """Estimate terrain slope at (lat, lon) using four cardinal elevation probes.
+
+    Returns the steepest of the N-S and E-W gradients in degrees.
+    """
+    d_lat = probe_m / 111_000.0
+    cos_lat = math.cos(math.radians(lat))
+    d_lon = probe_m / (111_000.0 * max(cos_lat, 0.001))
+
+    e_n = _get_elev(lat + d_lat, lon)
+    e_s = _get_elev(lat - d_lat, lon)
+    e_e = _get_elev(lat, lon + d_lon)
+    e_w = _get_elev(lat, lon - d_lon)
+
+    ns_rise = abs(e_n - e_s)
+    ew_rise = abs(e_e - e_w)
+    run = 2.0 * probe_m
+    slope_rad = math.atan(max(ns_rise, ew_rise) / max(run, 0.01))
+    return math.degrees(slope_rad)
+
+
+def fetch_osm_exclusion_zones(
+    lat_min: float, lat_max: float,
+    lon_min: float, lon_max: float,
+) -> list[list[tuple[float, float]]]:
+    """Fetch water bodies, wetlands, and building footprints from OSM.
+
+    Returns a list of closed polygon rings as [(lat, lon), ...].  Used as
+    exclusion zones — any candidate landing inside one of these polygons is
+    rejected as inaccessible.
+    """
+    query = (
+        f"[out:json][timeout:60];"
+        f"("
+        f"  way[\"natural\"=\"water\"]({lat_min},{lon_min},{lat_max},{lon_max});"
+        f"  way[\"natural\"=\"wetland\"]({lat_min},{lon_min},{lat_max},{lon_max});"
+        f"  way[\"waterway\"=\"riverbank\"]({lat_min},{lon_min},{lat_max},{lon_max});"
+        f"  way[\"landuse\"=\"reservoir\"]({lat_min},{lon_min},{lat_max},{lon_max});"
+        f"  way[\"building\"]({lat_min},{lon_min},{lat_max},{lon_max});"
+        f"  relation[\"natural\"=\"water\"]({lat_min},{lon_min},{lat_max},{lon_max});"
+        f");"
+        f"(._; >>;);"
+        f"out body;"
+    )
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = _http.post(OVERPASS_URL, data={"data": query}, timeout=120)
+            if resp.status_code in (429, 504):
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+            break
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(5 * (attempt + 1))
+    else:
+        app.logger.warning("Exclusion-zone OSM fetch failed after 3 attempts: %s", last_exc)
+        return []
+
+    nodes: dict[int, tuple[float, float]] = {}
+    ways_raw: list[dict] = []
+    for el in elements:
+        if el["type"] == "node":
+            nodes[el["id"]] = (el["lat"], el["lon"])
+        elif el["type"] == "way":
+            ways_raw.append(el)
+
+    polygons: list[list[tuple[float, float]]] = []
+    for way in ways_raw:
+        tags = way.get("tags", {})
+        is_excl = (tags.get("natural") in ("water", "wetland")
+                   or tags.get("waterway") == "riverbank"
+                   or tags.get("landuse") == "reservoir"
+                   or "building" in tags)
+        if not is_excl:
+            continue
+        nids = way.get("nodes", [])
+        pts = [nodes[nid] for nid in nids if nid in nodes]
+        if len(pts) >= 3:
+            polygons.append(pts)
+
+    return polygons
+
+
+def _point_in_polygon(lat: float, lon: float,
+                      poly: list[tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon test (odd-crossing rule).
+
+    Poly vertices are (lat, lon) pairs.  The test casts a horizontal ray
+    in the +lon direction and counts crossings.
+    """
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        lat_i, lon_i = poly[i]
+        lat_j, lon_j = poly[j]
+        if ((lat_i > lat) != (lat_j > lat)) and \
+           (lon < (lon_j - lon_i) * (lat - lat_i) / (lat_j - lat_i) + lon_i):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _build_exclusion_grid(
+    polygons: list[list[tuple[float, float]]],
+) -> tuple[dict[tuple[int, int], list[int]], float]:
+    """Spatial hash of exclusion polygons for fast point-in-polygon lookups.
+
+    Returns (grid_dict, cell_deg).  Each cell maps to indices into the
+    polygons list whose bounding box overlaps that cell.
+    """
+    cell_deg = 0.005   # ~550 m cells — coarse enough to be fast, fine enough to cull
+    grid: dict[tuple[int, int], list[int]] = {}
+    for pi, poly in enumerate(polygons):
+        lats = [p[0] for p in poly]
+        lons = [p[1] for p in poly]
+        r_min = int(min(lats) / cell_deg) - 1
+        r_max = int(max(lats) / cell_deg) + 1
+        c_min = int(min(lons) / cell_deg) - 1
+        c_max = int(max(lons) / cell_deg) + 1
+        for r in range(r_min, r_max + 1):
+            for c in range(c_min, c_max + 1):
+                grid.setdefault((r, c), []).append(pi)
+    return grid, cell_deg
+
+
+def point_in_exclusion_zone(
+    lat: float, lon: float,
+    polygons: list[list[tuple[float, float]]],
+    grid: dict[tuple[int, int], list[int]],
+    cell_deg: float,
+) -> bool:
+    """Return True if (lat, lon) falls inside any exclusion polygon."""
+    cell = (int(lat / cell_deg), int(lon / cell_deg))
+    poly_indices = grid.get(cell)
+    if not poly_indices:
+        return False
+    for pi in poly_indices:
+        if _point_in_polygon(lat, lon, polygons[pi]):
+            return True
+    return False
+
+
 def sample_road_candidates(ways: list[dict], spacing_m: float) -> list[dict]:
     """Sample candidate infrastructure points every spacing_m metres along roads."""
     seen: set[tuple[float, float]] = set()
@@ -2779,32 +2938,58 @@ def suggest_locations():
                     "covered_indices": sorted(pre_covered),
                 })
 
-            # Fetch OSM road/trail network — run in a thread so we can keep
-            # yielding keepalive events and avoid proxy / browser timeouts.
+            # Fetch OSM road/trail network AND exclusion zones (water, wetland,
+            # buildings) in parallel threads.  Both use Overpass API — separate
+            # queries avoid bloating a single response and let the two requests
+            # pipeline on the Overpass server.
             yield sse({"type": "status",
-                       "message": "Fetching road/trail data from OpenStreetMap…"})
+                       "message": "Fetching road/trail and terrain exclusion data from OpenStreetMap…"})
             _osm_result: list = [None]
             _osm_exc:    list = [None]
+            _excl_result: list = [None]
+            _excl_exc:    list = [None]
             def _do_osm():
                 try:
                     _osm_result[0] = fetch_osm_roads(la_min, la_max, lo_min, lo_max,
                                                      include_foot_trails)
                 except Exception as e:
                     _osm_exc[0] = e
-            osm_thread = threading.Thread(target=_do_osm, daemon=True)
+            def _do_excl():
+                try:
+                    _excl_result[0] = fetch_osm_exclusion_zones(
+                        la_min, la_max, lo_min, lo_max)
+                except Exception as e:
+                    _excl_exc[0] = e
+            osm_thread  = threading.Thread(target=_do_osm,  daemon=True)
+            excl_thread = threading.Thread(target=_do_excl, daemon=True)
             osm_thread.start()
-            while osm_thread.is_alive():
+            excl_thread.start()
+            while osm_thread.is_alive() or excl_thread.is_alive():
                 yield sse({"type": "status",
-                           "message": "Fetching road/trail data from OpenStreetMap…"})
+                           "message": "Fetching road/trail and terrain exclusion data from OpenStreetMap…"})
                 time.sleep(3)
             osm_thread.join()
+            excl_thread.join()
             if _osm_exc[0]:
                 yield sse({"type": "error", "message": str(_osm_exc[0])}); return
             ways = _osm_result[0]
 
+            # Build exclusion zone spatial index (non-fatal if fetch failed)
+            _excl_polygons: list[list[tuple[float, float]]] = []
+            _excl_grid:  dict[tuple[int, int], list[int]] = {}
+            _excl_cell_deg: float = 0.005
+            if _excl_exc[0]:
+                app.logger.warning("Exclusion zone fetch failed: %s", _excl_exc[0])
+            elif _excl_result[0]:
+                _excl_polygons = _excl_result[0]
+                _excl_grid, _excl_cell_deg = _build_exclusion_grid(_excl_polygons)
+
             yield sse({"type": "osm_status",
-                       "message": f"Found {len(ways)} road/trail segments. Generating candidates…",
-                       "way_count": len(ways)})
+                       "message": (f"Found {len(ways)} road/trail segments, "
+                                   f"{len(_excl_polygons)} exclusion zones. "
+                                   f"Generating candidates…"),
+                       "way_count": len(ways),
+                       "exclusion_zone_count": len(_excl_polygons)})
 
             # Tier-1: sample points along driveable roads
             tier1 = sample_road_candidates(ways, ROAD_SAMPLE_SPACING_M)
@@ -2899,6 +3084,35 @@ def suggest_locations():
                                "message": (f"Range pre-filter: {removed} out-of-range "
                                            f"candidates removed, {len(candidates)} remain.")})
 
+            # ── Phase 0b: Terrain accessibility filter ───────────────────────
+            # Reject candidates on steep slopes, inside water bodies / wetlands,
+            # or on building footprints.  Runs before the coarse RF pass so
+            # we don't waste coarse-scoring budget on inaccessible sites.
+            _pre_terrain = len(candidates)
+            _slope_rejected = 0
+            _excl_rejected  = 0
+            _terrain_ok: list[dict] = []
+            for c in candidates:
+                if _local_slope_deg(c["lat"], c["lon"]) > MAX_SITE_SLOPE_DEG:
+                    _slope_rejected += 1
+                    continue
+                if _excl_polygons and point_in_exclusion_zone(
+                    c["lat"], c["lon"], _excl_polygons, _excl_grid, _excl_cell_deg
+                ):
+                    _excl_rejected += 1
+                    continue
+                _terrain_ok.append(c)
+            if _terrain_ok:
+                candidates = _terrain_ok
+            _terrain_total = _slope_rejected + _excl_rejected
+            if _terrain_total > 0:
+                yield sse({"type": "status",
+                           "message": (
+                               f"Terrain filter: {_terrain_total} candidates removed "
+                               f"({_slope_rejected} steep slope, "
+                               f"{_excl_rejected} water/wetland/building). "
+                               f"{len(candidates)} remain.")})
+
             # ── Phase 1: Coarse RF scoring ───────────────────────────────────
             # Cheap in-process pass using FSPL + binary LOS (no Deygout).
             # Scores every COARSE_SCORE_SUBSAMPLE-th track point with
@@ -2946,6 +3160,12 @@ def suggest_locations():
                 for mc in micro_cands:
                     mk = (round(mc["lat"], 4), round(mc["lon"], 4))
                     if mk in _existing_keys:
+                        continue
+                    if _local_slope_deg(mc["lat"], mc["lon"]) > MAX_SITE_SLOPE_DEG:
+                        continue
+                    if _excl_polygons and point_in_exclusion_zone(
+                        mc["lat"], mc["lon"], _excl_polygons, _excl_grid, _excl_cell_deg
+                    ):
                         continue
                     mc["_coarse"] = coarse_score_candidate(
                         mc["lat"], mc["lon"], antenna_height_m,
@@ -3164,6 +3384,12 @@ def suggest_locations():
                                 continue
                             rlat  = clat + (di * REFINE_STEP_M) / m_per_dlat
                             rlon  = clon + (dj * REFINE_STEP_M) / m_per_dlon
+                            if _local_slope_deg(rlat, rlon) > MAX_SITE_SLOPE_DEG:
+                                continue
+                            if _excl_polygons and point_in_exclusion_zone(
+                                rlat, rlon, _excl_polygons, _excl_grid, _excl_cell_deg
+                            ):
+                                continue
                             ridx  = len(_refine_args) + _refine_base
                             _refine_args.append((
                                 ridx, rlat, rlon, antenna_height_m,
