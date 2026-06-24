@@ -2965,8 +2965,15 @@ def suggest_locations():
             osm_thread.start()
             excl_thread.start()
             while osm_thread.is_alive() or excl_thread.is_alive():
-                yield sse({"type": "status",
-                           "message": "Fetching road/trail and terrain exclusion data from OpenStreetMap…"})
+                roads_done = not osm_thread.is_alive()
+                excl_done  = not excl_thread.is_alive()
+                if roads_done and not excl_done:
+                    msg = "Roads loaded — awaiting water/building exclusion data…"
+                elif excl_done and not roads_done:
+                    msg = "Exclusion zones loaded — awaiting road/trail data…"
+                else:
+                    msg = "Fetching road/trail and terrain exclusion data from OpenStreetMap…"
+                yield sse({"type": "status", "message": msg})
                 time.sleep(3)
             osm_thread.join()
             excl_thread.join()
@@ -2986,7 +2993,7 @@ def suggest_locations():
 
             yield sse({"type": "osm_status",
                        "message": (f"Found {len(ways)} road/trail segments, "
-                                   f"{len(_excl_polygons)} exclusion zones. "
+                                   f"{len(_excl_polygons)} exclusion zone(s). "
                                    f"Generating candidates…"),
                        "way_count": len(ways),
                        "exclusion_zone_count": len(_excl_polygons)})
@@ -3092,7 +3099,10 @@ def suggest_locations():
             _slope_rejected = 0
             _excl_rejected  = 0
             _terrain_ok: list[dict] = []
-            for c in candidates:
+            yield sse({"type": "coarse_progress",
+                       "phase": "terrain", "current": 0, "total": _pre_terrain,
+                       "message": f"Checking terrain accessibility for {_pre_terrain} candidates…"})
+            for _ti, c in enumerate(candidates):
                 if _local_slope_deg(c["lat"], c["lon"]) > MAX_SITE_SLOPE_DEG:
                     _slope_rejected += 1
                     continue
@@ -3102,16 +3112,19 @@ def suggest_locations():
                     _excl_rejected += 1
                     continue
                 _terrain_ok.append(c)
+                if (_ti + 1) % 200 == 0:
+                    yield sse({"type": "coarse_progress",
+                               "phase": "terrain", "current": _ti + 1, "total": _pre_terrain,
+                               "message": f"Terrain check: {_ti + 1}/{_pre_terrain}…"})
             if _terrain_ok:
                 candidates = _terrain_ok
             _terrain_total = _slope_rejected + _excl_rejected
-            if _terrain_total > 0:
-                yield sse({"type": "status",
-                           "message": (
-                               f"Terrain filter: {_terrain_total} candidates removed "
-                               f"({_slope_rejected} steep slope, "
-                               f"{_excl_rejected} water/wetland/building). "
-                               f"{len(candidates)} remain.")})
+            yield sse({"type": "coarse_progress",
+                       "phase": "terrain", "current": _pre_terrain, "total": _pre_terrain,
+                       "message": (
+                           f"Terrain filter: removed {_terrain_total} inaccessible "
+                           f"({_slope_rejected} steep, {_excl_rejected} water/building). "
+                           f"{len(candidates)} remain.")})
 
             # ── Phase 1: Coarse RF scoring ───────────────────────────────────
             # Cheap in-process pass using FSPL + binary LOS (no Deygout).
@@ -3126,17 +3139,23 @@ def suggest_locations():
                 _step = len(candidates) / _PRE_COARSE_CAP
                 candidates = [candidates[int(i * _step)] for i in range(_PRE_COARSE_CAP)]
 
-            yield sse({"type": "status",
-                       "message": f"Coarse scoring {len(candidates)} candidates…"})
+            _n_coarse = len(candidates)
+            yield sse({"type": "coarse_progress",
+                       "phase": "score", "current": 0, "total": _n_coarse,
+                       "message": f"Coarse scoring {_n_coarse} candidates…"})
 
             _rx_gain_total = tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI
-            for c in candidates:
+            for _ci, c in enumerate(candidates):
                 c["_coarse"] = coarse_score_candidate(
                     c["lat"], c["lon"], antenna_height_m,
                     track_pts, freq_mhz,
                     tx_power_dbm, _rx_gain_total,
                     sensitivity_dbm, fade_margin_db,
                 )
+                if (_ci + 1) % 75 == 0 or _ci == _n_coarse - 1:
+                    yield sse({"type": "coarse_progress",
+                               "phase": "score", "current": _ci + 1, "total": _n_coarse,
+                               "message": f"Coarse scoring: {_ci + 1}/{_n_coarse}…"})
 
             # Drop bottom COARSE_REJECT_BOTTOM fraction — keep at least 50 candidates
             candidates.sort(key=lambda c: c["_coarse"], reverse=True)
@@ -3151,13 +3170,15 @@ def suggest_locations():
             micro_cands = expand_hot_zones(hot_zones)
 
             if micro_cands:
-                yield sse({"type": "status",
-                           "message": (f"Hot-zone analysis: {len(hot_zones)} active zone(s) → "
-                                       f"coarse-scoring {len(micro_cands)} micro-candidates…")})
+                _n_micro = len(micro_cands)
+                yield sse({"type": "coarse_progress",
+                           "phase": "hotzone", "current": 0, "total": _n_micro,
+                           "message": (f"Hot-zone analysis: {len(hot_zones)} zone(s) → "
+                                       f"scoring {_n_micro} micro-candidates…")})
                 _micro_survivors = []
                 _existing_keys = {(round(c["lat"], 4), round(c["lon"], 4))
                                   for c in coarse_survivors}
-                for mc in micro_cands:
+                for _mi, mc in enumerate(micro_cands):
                     mk = (round(mc["lat"], 4), round(mc["lon"], 4))
                     if mk in _existing_keys:
                         continue
@@ -3176,11 +3197,16 @@ def suggest_locations():
                     if mc["_coarse"] > 0.0:
                         _micro_survivors.append(mc)
                         _existing_keys.add(mk)
+                    if (_mi + 1) % 50 == 0 or _mi == _n_micro - 1:
+                        yield sse({"type": "coarse_progress",
+                                   "phase": "hotzone", "current": _mi + 1, "total": _n_micro,
+                                   "message": f"Hot-zone scoring: {_mi + 1}/{_n_micro}…"})
 
                 coarse_survivors = coarse_survivors + _micro_survivors
-                yield sse({"type": "status",
+                yield sse({"type": "coarse_progress",
+                           "phase": "hotzone", "current": _n_micro, "total": _n_micro,
                            "message": (f"{len(_micro_survivors)} micro-candidates added from "
-                                       f"hot zones. Total pool: {len(coarse_survivors)}.")})
+                                       f"hot zones. Pool: {len(coarse_survivors)}.")})
 
             candidates = coarse_survivors
 
@@ -3408,26 +3434,38 @@ def suggest_locations():
                     _refine_best    = {i: site.get("coverage_pct", 0.0)
                                        for i, site in enumerate(selected)}
                     _refine_winner  = {}   # sel_i → best result dict
+                    _refine_total   = len(_refine_args)
+                    _refine_done_n  = 0
+                    yield sse({"type": "refine_progress",
+                               "current": 0, "total": _refine_total,
+                               "message": f"Refining {len(selected)} site(s): 0/{_refine_total}…"})
 
                     while _refine_pending:
                         _rdone, _refine_pending = cf_wait(_refine_pending, timeout=8)
                         if not _rdone:
-                            yield sse({"type": "status",
-                                       "message": "Refining site positions…"})
+                            yield sse({"type": "refine_progress",
+                                       "current": _refine_done_n, "total": _refine_total,
+                                       "message": f"Refining positions… {_refine_done_n}/{_refine_total}"})
                             continue
                         for rfut in _rdone:
                             try:
                                 rres = rfut.result()
                                 if rres.get("backbone_blocked"):
+                                    _refine_done_n += 1
                                     continue
                                 sel_i = _refine_meta.get(rres["cand_idx"])
                                 if sel_i is None:
+                                    _refine_done_n += 1
                                     continue
                                 if rres["coverage_pct"] > _refine_best[sel_i]:
                                     _refine_best[sel_i]  = rres["coverage_pct"]
                                     _refine_winner[sel_i] = rres
                             except Exception as rexc:
                                 app.logger.warning("refine_candidate failed: %s", rexc)
+                            _refine_done_n += 1
+                        yield sse({"type": "refine_progress",
+                                   "current": _refine_done_n, "total": _refine_total,
+                                   "message": f"Refining positions… {_refine_done_n}/{_refine_total}"})
 
                     for sel_i, rres in _refine_winner.items():
                         site = selected[sel_i]

@@ -2610,18 +2610,48 @@ function _handleIaSSE(evt) {
 
     case 'elev_progress':
       if (evt.total > 0) {
-        progressEl.textContent = evt.message || `Terrain: ${evt.current}/${evt.total}`;
-        barEl.style.width = `${Math.min(25, (evt.current / evt.total) * 25)}%`;
+        progressEl.textContent = evt.message || `Terrain tiles: ${evt.current}/${evt.total}`;
+        barEl.style.width = `${Math.min(20, (evt.current / evt.total) * 20)}%`;
       }
       break;
 
     case 'osm_status':
       statusEl.textContent = evt.message;
       if (evt.candidate_count) {
-        progressEl.textContent = `${evt.candidate_count} candidates to score`;
-        barEl.style.width = '30%';
+        // Shown after coarse scoring — full RF scoring is next
+        progressEl.textContent = `${evt.candidate_count} candidates → full RF scoring`;
+        barEl.style.width = '53%';
+      } else {
+        // Initial road/exclusion fetch complete
+        barEl.style.width = '22%';
       }
       break;
+
+    case 'coarse_progress': {
+      // Three sub-phases within the 22–53% range:
+      //   terrain  → 22–27%
+      //   score    → 27–50%
+      //   hotzone  → 50–53%
+      const frac = evt.total > 0 ? evt.current / evt.total : 0;
+      let pct;
+      if (evt.phase === 'terrain') {
+        pct = 22 + frac * 5;
+      } else if (evt.phase === 'hotzone') {
+        pct = 50 + frac * 3;
+      } else {
+        pct = 27 + frac * 23;   // 'score' phase
+      }
+      progressEl.textContent = evt.message || `Coarse scoring: ${evt.current}/${evt.total}`;
+      barEl.style.width = `${pct}%`;
+      break;
+    }
+
+    case 'refine_progress': {
+      const frac = evt.total > 0 ? evt.current / evt.total : 0;
+      progressEl.textContent = evt.message || `Refining: ${evt.current}/${evt.total}`;
+      barEl.style.width = `${85 + frac * 10}%`;
+      break;
+    }
 
     case 'track_pts':
       state.iaAdvisorTrackPts = evt.pts || [];
@@ -2631,7 +2661,7 @@ function _handleIaSSE(evt) {
     case 'existing_coverage':
       statusEl.textContent =
         `Existing ${evt.receiver_count} receiver(s) cover ${evt.coverage_pct}% — finding gaps…`;
-      barEl.style.width = '28%';
+      barEl.style.width = '21%';
       if (evt.covered_indices) {
         state.iaCoveredExisting = new Set(evt.covered_indices);
         _iaDrawCoverageTrack();
@@ -2639,8 +2669,8 @@ function _handleIaSSE(evt) {
       break;
 
     case 'scoring_progress':
-      progressEl.textContent = `Scoring: ${evt.current}/${evt.total}`;
-      barEl.style.width = `${30 + (evt.current / evt.total) * 55}%`;
+      progressEl.textContent = `RF scoring: ${evt.current}/${evt.total}`;
+      barEl.style.width = `${53 + (evt.current / evt.total) * 32}%`;
       break;
 
     case 'candidates':
@@ -2649,7 +2679,8 @@ function _handleIaSSE(evt) {
           radius: 5, color: '#888', fillColor: '#888',
           fillOpacity: 0.55, weight: 1,
         }).addTo(state.iaCandidateLayer);
-        m.bindTooltip(`Candidate (${c.tier === 2 ? 'Hike' : 'Road'})`, {permanent: false});
+        const tierLabel = c.tier === 2 ? 'Hike' : c.tier === 4 ? 'Hot-zone' : 'Road';
+        m.bindTooltip(`Candidate (${tierLabel})`, {permanent: false});
         state.iaCandidateMarkers[c.idx] = m;
       });
       updateLegend();
