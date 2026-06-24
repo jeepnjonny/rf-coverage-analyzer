@@ -2527,7 +2527,10 @@ function startInfraAdvisor() {
   state.iaSuggestions = [];
   state.iaSelectedIdx = -1;
   state.iaMarkerLayer.clearLayers();
-  state.iaMarkers     = [];
+  state.iaMarkers          = [];
+  state.iaCoveredExisting  = new Set();
+  state.iaCoveredSuggested = new Set();
+  state.iaCoverageLayer.clearLayers();
   state.iaAbortCtrl   = new AbortController();
 
   const resultsEl  = document.getElementById('ia-results');
@@ -2747,6 +2750,7 @@ function _handleIaSSE(evt) {
 }
 
 function _addIaMarker(suggestion, idx) {
+  const isHike    = suggestion.tier === 2;
   const tierClass = suggestion.tier === 2 ? ' ia-tier-2' : suggestion.tier === 3 ? ' ia-tier-3' : '';
   const icon = L.divIcon({
     className: '',
@@ -2776,6 +2780,7 @@ function _renderIaResults() {
 }
 
 function _appendIaResultItem(suggestion, idx) {
+  const tierClass = suggestion.tier === 2 ? ' ia-tier-2' : suggestion.tier === 3 ? ' ia-tier-3' : '';
   const el = document.createElement('div');
   el.className = 'ia-item';
   el.dataset.iaIdx = idx;
