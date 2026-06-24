@@ -3091,124 +3091,175 @@ def suggest_locations():
                                "message": (f"Range pre-filter: {removed} out-of-range "
                                            f"candidates removed, {len(candidates)} remain.")})
 
-            # ── Phase 0b: Terrain accessibility filter ───────────────────────
-            # Reject candidates on steep slopes, inside water bodies / wetlands,
-            # or on building footprints.  Runs before the coarse RF pass so
-            # we don't waste coarse-scoring budget on inaccessible sites.
-            _pre_terrain = len(candidates)
-            _slope_rejected = 0
-            _excl_rejected  = 0
-            _terrain_ok: list[dict] = []
-            yield sse({"type": "coarse_progress",
-                       "phase": "terrain", "current": 0, "total": _pre_terrain,
-                       "message": f"Checking terrain accessibility for {_pre_terrain} candidates…"})
-            for _ti, c in enumerate(candidates):
-                if _local_slope_deg(c["lat"], c["lon"]) > MAX_SITE_SLOPE_DEG:
-                    _slope_rejected += 1
-                    continue
-                if _excl_polygons and point_in_exclusion_zone(
-                    c["lat"], c["lon"], _excl_polygons, _excl_grid, _excl_cell_deg
-                ):
-                    _excl_rejected += 1
-                    continue
-                _terrain_ok.append(c)
-                if (_ti + 1) % 200 == 0:
-                    yield sse({"type": "coarse_progress",
-                               "phase": "terrain", "current": _ti + 1, "total": _pre_terrain,
-                               "message": f"Terrain check: {_ti + 1}/{_pre_terrain}…"})
-            if _terrain_ok:
-                candidates = _terrain_ok
-            _terrain_total = _slope_rejected + _excl_rejected
-            yield sse({"type": "coarse_progress",
-                       "phase": "terrain", "current": _pre_terrain, "total": _pre_terrain,
-                       "message": (
-                           f"Terrain filter: removed {_terrain_total} inaccessible "
-                           f"({_slope_rejected} steep, {_excl_rejected} water/building). "
-                           f"{len(candidates)} remain.")})
+            # ── Phases 0b / 1 / 2: terrain filter + coarse RF scoring + hot-zone
+            # expansion — all run in a daemon thread so the generator keeps
+            # yielding keepalive SSE events every 0.5 s.  Without this the
+            # Flask generator blocks for minutes (1500 candidates × ~100 ms
+            # per _get_elev() SQLite fallback) and the browser drops the SSE
+            # connection, resetting the UI button.
+            _phase_state: dict = {
+                "phase":   "terrain",
+                "current": 0,
+                "total":   len(candidates),
+                "message": f"Checking terrain accessibility for {len(candidates)} candidates…",
+                "done":    False,
+                "error":   None,
+            }
+            _phase_candidates: list = [None]
 
-            # ── Phase 1: Coarse RF scoring ───────────────────────────────────
-            # Cheap in-process pass using FSPL + binary LOS (no Deygout).
-            # Scores every COARSE_SCORE_SUBSAMPLE-th track point with
-            # COARSE_TERRAIN_SAMPLES interior terrain checks — ~20× faster than
-            # the full model.  Lets us evaluate the full FSPL-survivor pool
-            # (up to RAW_CANDIDATES_CAP) before committing to the expensive
-            # parallel RF scoring pass.
-            _PRE_COARSE_CAP = 1500
-            if len(candidates) > _PRE_COARSE_CAP:
-                candidates.sort(key=lambda c: c["lat"])
-                _step = len(candidates) / _PRE_COARSE_CAP
-                candidates = [candidates[int(i * _step)] for i in range(_PRE_COARSE_CAP)]
+            def _run_phases_012():
+                try:
+                    # ── Phase 0b: terrain accessibility filter ────────────
+                    _phase_state["phase"] = "terrain"
+                    _phase_state["total"] = len(candidates)
+                    terrain_ok: list[dict] = []
+                    slope_rej = excl_rej = 0
+                    for ti, c in enumerate(candidates):
+                        try:
+                            if _local_slope_deg(c["lat"], c["lon"]) > MAX_SITE_SLOPE_DEG:
+                                slope_rej += 1
+                            elif _excl_polygons and point_in_exclusion_zone(
+                                c["lat"], c["lon"],
+                                _excl_polygons, _excl_grid, _excl_cell_deg
+                            ):
+                                excl_rej += 1
+                            else:
+                                terrain_ok.append(c)
+                        except Exception:
+                            terrain_ok.append(c)   # keep candidate if check errors
+                        _phase_state["current"] = ti + 1
+                        _phase_state["message"] = (
+                            f"Terrain check: {ti + 1}/{len(candidates)}…")
 
-            _n_coarse = len(candidates)
-            yield sse({"type": "coarse_progress",
-                       "phase": "score", "current": 0, "total": _n_coarse,
-                       "message": f"Coarse scoring {_n_coarse} candidates…"})
+                    total_rej = slope_rej + excl_rej
+                    filtered = terrain_ok if terrain_ok else candidates
+                    _phase_state["message"] = (
+                        f"Terrain filter: removed {total_rej} inaccessible "
+                        f"({slope_rej} steep, {excl_rej} water/building). "
+                        f"{len(filtered)} remain.")
 
-            _rx_gain_total = tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI
-            for _ci, c in enumerate(candidates):
-                c["_coarse"] = coarse_score_candidate(
-                    c["lat"], c["lon"], antenna_height_m,
-                    track_pts, freq_mhz,
-                    tx_power_dbm, _rx_gain_total,
-                    sensitivity_dbm, fade_margin_db,
-                )
-                if (_ci + 1) % 75 == 0 or _ci == _n_coarse - 1:
-                    yield sse({"type": "coarse_progress",
-                               "phase": "score", "current": _ci + 1, "total": _n_coarse,
-                               "message": f"Coarse scoring: {_ci + 1}/{_n_coarse}…"})
+                    # ── Phase 1: coarse RF scoring ────────────────────────
+                    _PRE_COARSE_CAP = 1500
+                    if len(filtered) > _PRE_COARSE_CAP:
+                        filtered.sort(key=lambda c: c["lat"])
+                        _step = len(filtered) / _PRE_COARSE_CAP
+                        filtered = [filtered[int(i * _step)]
+                                    for i in range(_PRE_COARSE_CAP)]
 
-            # Drop bottom COARSE_REJECT_BOTTOM fraction — keep at least 50 candidates
-            candidates.sort(key=lambda c: c["_coarse"], reverse=True)
-            n_coarse_keep = max(50, int(len(candidates) * (1.0 - COARSE_REJECT_BOTTOM)))
-            coarse_survivors = candidates[:n_coarse_keep]
+                    _phase_state["phase"] = "score"
+                    _phase_state["total"] = len(filtered)
+                    _phase_state["current"] = 0
+                    _phase_state["message"] = (
+                        f"Coarse scoring {len(filtered)} candidates…")
 
-            # ── Phase 2: Heat-map expansion ──────────────────────────────────
-            # Find geographic clusters where multiple coarse survivors are
-            # concentrated (= terrain geometry works in this area), then seed
-            # a fine grid of Tier-4 micro-candidates around each cluster centre.
-            hot_zones = compute_hot_zones(coarse_survivors)
-            micro_cands = expand_hot_zones(hot_zones)
+                    rx_gain_total = tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI
+                    for ci, c in enumerate(filtered):
+                        try:
+                            c["_coarse"] = coarse_score_candidate(
+                                c["lat"], c["lon"], antenna_height_m,
+                                track_pts, freq_mhz,
+                                tx_power_dbm, rx_gain_total,
+                                sensitivity_dbm, fade_margin_db,
+                            )
+                        except Exception:
+                            c["_coarse"] = 0.0
+                        _phase_state["current"] = ci + 1
+                        _phase_state["message"] = (
+                            f"Coarse scoring: {ci + 1}/{len(filtered)}…")
 
-            if micro_cands:
-                _n_micro = len(micro_cands)
-                yield sse({"type": "coarse_progress",
-                           "phase": "hotzone", "current": 0, "total": _n_micro,
-                           "message": (f"Hot-zone analysis: {len(hot_zones)} zone(s) → "
-                                       f"scoring {_n_micro} micro-candidates…")})
-                _micro_survivors = []
-                _existing_keys = {(round(c["lat"], 4), round(c["lon"], 4))
-                                  for c in coarse_survivors}
-                for _mi, mc in enumerate(micro_cands):
-                    mk = (round(mc["lat"], 4), round(mc["lon"], 4))
-                    if mk in _existing_keys:
-                        continue
-                    if _local_slope_deg(mc["lat"], mc["lon"]) > MAX_SITE_SLOPE_DEG:
-                        continue
-                    if _excl_polygons and point_in_exclusion_zone(
-                        mc["lat"], mc["lon"], _excl_polygons, _excl_grid, _excl_cell_deg
-                    ):
-                        continue
-                    mc["_coarse"] = coarse_score_candidate(
-                        mc["lat"], mc["lon"], antenna_height_m,
-                        track_pts, freq_mhz,
-                        tx_power_dbm, _rx_gain_total,
-                        sensitivity_dbm, fade_margin_db,
-                    )
-                    if mc["_coarse"] > 0.0:
-                        _micro_survivors.append(mc)
-                        _existing_keys.add(mk)
-                    if (_mi + 1) % 50 == 0 or _mi == _n_micro - 1:
-                        yield sse({"type": "coarse_progress",
-                                   "phase": "hotzone", "current": _mi + 1, "total": _n_micro,
-                                   "message": f"Hot-zone scoring: {_mi + 1}/{_n_micro}…"})
+                    filtered.sort(key=lambda c: c["_coarse"], reverse=True)
+                    n_keep = max(50, int(len(filtered) * (1.0 - COARSE_REJECT_BOTTOM)))
+                    coarse_survivors = filtered[:n_keep]
 
-                coarse_survivors = coarse_survivors + _micro_survivors
-                yield sse({"type": "coarse_progress",
-                           "phase": "hotzone", "current": _n_micro, "total": _n_micro,
-                           "message": (f"{len(_micro_survivors)} micro-candidates added from "
-                                       f"hot zones. Pool: {len(coarse_survivors)}.")})
+                    # ── Phase 2: heat-map expansion ───────────────────────
+                    hot_zones  = compute_hot_zones(coarse_survivors)
+                    micro_cands = expand_hot_zones(hot_zones)
 
-            candidates = coarse_survivors
+                    if micro_cands:
+                        _phase_state["phase"] = "hotzone"
+                        _phase_state["total"] = len(micro_cands)
+                        _phase_state["current"] = 0
+                        _phase_state["message"] = (
+                            f"Hot-zone analysis: {len(hot_zones)} zone(s) → "
+                            f"scoring {len(micro_cands)} micro-candidates…")
+
+                        micro_survivors: list[dict] = []
+                        existing_keys = {
+                            (round(c["lat"], 4), round(c["lon"], 4))
+                            for c in coarse_survivors
+                        }
+                        for mi, mc in enumerate(micro_cands):
+                            mk = (round(mc["lat"], 4), round(mc["lon"], 4))
+                            if mk not in existing_keys:
+                                try:
+                                    if _local_slope_deg(
+                                        mc["lat"], mc["lon"]
+                                    ) > MAX_SITE_SLOPE_DEG:
+                                        pass
+                                    elif _excl_polygons and point_in_exclusion_zone(
+                                        mc["lat"], mc["lon"],
+                                        _excl_polygons, _excl_grid, _excl_cell_deg
+                                    ):
+                                        pass
+                                    else:
+                                        mc["_coarse"] = coarse_score_candidate(
+                                            mc["lat"], mc["lon"], antenna_height_m,
+                                            track_pts, freq_mhz,
+                                            tx_power_dbm, rx_gain_total,
+                                            sensitivity_dbm, fade_margin_db,
+                                        )
+                                        if mc["_coarse"] > 0.0:
+                                            micro_survivors.append(mc)
+                                            existing_keys.add(mk)
+                                except Exception:
+                                    pass
+                            _phase_state["current"] = mi + 1
+                            _phase_state["message"] = (
+                                f"Hot-zone scoring: {mi + 1}/{len(micro_cands)}…")
+
+                        coarse_survivors = coarse_survivors + micro_survivors
+                        _phase_state["message"] = (
+                            f"{len(micro_survivors)} micro-candidates added from "
+                            f"hot zones. Pool: {len(coarse_survivors)}.")
+
+                    _phase_candidates[0] = coarse_survivors
+
+                except Exception as exc:
+                    _phase_state["error"] = str(exc)
+                finally:
+                    _phase_state["done"] = True
+
+            filter_thread = threading.Thread(target=_run_phases_012, daemon=True)
+            filter_thread.start()
+            while not _phase_state["done"]:
+                yield sse({
+                    "type":    "coarse_progress",
+                    "phase":   _phase_state["phase"],
+                    "current": _phase_state["current"],
+                    "total":   max(1, _phase_state["total"]),
+                    "message": _phase_state["message"],
+                })
+                time.sleep(0.5)
+            filter_thread.join()
+
+            if _phase_state["error"]:
+                yield sse({"type": "status",
+                           "message": f"Warning during coarse phase: {_phase_state['error']}"})
+
+            # Final yield so the completed state is visible in the UI
+            yield sse({
+                "type":    "coarse_progress",
+                "phase":   _phase_state["phase"],
+                "current": max(1, _phase_state["total"]),
+                "total":   max(1, _phase_state["total"]),
+                "message": _phase_state["message"],
+            })
+
+            candidates = (
+                _phase_candidates[0]
+                if _phase_candidates[0] is not None
+                else candidates
+            )
 
             # ── Phase 3: Vectorized nearest-track-point index ────────────────
             # One numpy argmin over the full squared-degrees distance matrix
