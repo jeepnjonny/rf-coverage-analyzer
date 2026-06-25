@@ -939,6 +939,32 @@ async function updateReceiverPosition(rxIdx, lat, lon, markerObj) {
   }
 }
 
+function _iaRenderHeatMap() {
+  if (state.iaHeatLayer) { map.removeLayer(state.iaHeatLayer); state.iaHeatLayer = null; }
+  const scores = Object.entries(state.iaCandScores)
+    .map(([idx, d]) => ({ idx: +idx, pct: d.pct || 0 }))
+    .filter(d => d.pct > 0)
+    .sort((a, b) => b.pct - a.pct);
+  if (scores.length === 0) return;
+  const cutoff = Math.ceil(scores.length * 0.20);
+  const top    = scores.slice(0, cutoff);
+  const maxPct = top[0].pct;
+  const pts = [];
+  top.forEach(({ idx, pct }) => {
+    const m = state.iaCandidateMarkers[idx];
+    if (!m) return;
+    const ll = m.getLatLng();
+    pts.push([ll.lat, ll.lng, pct / maxPct]);
+  });
+  if (pts.length === 0) return;
+  state.iaHeatLayer = L.heatLayer(pts, {
+    radius: 35, blur: 25, maxZoom: 15,
+    gradient: { 0.3: '#2196f3', 0.6: '#ff9800', 1.0: '#f44336' },
+    max: 1.0,
+  }).addTo(map);
+  updateLegend();
+}
+
 function updateLegend() {
   const el = document.getElementById('map-legend');
   if (!el) return;
@@ -951,8 +977,9 @@ function updateLegend() {
   const hasIaExclusions  = state.iaExclusionsLayer && state.iaExclusionsLayer.getLayers().length > 0;
   const hasIaHotZones    = state.iaHotZoneLayer    && state.iaHotZoneLayer.getLayers().length > 0;
   const hasIaTrackPrev   = state.iaTrackPreviewLayer && state.iaTrackPreviewLayer.getLayers().length > 0;
+  const hasIaHeat        = !!state.iaHeatLayer;
   if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack && !hasIaCandidates
-      && !hasIaRoads && !hasIaExclusions && !hasIaHotZones && !hasIaTrackPrev) {
+      && !hasIaRoads && !hasIaExclusions && !hasIaHotZones && !hasIaTrackPrev && !hasIaHeat) {
     el.style.display = 'none'; return;
   }
   el.style.display = '';
@@ -1009,6 +1036,10 @@ function updateLegend() {
   }
   if (hasIaHotZones) {
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:rgba(243,156,18,0.2);border:1px solid #e67e22;border-radius:50%"></div><span>Hot-zone cluster</span></div>');
+  }
+  if (hasIaHeat) {
+    lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:linear-gradient(90deg,#2196f3,#ff9800,#f44336)"></div><span>RF score heat map (top 20%)</span></div>');
   }
   el.innerHTML = lines.join('');
 }
@@ -2429,6 +2460,7 @@ state.iaRoadsLayer        = L.layerGroup().addTo(map);  // OSM road network sket
 state.iaExclusionsLayer   = L.layerGroup().addTo(map);  // water/building exclusion polygons
 state.iaHotZoneLayer      = L.layerGroup().addTo(map);  // coarse-scoring hot zone circles
 state.iaRefineLayer       = L.layerGroup().addTo(map);  // 150 m refinement radius rings
+state.iaHeatLayer         = null;                       // L.heatLayer — top-20% RF score overlay
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -2570,6 +2602,7 @@ function startInfraAdvisor() {
   state.iaBestCandIdxSet = new Set();
   state.iaBestCandPct    = 0;
   state.iaCandScores     = {};
+  if (state.iaHeatLayer) { map.removeLayer(state.iaHeatLayer); state.iaHeatLayer = null; }
 
   const resultsEl  = document.getElementById('ia-results');
   const progressEl = document.getElementById('ia-progress-container');
@@ -2830,6 +2863,8 @@ function _handleIaSSE(evt) {
     }
 
     case 'suggestion': {
+      // Render RF score heat map on first suggestion (scoring is now complete)
+      if (state.iaSuggestions.length === 0) _iaRenderHeatMap();
       // Remove candidate dot for this site before adding the ranked marker
       if (evt.cand_idx != null && state.iaCandidateMarkers[evt.cand_idx]) {
         state.iaCandidateLayer.removeLayer(state.iaCandidateMarkers[evt.cand_idx]);
@@ -2907,6 +2942,7 @@ function _handleIaSSE(evt) {
       state.iaRoadsLayer.clearLayers();
       state.iaHotZoneLayer.clearLayers();
       state.iaRefineLayer.clearLayers();
+      if (state.iaHeatLayer) { map.removeLayer(state.iaHeatLayer); state.iaHeatLayer = null; }
       _iaFinish();
       break;
   }
@@ -3357,6 +3393,7 @@ function _iaClear() {
   state.iaExclusionsLayer.clearLayers();
   state.iaHotZoneLayer.clearLayers();
   state.iaRefineLayer.clearLayers();
+  if (state.iaHeatLayer) { map.removeLayer(state.iaHeatLayer); state.iaHeatLayer = null; }
   if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
   _hideIaTestMenu();
   state.iaSuggestions      = [];
