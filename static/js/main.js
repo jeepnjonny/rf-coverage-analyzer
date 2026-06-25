@@ -990,10 +990,10 @@ function updateLegend() {
   if (hasIaCandidates) {
     if (hasRx || hasCoverage || hasIaTrack || hasIa) lines.push('<div class="legend-sep"></div>');
     lines.push('<div class="legend-title">Candidate Sites</div>');
-    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#888;background:rgba(136,136,136,0.55)"></div><span>Pending</span></div>');
-    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#4caf50;background:rgba(76,175,80,0.7)"></div><span>Good (&ge;40%)</span></div>');
-    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#ff9800;background:rgba(255,152,0,0.7)"></div><span>Moderate (&ge;15%)</span></div>');
-    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#e05252;background:rgba(224,82,82,0.7)"></div><span>Low coverage</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#888;background:rgba(136,136,136,0.55)"></div><span>Scoring…</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#9c27b0;background:rgba(156,39,176,0.9)"></div><span>Best so far</span></div>');
+    lines.push(`<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#4caf50;background:rgba(76,175,80,0.7)"></div><span>Meets min. contribution</span></div>`);
+    lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#e05252;background:rgba(224,82,82,0.7)"></div><span>Below min. contribution</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#555;background:rgba(85,85,85,0.7)"></div><span>Backbone blocked</span></div>');
   }
   if (hasIaTrackPrev) {
@@ -2418,6 +2418,11 @@ state.iaCompleteEvt      = null;
 // Candidate site dots (shown during scoring, cleared after complete)
 state.iaCandidateLayer   = L.layerGroup().addTo(map);
 state.iaCandidateMarkers = {};  // keyed by cand_idx → L.circleMarker
+// Live scoring state for candidate coloring
+state.iaMinContribPct    = 0;     // min_contribution_pct from UI params
+state.iaBestCandIdx      = null;  // cand_idx of the highest-coverage site seen so far
+state.iaBestCandPct      = 0;     // coverage_pct of that site
+state.iaCandScores       = {};    // { cand_idx: { pct, backbone_blocked } }
 // Step-by-step map visualization layers
 state.iaTrackPreviewLayer = L.layerGroup().addTo(map);  // dashed track before coverage data
 state.iaRoadsLayer        = L.layerGroup().addTo(map);  // OSM road network sketch
@@ -2552,9 +2557,9 @@ document.getElementById('ia-run-btn').addEventListener('click', () => {
 function startInfraAdvisor() {
   if (state.iaRunning || state.analysisRunning) return;
 
-  state.iaRunning     = true;
-  state.iaSuggestions = [];
-  state.iaSelectedIdx = -1;
+  state.iaRunning        = true;
+  state.iaSuggestions    = [];
+  state.iaSelectedIdx    = -1;
   state.iaMarkerLayer.clearLayers();
   state.iaMarkers          = [];
   state.iaCoveredExisting  = new Set();
@@ -2756,10 +2761,13 @@ function _handleIaSSE(evt) {
       }
       break;
 
-    case 'scoring_progress':
-      progressEl.textContent = `RF scoring: ${evt.current}/${evt.total}`;
+    case 'scoring_progress': {
+      const bestStr = state.iaBestCandPct > 0
+        ? ` · Best: +${state.iaBestCandPct.toFixed(1)}%` : '';
+      progressEl.textContent = `RF scoring: ${evt.current}/${evt.total}${bestStr}`;
       barEl.style.width = `${53 + (evt.current / evt.total) * 32}%`;
       break;
+    }
 
     case 'candidates':
       // Pre-scoring layers have served their purpose — clear them before dots appear
@@ -2780,13 +2788,36 @@ function _handleIaSSE(evt) {
 
     case 'candidate_scored': {
       const cm = state.iaCandidateMarkers[evt.idx];
-      if (cm) {
-        const pct = evt.coverage_pct || 0;
-        const clr = evt.backbone_blocked ? '#555'
-                  : pct >= 40            ? '#4caf50'
-                  : pct >= 15            ? '#ff9800'
-                  :                        '#e05252';
-        cm.setStyle({color: clr, fillColor: clr, fillOpacity: 0.7});
+      if (!cm) break;
+      const pct      = evt.coverage_pct    || 0;
+      const blocked  = evt.backbone_blocked || false;
+      const minC     = state.iaMinContribPct || 0;
+
+      // Remember this score for recoloring when the best changes
+      state.iaCandScores[evt.idx] = { pct, backbone_blocked: blocked };
+
+      // Helper: non-best color for a scored candidate
+      const normalColor = (idx) => {
+        const d = state.iaCandScores[idx] || {};
+        return d.backbone_blocked ? '#555' : d.pct >= minC ? '#4caf50' : '#e05252';
+      };
+
+      if (!blocked && pct > state.iaBestCandPct) {
+        // Revert old best to its normal color
+        if (state.iaBestCandIdx !== null) {
+          const oldM = state.iaCandidateMarkers[state.iaBestCandIdx];
+          if (oldM) oldM.setStyle({ color: normalColor(state.iaBestCandIdx),
+                                    fillColor: normalColor(state.iaBestCandIdx),
+                                    fillOpacity: 0.7 });
+        }
+        state.iaBestCandIdx = evt.idx;
+        state.iaBestCandPct = pct;
+        cm.setStyle({ color: '#9c27b0', fillColor: '#9c27b0', fillOpacity: 0.9,
+                      radius: 7 });
+        progressEl.textContent = `RF scoring… Best candidate: +${pct.toFixed(1)}%`;
+      } else {
+        const clr = normalColor(evt.idx);
+        cm.setStyle({ color: clr, fillColor: clr, fillOpacity: 0.7, radius: 5 });
       }
       break;
     }
@@ -3330,6 +3361,9 @@ function _iaClear() {
   state.iaCoveredExisting  = new Set();
   state.iaCoveredSuggested = new Set();
   state.iaCompleteEvt      = null;
+  state.iaBestCandIdx      = null;
+  state.iaBestCandPct      = 0;
+  state.iaCandScores       = {};
   document.getElementById('ia-results').innerHTML = '';
   document.getElementById('ia-results').classList.add('hidden');
   document.getElementById('ia-import-btn').classList.add('hidden');
