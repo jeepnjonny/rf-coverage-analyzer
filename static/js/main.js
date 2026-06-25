@@ -2419,10 +2419,10 @@ state.iaCompleteEvt      = null;
 state.iaCandidateLayer   = L.layerGroup().addTo(map);
 state.iaCandidateMarkers = {};  // keyed by cand_idx → L.circleMarker
 // Live scoring state for candidate coloring
-state.iaMinContribPct    = 0;     // min_contribution_pct from UI params
-state.iaBestCandIdx      = null;  // cand_idx of the highest-coverage site seen so far
-state.iaBestCandPct      = 0;     // coverage_pct of that site
-state.iaCandScores       = {};    // { cand_idx: { pct, backbone_blocked } }
+state.iaMinContribPct    = 0;        // min_contribution_pct from UI params
+state.iaBestCandIdxSet   = new Set(); // all cand_idx tied at the current best coverage_pct
+state.iaBestCandPct      = 0;        // that best coverage_pct
+state.iaCandScores       = {};        // { cand_idx: { pct, backbone_blocked } }
 // Step-by-step map visualization layers
 state.iaTrackPreviewLayer = L.layerGroup().addTo(map);  // dashed track before coverage data
 state.iaRoadsLayer        = L.layerGroup().addTo(map);  // OSM road network sketch
@@ -2565,7 +2565,11 @@ function startInfraAdvisor() {
   state.iaCoveredExisting  = new Set();
   state.iaCoveredSuggested = new Set();
   state.iaCoverageLayer.clearLayers();
-  state.iaAbortCtrl   = new AbortController();
+  state.iaAbortCtrl      = new AbortController();
+  state.iaMinContribPct  = parseFloat(document.getElementById('ia-min-contrib').value) || 0;
+  state.iaBestCandIdxSet = new Set();
+  state.iaBestCandPct    = 0;
+  state.iaCandScores     = {};
 
   const resultsEl  = document.getElementById('ia-results');
   const progressEl = document.getElementById('ia-progress-container');
@@ -2803,18 +2807,21 @@ function _handleIaSSE(evt) {
       };
 
       if (!blocked && pct > state.iaBestCandPct) {
-        // Revert old best to its normal color
-        if (state.iaBestCandIdx !== null) {
-          const oldM = state.iaCandidateMarkers[state.iaBestCandIdx];
-          if (oldM) oldM.setStyle({ color: normalColor(state.iaBestCandIdx),
-                                    fillColor: normalColor(state.iaBestCandIdx),
-                                    fillOpacity: 0.7 });
-        }
-        state.iaBestCandIdx = evt.idx;
-        state.iaBestCandPct = pct;
-        cm.setStyle({ color: '#9c27b0', fillColor: '#9c27b0', fillOpacity: 0.9,
-                      radius: 7 });
+        // Strictly better — revert all previous tied-bests to normal color
+        state.iaBestCandIdxSet.forEach(oldIdx => {
+          const oldM = state.iaCandidateMarkers[oldIdx];
+          if (oldM) oldM.setStyle({ color: normalColor(oldIdx),
+                                    fillColor: normalColor(oldIdx),
+                                    fillOpacity: 0.7, radius: 5 });
+        });
+        state.iaBestCandIdxSet = new Set([evt.idx]);
+        state.iaBestCandPct    = pct;
+        cm.setStyle({ color: '#9c27b0', fillColor: '#9c27b0', fillOpacity: 0.9, radius: 7 });
         progressEl.textContent = `RF scoring… Best candidate: +${pct.toFixed(1)}%`;
+      } else if (!blocked && pct === state.iaBestCandPct && pct > 0) {
+        // Tied — add to the purple set alongside existing bests
+        state.iaBestCandIdxSet.add(evt.idx);
+        cm.setStyle({ color: '#9c27b0', fillColor: '#9c27b0', fillOpacity: 0.9, radius: 7 });
       } else {
         const clr = normalColor(evt.idx);
         cm.setStyle({ color: clr, fillColor: clr, fillOpacity: 0.7, radius: 5 });
@@ -3361,7 +3368,7 @@ function _iaClear() {
   state.iaCoveredExisting  = new Set();
   state.iaCoveredSuggested = new Set();
   state.iaCompleteEvt      = null;
-  state.iaBestCandIdx      = null;
+  state.iaBestCandIdxSet   = new Set();
   state.iaBestCandPct      = 0;
   state.iaCandScores       = {};
   document.getElementById('ia-results').innerHTML = '';
