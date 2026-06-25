@@ -3464,8 +3464,15 @@ def suggest_locations():
             # Greedy set-cover to select the best combination
             yield sse({"type": "status",
                        "message": "Selecting optimal location combination…"})
+            # If existing receivers already meet the user's target, still run greedy
+            # trying to reach 100% so sites are suggested for the remaining gap.
+            effective_target = (
+                100.0
+                if total_pts and len(pre_covered) / total_pts * 100 >= target_cov_pct
+                else target_cov_pct
+            )
             selected = greedy_set_cover(
-                scored, total_pts, max_locations, target_cov_pct,
+                scored, total_pts, max_locations, effective_target,
                 pre_covered=pre_covered,
                 min_contribution_pct=min_contribution_pct,
             )
@@ -3576,6 +3583,7 @@ def suggest_locations():
                 "total_candidates":        len(scored),
                 "final_coverage_pct":      final_pct,
                 "existing_coverage_pct":   existing_pct,
+                "target_coverage_pct":     target_cov_pct,
                 "backbone_blocked_count":  backbone_blocked_count,
                 "zero_coverage_count":     zero_coverage_count,
                 "best_marginal_pct":       best_marginal_pct,
