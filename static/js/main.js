@@ -947,7 +947,14 @@ function updateLegend() {
   const hasIa            = state.iaSuggestions && state.iaSuggestions.length > 0;
   const hasIaTrack       = state.iaAdvisorTrackPts && state.iaAdvisorTrackPts.length > 0;
   const hasIaCandidates  = state.iaCandidateMarkers && Object.keys(state.iaCandidateMarkers).length > 0;
-  if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack && !hasIaCandidates) { el.style.display = 'none'; return; }
+  const hasIaRoads       = state.iaRoadsLayer      && state.iaRoadsLayer.getLayers().length > 0;
+  const hasIaExclusions  = state.iaExclusionsLayer && state.iaExclusionsLayer.getLayers().length > 0;
+  const hasIaHotZones    = state.iaHotZoneLayer    && state.iaHotZoneLayer.getLayers().length > 0;
+  const hasIaTrackPrev   = state.iaTrackPreviewLayer && state.iaTrackPreviewLayer.getLayers().length > 0;
+  if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack && !hasIaCandidates
+      && !hasIaRoads && !hasIaExclusions && !hasIaHotZones && !hasIaTrackPrev) {
+    el.style.display = 'none'; return;
+  }
   el.style.display = '';
   const lines = [];
   if (hasRx) {
@@ -988,6 +995,20 @@ function updateLegend() {
     lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#ff9800;background:rgba(255,152,0,0.7)"></div><span>Moderate (&ge;15%)</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#e05252;background:rgba(224,82,82,0.7)"></div><span>Low coverage</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-marker lm-circle" style="color:#555;background:rgba(85,85,85,0.7)"></div><span>Backbone blocked</span></div>');
+  }
+  if (hasIaTrackPrev) {
+    lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:repeating-linear-gradient(90deg,#888 0,#888 7px,transparent 7px,transparent 12px)"></div><span>Track (analyzing…)</span></div>');
+  }
+  if (hasIaRoads) {
+    if (!hasIaTrackPrev) lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#555;height:2px;margin:5px 0"></div><span>Road/trail network</span></div>');
+  }
+  if (hasIaExclusions) {
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:rgba(231,76,60,0.25);border:1px solid #c0392b"></div><span>Water / building (excluded)</span></div>');
+  }
+  if (hasIaHotZones) {
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:rgba(243,156,18,0.2);border:1px solid #e67e22;border-radius:50%"></div><span>Hot-zone cluster</span></div>');
   }
   el.innerHTML = lines.join('');
 }
@@ -2397,6 +2418,12 @@ state.iaCompleteEvt      = null;
 // Candidate site dots (shown during scoring, cleared after complete)
 state.iaCandidateLayer   = L.layerGroup().addTo(map);
 state.iaCandidateMarkers = {};  // keyed by cand_idx → L.circleMarker
+// Step-by-step map visualization layers
+state.iaTrackPreviewLayer = L.layerGroup().addTo(map);  // dashed track before coverage data
+state.iaRoadsLayer        = L.layerGroup().addTo(map);  // OSM road network sketch
+state.iaExclusionsLayer   = L.layerGroup().addTo(map);  // water/building exclusion polygons
+state.iaHotZoneLayer      = L.layerGroup().addTo(map);  // coarse-scoring hot zone circles
+state.iaRefineLayer       = L.layerGroup().addTo(map);  // 150 m refinement radius rings
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -2453,6 +2480,8 @@ function _iaCoverageState(idx) {
 }
 
 function _iaDrawCoverageTrack() {
+  // Coverage coloring takes over from the dashed preview
+  state.iaTrackPreviewLayer.clearLayers();
   state.iaCoverageLayer.clearLayers();
   const pts = state.iaAdvisorTrackPts;
   if (pts.length < 2) return;
@@ -2652,6 +2681,16 @@ function _handleIaSSE(evt) {
     }
 
     case 'refine_progress': {
+      // Draw 150 m dashed rings around each selected site on the first event
+      if (state.iaRefineLayer.getLayers().length === 0 && state.iaSuggestions.length > 0) {
+        state.iaSuggestions.forEach(s => {
+          L.circle([s.lat, s.lon], {
+            radius: 150,
+            color: '#00bcd4', weight: 1.5, opacity: 0.8, dashArray: '5 4',
+            fillColor: '#00bcd4', fillOpacity: 0.07,
+          }).addTo(state.iaRefineLayer);
+        });
+      }
       const frac = evt.total > 0 ? evt.current / evt.total : 0;
       progressEl.textContent = evt.message || `Refining: ${evt.current}/${evt.total}`;
       barEl.style.width = `${85 + frac * 10}%`;
@@ -2660,6 +2699,50 @@ function _handleIaSSE(evt) {
 
     case 'track_pts':
       state.iaAdvisorTrackPts = evt.pts || [];
+      // Draw dashed gray preview immediately so the map isn't blank during tile/OSM fetch
+      state.iaTrackPreviewLayer.clearLayers();
+      if (state.iaAdvisorTrackPts.length > 1) {
+        const prevLine = L.polyline(state.iaAdvisorTrackPts, {
+          color: '#888', weight: 3, opacity: 0.55, dashArray: '7 5',
+        });
+        prevLine.addTo(state.iaTrackPreviewLayer);
+        map.fitBounds(prevLine.getBounds(), { padding: [40, 40] });
+      }
+      updateLegend();
+      break;
+
+    case 'osm_roads':
+      state.iaRoadsLayer.clearLayers();
+      (evt.lines || []).forEach(pts => {
+        if (pts.length > 1)
+          L.polyline(pts, { color: '#555', weight: 1.2, opacity: 0.4 })
+           .addTo(state.iaRoadsLayer);
+      });
+      updateLegend();
+      break;
+
+    case 'osm_exclusions':
+      state.iaExclusionsLayer.clearLayers();
+      (evt.polygons || []).forEach(pts => {
+        if (pts.length > 2)
+          L.polygon(pts, {
+            color: '#c0392b', weight: 1, opacity: 0.55,
+            fillColor: '#e74c3c', fillOpacity: 0.18,
+          }).addTo(state.iaExclusionsLayer);
+      });
+      updateLegend();
+      break;
+
+    case 'hot_zones':
+      state.iaHotZoneLayer.clearLayers();
+      (evt.zones || []).forEach(z => {
+        L.circle([z.lat, z.lon], {
+          radius: evt.radius_m || 200,
+          color: '#e67e22', weight: 1.5, opacity: 0.7,
+          fillColor: '#f39c12', fillOpacity: 0.15,
+        }).bindTooltip(`Hot zone (${z.count} coarse survivors)`, { permanent: false })
+          .addTo(state.iaHotZoneLayer);
+      });
       updateLegend();
       break;
 
@@ -2679,6 +2762,10 @@ function _handleIaSSE(evt) {
       break;
 
     case 'candidates':
+      // Pre-scoring layers have served their purpose — clear them before dots appear
+      state.iaTrackPreviewLayer.clearLayers();
+      state.iaRoadsLayer.clearLayers();
+      state.iaHotZoneLayer.clearLayers();
       (evt.candidates || []).forEach(c => {
         const m = L.circleMarker([c.lat, c.lon], {
           radius: 5, color: '#888', fillColor: '#888',
@@ -2768,6 +2855,7 @@ function _handleIaSSE(evt) {
       }
       state.iaCandidateLayer.clearLayers();
       state.iaCandidateMarkers = {};
+      state.iaRefineLayer.clearLayers();
       _iaUpdateSummary();
       _iaFinish();
       break;
@@ -2777,6 +2865,10 @@ function _handleIaSSE(evt) {
       statusEl.textContent = `Error: ${evt.message.split('\n')[0]}`;
       state.iaCandidateLayer.clearLayers();
       state.iaCandidateMarkers = {};
+      state.iaTrackPreviewLayer.clearLayers();
+      state.iaRoadsLayer.clearLayers();
+      state.iaHotZoneLayer.clearLayers();
+      state.iaRefineLayer.clearLayers();
       _iaFinish();
       break;
   }
@@ -3222,6 +3314,11 @@ function _iaClear() {
   state.iaCandidateLayer.clearLayers();
   state.iaCandidateMarkers = {};
   state.iaTestLayer.clearLayers();
+  state.iaTrackPreviewLayer.clearLayers();
+  state.iaRoadsLayer.clearLayers();
+  state.iaExclusionsLayer.clearLayers();
+  state.iaHotZoneLayer.clearLayers();
+  state.iaRefineLayer.clearLayers();
   if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
   _hideIaTestMenu();
   state.iaSuggestions      = [];

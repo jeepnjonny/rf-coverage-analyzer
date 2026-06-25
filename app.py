@@ -2998,6 +2998,31 @@ def suggest_locations():
                        "way_count": len(ways),
                        "exclusion_zone_count": len(_excl_polygons)})
 
+            # Emit simplified road geometry for map preview.
+            # Nodes are (lat, lon) tuples; subsample to ~10 pts per way.
+            _road_lines: list = []
+            for _way in ways:
+                _pts = _way.get("nodes", [])
+                if len(_pts) < 2:
+                    continue
+                _step = max(1, len(_pts) // 10)
+                _sub  = _pts[::_step]
+                if _sub[-1] != _pts[-1]:
+                    _sub = list(_sub) + [_pts[-1]]
+                _road_lines.append(
+                    [[round(p[0], 5), round(p[1], 5)] for p in _sub])
+            if _road_lines:
+                yield sse({"type": "osm_roads", "lines": _road_lines})
+
+            # Emit exclusion zone polygons (water, buildings) — capped for payload size.
+            if _excl_polygons:
+                _excl_out: list = []
+                for _poly in _excl_polygons[:200]:
+                    _pstep = max(1, len(_poly) // 20)
+                    _excl_out.append(
+                        [[round(p[0], 5), round(p[1], 5)] for p in _poly[::_pstep]])
+                yield sse({"type": "osm_exclusions", "polygons": _excl_out})
+
             # Tier-1: sample points along driveable roads
             tier1 = sample_road_candidates(ways, ROAD_SAMPLE_SPACING_M)
 
@@ -3172,8 +3197,13 @@ def suggest_locations():
                     coarse_survivors = filtered[:n_keep]
 
                     # ── Phase 2: heat-map expansion ───────────────────────
-                    hot_zones  = compute_hot_zones(coarse_survivors)
+                    hot_zones   = compute_hot_zones(coarse_survivors)
                     micro_cands = expand_hot_zones(hot_zones)
+                    # Store for the generator to emit as a map visualization event
+                    _phase_state["hot_zones"] = [
+                        {"lat": lat, "lon": lon, "count": cnt}
+                        for lat, lon, cnt in hot_zones
+                    ]
 
                     if micro_cands:
                         _phase_state["phase"] = "hotzone"
@@ -3254,6 +3284,13 @@ def suggest_locations():
                 "total":   max(1, _phase_state["total"]),
                 "message": _phase_state["message"],
             })
+
+            # Emit hot zone circles for map visualization
+            _hz = _phase_state.get("hot_zones") or []
+            if _hz:
+                yield sse({"type": "hot_zones",
+                           "zones": _hz,
+                           "radius_m": HOT_ZONE_EXPAND_M})
 
             candidates = (
                 _phase_candidates[0]
