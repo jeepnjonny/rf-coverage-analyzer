@@ -1307,9 +1307,8 @@ function handleSSE(evt, ctx) {
       // Backbone links (WIDE1 ↔ WIDE2 or WIDE1 ↔ iGate) get a distinct amber dashed style
       const r1 = _rxRole(rx1);
       const r2 = _rxRole(rx2);
-      const _termRoles = new Set(['wide2', 'igate', 'meshtastic']);
-      const isBackbone = (r1 === 'wide1' && _termRoles.has(r2))
-                      || (r2 === 'wide1' && _termRoles.has(r1));
+      const isBackbone = (r1 === 'wide1' && (r2 === 'wide2' || r2 === 'igate'))
+                      || (r2 === 'wide1' && (r1 === 'wide2' || r1 === 'igate'));
       const color  = isBackbone ? '#ffb300' : RX_COLORS[evt.rx1_idx % RX_COLORS.length];
       const weight = isBackbone ? 3.5 : 2.5;
       const opts   = { color, weight, opacity: isBackbone ? 0.95 : 0.75,
@@ -1342,7 +1341,7 @@ function handleSSE(evt, ctx) {
       setStatus(evt.mode === 'links'
         ? 'Receiver link analysis complete.'
         : evt.chain_mode
-          ? 'APRS chain analysis complete. Covered = tracker → WIDE1 → WIDE2/iGate/Meshtastic path. Backbone links shown in amber.'
+          ? 'APRS chain analysis complete. Covered = tracker → WIDE1 (requires WIDE2/iGate link) or direct to WIDE2/iGate. Backbone links shown in amber.'
           : 'Track coverage complete. Click an inter-receiver link to view terrain profile.');
       // Store stats and show save row
       state.lastAnalysisStats    = evt.stats || [];

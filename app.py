@@ -937,9 +937,10 @@ VEG_PROFILES: dict[str, dict] = {
 # the path is considered unworkable regardless of the computed RSSI.
 HARD_FAIL_DB = 30.0
 
-# Roles that provide terminal APRS/mesh connectivity (direct internet or mesh gateway).
-# WIDE1 digis are viable in chain mode only when they can reach at least one of these.
-TERMINAL_ROLES: frozenset[str] = frozenset(("wide2", "igate", "meshtastic"))
+# Roles that satisfy the WIDE1 relay requirement in APRS chain mode.
+# A WIDE1 is viable when it has a good RF link to any receiver with one of these roles.
+# Meshtastic is intentionally excluded — it is a separate protocol, not part of the APRS chain.
+W1_RELAY_ROLES: frozenset[str] = frozenset(("wide2", "igate"))
 
 # ---------------------------------------------------------------------------
 # Infrastructure Location Advisor — OSM + greedy site selection
@@ -1833,7 +1834,7 @@ def _point_task(args: tuple) -> dict:
             if rr["hard_fail"]: continue
             if rr["rssi"] < (sensitivity_dbm + fade_margin_db): continue
             rx_role = (receivers[rr["rx_idx"]].get("role") or "").strip().lower()
-            viable  = (rr["rx_idx"] in viable_w1_idxs) or rx_role in TERMINAL_ROLES
+            viable  = (rr["rx_idx"] in viable_w1_idxs) or rx_role in W1_RELAY_ROLES
             if viable and rr["rssi"] > chain_best_rssi:
                 chain_best_rssi = rr["rssi"]
                 chain_best_rx   = rr["rx_idx"]
@@ -2150,12 +2151,12 @@ def analyze():
                     _r2 = (receivers[_j].get("role") or "").strip().lower()
 
                     # Case A: WIDE1 is rx1 (lower index) — link was evaluated WIDE1→terminal ✓
-                    if _r1 == "wide1" and _r2 in TERMINAL_ROLES and _res.get("good_link"):
+                    if _r1 == "wide1" and _r2 in W1_RELAY_ROLES and _res.get("good_link"):
                         _w1.add(_i)
 
                     # Case B: WIDE1 is rx2 (higher index) — link was evaluated terminal→WIDE1 ✗
                     # Re-compute RSSI for the WIDE1→terminal direction using cached path losses.
-                    if _r2 == "wide1" and _r1 in TERMINAL_ROLES:
+                    if _r2 == "wide1" and _r1 in W1_RELAY_ROLES:
                         _pl   = fspl_db(freq_mhz, _res["dist_km"] * 1000)
                         _rssi = (
                             float(receivers[_j].get("tx_power_dbm",    22) or 22)
@@ -2168,13 +2169,14 @@ def analyze():
 
                 viable_w1_idxs = frozenset(_w1)
                 if not any(
-                    (rx.get("role") or "").strip().lower() in TERMINAL_ROLES
+                    (rx.get("role") or "").strip().lower() in W1_RELAY_ROLES
                     for rx in receivers
                     if str(rx.get("enabled", "1")).strip() != "0"
                 ):
                     yield sse({"type": "status",
-                               "message": "⚠ Chain mode: no WIDE2, iGate, or Meshtastic Router receivers found — "
-                                          "add receivers with role=wide2, role=igate, or role=meshtastic in the CSV."})
+                               "message": "⚠ Chain mode: no WIDE2 or iGate receivers found — "
+                                          "WIDE1 fill-in digis cannot relay without a backbone node. "
+                                          "Add receivers with role=wide2 or role=igate, or disable chain mode."})
 
             # ---- Per-path-point RF analysis ----
             if mode in ("track", "both"):
