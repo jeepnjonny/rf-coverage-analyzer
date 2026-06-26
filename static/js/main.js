@@ -1049,7 +1049,23 @@ function updateLegend() {
   el.innerHTML = lines.join('');
 }
 
+function updateSingleRxSelect() {
+  const sel = document.getElementById('single-rx-select');
+  const row = document.getElementById('single-rx-row');
+  const prev = sel.value;
+  while (sel.options.length > 1) sel.remove(1);
+  state.receivers.forEach(rx => {
+    const opt = document.createElement('option');
+    opt.value = rx.name;
+    opt.textContent = rx.name;
+    sel.add(opt);
+  });
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+  row.style.display = state.receivers.length > 0 ? 'flex' : 'none';
+}
+
 function checkReady() {
+  updateSingleRxSelect();
   const trackBtn = document.getElementById('analyze-track-btn');
   const linksBtn = document.getElementById('analyze-links-btn');
 
@@ -1149,12 +1165,16 @@ function startAnalysis(mode, opts = {}) {
   setProgress('Starting…', 0);
   setStatus('');
 
+  const _focusedRx = document.getElementById('single-rx-select').value;
   const params = {
     kml_file:        state.kmlFile,
     csv_file:        state.csvFile,
     // Send receivers directly so the server always uses the live UI state
     // (enabled flags, dragged positions) without requiring an explicit CSV save first.
-    receivers:       state.receivers,
+    // When a single site is focused, temporarily disable all others in this request only.
+    receivers:       _focusedRx
+                       ? state.receivers.map(rx => rx.name === _focusedRx ? rx : { ...rx, enabled: '0' })
+                       : state.receivers,
     freq_mhz:        state.lastFreqMhz,
     tx_power_dbm:    parseFloat(document.getElementById('tx-power').value),
     tx_gain_dbi:     parseFloat(document.getElementById('tx-gain').value),

@@ -213,6 +213,12 @@
         </label>
       </div>
       <button class="btn btn-secondary btn-full" id="add-rx-btn">＋ Add Receiver</button>
+      <div id="single-rx-row" style="display:none;align-items:center;gap:6px;margin-top:4px">
+        <label for="single-rx-select" class="param-label" style="margin:0;white-space:nowrap;flex-shrink:0">Focus:</label>
+        <select id="single-rx-select" class="ctrl-input" style="flex:1;min-width:0">
+          <option value="">All sites</option>
+        </select>
+      </div>
       <div style="display:flex;gap:6px">
         <button id="analyze-track-btn" class="btn btn-primary btn-full" disabled>▶ Track Coverage</button>
         <button id="analyze-links-btn" class="btn btn-primary btn-full" disabled>▶ Receiver Links</button>
