@@ -2825,9 +2825,11 @@ def suggest_locations():
 
     def generate():
         try:
-            # Determine backbone anchors for chain-aware WIDE1 scoring
+            # Determine backbone anchors for chain-aware scoring (WIDE1 and WIDE2).
+            # Both tiers require a relay path to a WIDE2/iGate to be network-useful.
+            # Load an iGate or existing WIDE2 in the receivers CSV to enable this check.
             backbone_pts: tuple | None = None
-            if tier_hint == "wide1" and existing_receivers:
+            if tier_hint in ("wide1", "wide2") and existing_receivers:
                 backbone_rxs = [
                     r for r in existing_receivers
                     if str(r.get("role", "wide1")).lower() in ("wide2", "igate")
@@ -3387,10 +3389,11 @@ def suggest_locations():
             # Parallel RF scoring via the analysis process pool
             n_cands = len(candidates)
             if backbone_pts:
+                tier_label = tier_hint.upper()
                 yield sse({"type": "status",
                            "message": (f"Chain mode: {len(backbone_pts)} backbone anchor(s) found — "
-                                       f"scoring {n_cands} WIDE1 candidates for relay viability…")})
-            elif tier_hint == "wide1" and existing_receivers and not backbone_pts:
+                                       f"scoring {n_cands} {tier_label} candidates for relay viability…")})
+            elif tier_hint in ("wide1", "wide2") and existing_receivers and not backbone_pts:
                 yield sse({"type": "status",
                            "message": (f"No WIDE2/iGate receivers loaded — "
                                        f"scoring {n_cands} candidates for direct coverage only.")})
