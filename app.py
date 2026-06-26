@@ -1036,6 +1036,46 @@ def _get_analysis_pool() -> ProcessPoolExecutor:
     return _analysis_pool
 
 
+def _terrain_check_task(args: tuple) -> dict:
+    """Slope + exclusion-zone check for one candidate. Module-level for process pool."""
+    ci, clat, clon, max_slope, excl_polygons, excl_grid, excl_cell_deg = args
+    try:
+        if _local_slope_deg(clat, clon) > max_slope:
+            return {"ci": ci, "ok": False, "reason": "slope"}
+        if excl_polygons and point_in_exclusion_zone(
+            clat, clon, excl_polygons, excl_grid, excl_cell_deg
+        ):
+            return {"ci": ci, "ok": False, "reason": "excl"}
+        return {"ci": ci, "ok": True}
+    except Exception:
+        return {"ci": ci, "ok": True}
+
+
+def _coarse_task(args: tuple) -> dict:
+    """Coarse RF coverage score for one candidate. Module-level for process pool."""
+    (ci, clat, clon, c_agl, track_pts, freq_mhz,
+     tx_power_dbm, tx_gain_dbi, sensitivity_dbm, fade_margin_db) = args
+    try:
+        score = coarse_score_candidate(
+            clat, clon, c_agl, track_pts, freq_mhz,
+            tx_power_dbm, tx_gain_dbi, sensitivity_dbm, fade_margin_db,
+        )
+    except Exception:
+        score = 0.0
+    return {"ci": ci, "score": score}
+
+
+def _los_check_task(args: tuple) -> dict:
+    """LOS check for one candidate against a set of nearby track points."""
+    ci, clat, clon, agl, check_pts = args
+    try:
+        ok = any(terrain_los_clear(clat, clon, agl, lat, lon)
+                 for lat, lon in check_pts)
+    except Exception:
+        ok = True
+    return {"ci": ci, "ok": ok}
+
+
 def _interp_gamma(veg: dict, freq_mhz: float) -> float:
     """Log-linear interpolation of γ (dB/m) between tabulated frequencies."""
     freqs = sorted(veg["gamma"])
@@ -2200,7 +2240,8 @@ def analyze():
                 ]
 
                 pool = _get_analysis_pool()
-                for pt in pool.map(_point_task, point_args, chunksize=1):
+                for pt in pool.map(_point_task, point_args,
+                                   chunksize=max(1, len(point_args) // (_POOL_WORKERS * 4))):
                         if pt["coverage"]:
                             total_covered += 1
                             bx = pt["best_rx_idx"]
@@ -3162,27 +3203,30 @@ def suggest_locations():
 
             def _run_phases_012():
                 try:
-                    # ── Phase 0b: terrain accessibility filter ────────────
+                    _pool = _get_analysis_pool()
+
+                    # ── Phase 0b: terrain accessibility filter (parallel) ─
                     _phase_state["phase"] = "terrain"
                     _phase_state["total"] = len(candidates)
                     terrain_ok: list[dict] = []
                     slope_rej = excl_rej = 0
-                    for ti, c in enumerate(candidates):
-                        try:
-                            if _local_slope_deg(c["lat"], c["lon"]) > MAX_SITE_SLOPE_DEG:
-                                slope_rej += 1
-                            elif _excl_polygons and point_in_exclusion_zone(
-                                c["lat"], c["lon"],
-                                _excl_polygons, _excl_grid, _excl_cell_deg
-                            ):
-                                excl_rej += 1
-                            else:
-                                terrain_ok.append(c)
-                        except Exception:
-                            terrain_ok.append(c)   # keep candidate if check errors
-                        _phase_state["current"] = ti + 1
+                    _chk_args = [
+                        (ti, c["lat"], c["lon"], MAX_SITE_SLOPE_DEG,
+                         _excl_polygons, _excl_grid, _excl_cell_deg)
+                        for ti, c in enumerate(candidates)
+                    ]
+                    _chk_chunk = max(1, len(_chk_args) // (_POOL_WORKERS * 4))
+                    for res in _pool.map(_terrain_check_task, _chk_args,
+                                         chunksize=_chk_chunk):
+                        if res["ok"]:
+                            terrain_ok.append(candidates[res["ci"]])
+                        elif res["reason"] == "slope":
+                            slope_rej += 1
+                        else:
+                            excl_rej += 1
+                        _phase_state["current"] = res["ci"] + 1
                         _phase_state["message"] = (
-                            f"Terrain check: {ti + 1}/{len(candidates)}…")
+                            f"Terrain check: {res['ci'] + 1}/{len(candidates)}…")
 
                     total_rej = slope_rej + excl_rej
                     filtered = terrain_ok if terrain_ok else candidates
@@ -3191,7 +3235,7 @@ def suggest_locations():
                         f"({slope_rej} steep, {excl_rej} water/building). "
                         f"{len(filtered)} remain.")
 
-                    # ── Phase 1: coarse RF scoring ────────────────────────
+                    # ── Phase 1: coarse RF scoring (parallel) ─────────────
                     _PRE_COARSE_CAP = 1500
                     if len(filtered) > _PRE_COARSE_CAP:
                         filtered.sort(key=lambda c: c["lat"])
@@ -3206,19 +3250,20 @@ def suggest_locations():
                         f"Coarse scoring {len(filtered)} candidates…")
 
                     rx_gain_total = tx_gain_dbi + WIDE_APRS_RX_GAIN_DBI
-                    for ci, c in enumerate(filtered):
-                        try:
-                            c["_coarse"] = coarse_score_candidate(
-                                c["lat"], c["lon"], antenna_height_m,
-                                track_pts, freq_mhz,
-                                tx_power_dbm, rx_gain_total,
-                                sensitivity_dbm, fade_margin_db,
-                            )
-                        except Exception:
-                            c["_coarse"] = 0.0
-                        _phase_state["current"] = ci + 1
+                    _cs_args = [
+                        (ci, c["lat"], c["lon"], antenna_height_m,
+                         track_pts, freq_mhz,
+                         tx_power_dbm, rx_gain_total,
+                         sensitivity_dbm, fade_margin_db)
+                        for ci, c in enumerate(filtered)
+                    ]
+                    _cs_chunk = max(1, len(_cs_args) // (_POOL_WORKERS * 4))
+                    for res in _pool.map(_coarse_task, _cs_args,
+                                          chunksize=_cs_chunk):
+                        filtered[res["ci"]]["_coarse"] = res["score"]
+                        _phase_state["current"] = res["ci"] + 1
                         _phase_state["message"] = (
-                            f"Coarse scoring: {ci + 1}/{len(filtered)}…")
+                            f"Coarse scoring: {res['ci'] + 1}/{len(filtered)}…")
 
                     filtered.sort(key=lambda c: c["_coarse"], reverse=True)
                     n_keep = max(50, int(len(filtered) * (1.0 - COARSE_REJECT_BOTTOM)))
@@ -3241,39 +3286,55 @@ def suggest_locations():
                             f"Hot-zone analysis: {len(hot_zones)} zone(s) → "
                             f"scoring {len(micro_cands)} micro-candidates…")
 
-                        micro_survivors: list[dict] = []
                         existing_keys = {
                             (round(c["lat"], 4), round(c["lon"], 4))
                             for c in coarse_survivors
                         }
-                        for mi, mc in enumerate(micro_cands):
-                            mk = (round(mc["lat"], 4), round(mc["lon"], 4))
-                            if mk not in existing_keys:
-                                try:
-                                    if _local_slope_deg(
-                                        mc["lat"], mc["lon"]
-                                    ) > MAX_SITE_SLOPE_DEG:
-                                        pass
-                                    elif _excl_polygons and point_in_exclusion_zone(
-                                        mc["lat"], mc["lon"],
-                                        _excl_polygons, _excl_grid, _excl_cell_deg
-                                    ):
-                                        pass
-                                    else:
-                                        mc["_coarse"] = coarse_score_candidate(
-                                            mc["lat"], mc["lon"], antenna_height_m,
-                                            track_pts, freq_mhz,
-                                            tx_power_dbm, rx_gain_total,
-                                            sensitivity_dbm, fade_margin_db,
-                                        )
-                                        if mc["_coarse"] > 0.0:
-                                            micro_survivors.append(mc)
-                                            existing_keys.add(mk)
-                                except Exception:
-                                    pass
-                            _phase_state["current"] = mi + 1
+                        # Deduplicate before dispatching to pool
+                        novel_mc = [
+                            mc for mc in micro_cands
+                            if (round(mc["lat"], 4), round(mc["lon"], 4))
+                            not in existing_keys
+                        ]
+
+                        # Parallel terrain check for novel micro-candidates
+                        _mc_chk_args = [
+                            (mi, mc["lat"], mc["lon"], MAX_SITE_SLOPE_DEG,
+                             _excl_polygons, _excl_grid, _excl_cell_deg)
+                            for mi, mc in enumerate(novel_mc)
+                        ]
+                        _mc_chk_chunk = max(1, len(_mc_chk_args) // (_POOL_WORKERS * 4)) if _mc_chk_args else 1
+                        mc_terrain_ok: list[dict] = []
+                        for res in _pool.map(_terrain_check_task, _mc_chk_args,
+                                              chunksize=_mc_chk_chunk):
+                            if res["ok"]:
+                                mc_terrain_ok.append(novel_mc[res["ci"]])
+                            _phase_state["current"] = res["ci"] + 1
                             _phase_state["message"] = (
-                                f"Hot-zone scoring: {mi + 1}/{len(micro_cands)}…")
+                                f"Hot-zone terrain check: {res['ci'] + 1}/{len(novel_mc)}…")
+
+                        # Parallel coarse score for terrain-ok micro-candidates
+                        _mc_cs_args = [
+                            (mi, mc["lat"], mc["lon"], antenna_height_m,
+                             track_pts, freq_mhz,
+                             tx_power_dbm, rx_gain_total,
+                             sensitivity_dbm, fade_margin_db)
+                            for mi, mc in enumerate(mc_terrain_ok)
+                        ]
+                        _mc_cs_chunk = max(1, len(_mc_cs_args) // (_POOL_WORKERS * 4)) if _mc_cs_args else 1
+                        micro_survivors: list[dict] = []
+                        for res in _pool.map(_coarse_task, _mc_cs_args,
+                                              chunksize=_mc_cs_chunk):
+                            mc = mc_terrain_ok[res["ci"]]
+                            if res["score"] > 0.0:
+                                mc["_coarse"] = res["score"]
+                                mk = (round(mc["lat"], 4), round(mc["lon"], 4))
+                                if mk not in existing_keys:
+                                    micro_survivors.append(mc)
+                                    existing_keys.add(mk)
+                            _phase_state["current"] = res["ci"] + 1
+                            _phase_state["message"] = (
+                                f"Hot-zone scoring: {res['ci'] + 1}/{len(mc_terrain_ok)}…")
 
                         coarse_survivors = coarse_survivors + micro_survivors
                         _phase_state["message"] = (
@@ -3338,20 +3399,26 @@ def suggest_locations():
             for c, ni in zip(candidates, np.argmin(_gd2, axis=1)):
                 c["_ntidx"] = int(ni)
 
-            # ── Phase 4: Terrain LOS pre-filter ─────────────────────────────
+            # ── Phase 4: Terrain LOS pre-filter (parallel) ──────────────────
             # Belt-and-suspenders: reject candidates with no clear LOS to any
             # of their nearest LOS_CHECK_PTS track points using the 8-sample
             # full LOS check (catches coarse-scoring edge cases).
             _LOS_CHECK_PTS = 6
-            _los_survivors: list[dict] = []
-            for c in candidates:
+            _los_args: list[tuple] = []
+            for ci2, c in enumerate(candidates):
                 ni    = c["_ntidx"]
                 start = max(0, ni - _LOS_CHECK_PTS // 2)
                 end   = min(len(track_pts), start + _LOS_CHECK_PTS)
-                if any(terrain_los_clear(c["lat"], c["lon"], antenna_height_m,
-                                         track_pts[ti][0], track_pts[ti][1])
-                       for ti in range(start, end)):
-                    _los_survivors.append(c)
+                _los_args.append((ci2, c["lat"], c["lon"], antenna_height_m,
+                                  [(track_pts[ti][0], track_pts[ti][1])
+                                   for ti in range(start, end)]))
+            _los_chunk = max(1, len(_los_args) // (_POOL_WORKERS * 4))
+            _los_pool  = _get_analysis_pool()
+            _los_ok    = {res["ci"]
+                          for res in _los_pool.map(_los_check_task, _los_args,
+                                                    chunksize=_los_chunk)
+                          if res["ok"]}
+            _los_survivors = [c for ci2, c in enumerate(candidates) if ci2 in _los_ok]
             if _los_survivors:
                 candidates = _los_survivors
 
