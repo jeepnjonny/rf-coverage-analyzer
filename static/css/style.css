@@ -523,6 +523,11 @@ html, body {
 .rx-marker.rx-igate {
   border-radius: 4px !important;
 }
+/* Meshtastic Router — triangle (pointing up) */
+.rx-marker.rx-meshtastic {
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+  border-radius: 0 !important;
+}
 
 /* ─── Map overlay buttons ────────────────────────────────── */
 

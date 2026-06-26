@@ -16,7 +16,7 @@ const RX_COLORS = [
 
 const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled','role'];
 
-const ROLE_LABEL  = { wide1: 'WIDE1 fill-in', wide2: 'WIDE2 backbone', igate: 'iGate' };
+const ROLE_LABEL  = { wide1: 'WIDE1 fill-in', wide2: 'WIDE2 backbone', igate: 'iGate', meshtastic: 'Meshtastic Router' };
 const COORD_DP    = 6;   // decimal places — matches server _rc()
 
 function rc(v) { return parseFloat(v.toFixed(COORD_DP)); }
@@ -577,7 +577,7 @@ function renderFmEditorTable() {
       } else if (col === 'role') {
         const sel = document.createElement('select');
         sel.className = 'editor-select';
-        [['wide1', 'WIDE1 fill-in'], ['wide2', 'WIDE2 backbone'], ['igate', 'iGate']].forEach(([v, label]) => {
+        [['wide1', 'WIDE1 fill-in'], ['wide2', 'WIDE2 backbone'], ['igate', 'iGate'], ['meshtastic', 'Meshtastic Router']].forEach(([v, label]) => {
           const opt = document.createElement('option');
           opt.value = v; opt.textContent = label;
           if ((row[col] || 'wide1') === v) opt.selected = true;
@@ -821,7 +821,10 @@ function _addRxMarker(rx, i) {
   const color     = RX_COLORS[i % RX_COLORS.length];
   const disabled  = !_rxEnabled(rx);
   const role      = _rxRole(rx);
-  const roleClass = role === 'wide2' ? ' rx-wide2' : role === 'igate' ? ' rx-igate' : '';
+  const roleClass = role === 'wide2'       ? ' rx-wide2'
+                 : role === 'igate'       ? ' rx-igate'
+                 : role === 'meshtastic'  ? ' rx-meshtastic'
+                 : '';
   const icon  = L.divIcon({
     className:     '',
     html:          `<div class="rx-marker${disabled ? ' rx-disabled' : ''}${roleClass}" id="rx-dot-${i}" style="background:${color}"></div>`,
@@ -993,6 +996,8 @@ function updateLegend() {
       lines.push('<div class="legend-entry"><div class="legend-marker lm-diamond" style="color:#4f8ef7;background:rgba(79,142,247,0.25)"></div><span>WIDE2 backbone</span></div>');
     if (roles.has('igate'))
       lines.push('<div class="legend-entry"><div class="legend-marker lm-square" style="color:#4f8ef7;background:rgba(79,142,247,0.25)"></div><span>iGate</span></div>');
+    if (roles.has('meshtastic'))
+      lines.push('<div class="legend-entry"><div class="legend-marker lm-square" style="color:#4f8ef7;background:rgba(79,142,247,0.25)"></div><span>Meshtastic Router</span></div>');
   }
   if (hasCoverage) {
     if (hasRx) lines.push('<div class="legend-sep"></div>');
@@ -1302,8 +1307,9 @@ function handleSSE(evt, ctx) {
       // Backbone links (WIDE1 ↔ WIDE2 or WIDE1 ↔ iGate) get a distinct amber dashed style
       const r1 = _rxRole(rx1);
       const r2 = _rxRole(rx2);
-      const isBackbone = (r1 === 'wide1' && (r2 === 'wide2' || r2 === 'igate'))
-                      || (r2 === 'wide1' && (r1 === 'wide2' || r1 === 'igate'));
+      const _termRoles = new Set(['wide2', 'igate', 'meshtastic']);
+      const isBackbone = (r1 === 'wide1' && _termRoles.has(r2))
+                      || (r2 === 'wide1' && _termRoles.has(r1));
       const color  = isBackbone ? '#ffb300' : RX_COLORS[evt.rx1_idx % RX_COLORS.length];
       const weight = isBackbone ? 3.5 : 2.5;
       const opts   = { color, weight, opacity: isBackbone ? 0.95 : 0.75,
@@ -1336,7 +1342,7 @@ function handleSSE(evt, ctx) {
       setStatus(evt.mode === 'links'
         ? 'Receiver link analysis complete.'
         : evt.chain_mode
-          ? 'APRS chain analysis complete. Covered = tracker → WIDE1 → WIDE2/iGate path. Backbone links shown in amber.'
+          ? 'APRS chain analysis complete. Covered = tracker → WIDE1 → WIDE2/iGate/Meshtastic path. Backbone links shown in amber.'
           : 'Track coverage complete. Click an inter-receiver link to view terrain profile.');
       // Store stats and show save row
       state.lastAnalysisStats    = evt.stats || [];
