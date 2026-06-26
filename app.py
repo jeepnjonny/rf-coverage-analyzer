@@ -2240,8 +2240,7 @@ def analyze():
                 ]
 
                 pool = _get_analysis_pool()
-                for pt in pool.map(_point_task, point_args,
-                                   chunksize=max(1, len(point_args) // (_POOL_WORKERS * 4))):
+                for pt in pool.map(_point_task, point_args, chunksize=1):
                         if pt["coverage"]:
                             total_covered += 1
                             bx = pt["best_rx_idx"]
