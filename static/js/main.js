@@ -1263,6 +1263,9 @@ function handleSSE(evt, ctx) {
       }
       setProgress(progressLabel, pct);
 
+      if (evt.stats && evt.stats.length)
+        renderResults(evt.stats, evt.total_coverage_pct ?? 0, false);
+
       evt.points.forEach(pt => {
         // Store for cursor hover RSSI
         state.pathResults.push(pt);
@@ -1645,7 +1648,7 @@ function hideResults() {
   document.getElementById('results-scroll').classList.add('hidden');
 }
 
-function renderResults(stats, totalPct) {
+function renderResults(stats, totalPct, doSwitchTab = true) {
   const tbody = document.getElementById('results-tbody');
   const tfoot = document.getElementById('results-tfoot');
   tbody.innerHTML = '';
@@ -1674,7 +1677,7 @@ function renderResults(stats, totalPct) {
 
   document.getElementById('results-empty').classList.add('hidden');
   document.getElementById('results-scroll').classList.remove('hidden');
-  switchTab('coverage');
+  if (doSwitchTab) switchTab('coverage');
 }
 
 // ---------------------------------------------------------------------------

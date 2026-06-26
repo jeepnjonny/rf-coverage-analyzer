@@ -2261,11 +2261,27 @@ def analyze():
                         })
 
                         if len(batch) >= FLUSH or pt["idx"] == total_pts - 1:
+                            _istats = []
+                            for _ii, _s in enumerate(rx_stats):
+                                if str(receivers[_ii].get("enabled", "1")).strip() == "0":
+                                    continue
+                                _avg = (_s["rssi_sum"] / _s["rssi_count"]
+                                        if _s["rssi_count"] > 0 else None)
+                                _istats.append({
+                                    "name":         _s["name"],
+                                    "coverage_pct": round(_s["covered"] / total_pts * 100, 1)
+                                                    if total_pts else 0,
+                                    "avg_rssi":     round(_avg, 1) if _avg is not None else None,
+                                    "color_idx":    _ii,
+                                })
                             yield sse({
-                                "type":     "points_batch",
-                                "points":   batch,
-                                "progress": pt["idx"] + 1,
-                                "total":    total_pts,
+                                "type":               "points_batch",
+                                "points":             batch,
+                                "progress":           pt["idx"] + 1,
+                                "total":              total_pts,
+                                "stats":              _istats,
+                                "total_coverage_pct": round(total_covered / total_pts * 100, 1)
+                                                      if total_pts else 0,
                             })
                             batch = []
 
