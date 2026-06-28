@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RF Path Coverage Analyzer</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
@@ -368,6 +369,63 @@
     <div class="modal-footer">
       <button class="btn btn-primary"   id="add-rx-confirm">Add to Map</button>
       <button class="btn btn-secondary" id="add-rx-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ EDIT RECEIVER DIALOG ═══════════════════ -->
+<div class="modal-backdrop hidden" id="edit-rx-modal">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2 id="edit-rx-title">Edit Receiver</h2>
+      <button class="modal-close" id="edit-rx-modal-close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="param-group">
+        <label class="param-label">Name</label>
+        <input id="edit-rx-name" class="ctrl-input full-width text-left" type="text" autocomplete="off" />
+      </div>
+      <div class="param-group">
+        <label class="param-label">Height AGL</label>
+        <div class="param-row">
+          <input id="edit-rx-height" class="ctrl-input" type="number" step="0.5" min="0" max="500" />
+          <span class="param-unit">m</span>
+        </div>
+      </div>
+      <div class="param-group">
+        <label class="param-label">Antenna Gain</label>
+        <div class="param-row">
+          <input id="edit-rx-gain" class="ctrl-input" type="number" step="0.5" min="-3" max="15" />
+          <span class="param-unit">dBi</span>
+        </div>
+      </div>
+      <div class="param-group">
+        <label class="param-label">Tx Power</label>
+        <div class="param-row">
+          <input id="edit-rx-power" class="ctrl-input" type="number" step="1" min="-30" max="43" />
+          <span class="param-unit">dBm</span>
+        </div>
+      </div>
+      <div class="param-group">
+        <label class="param-label">Role</label>
+        <select id="edit-rx-role" class="ctrl-input full-width">
+          <option value="wide1">WIDE1 fill-in</option>
+          <option value="wide2">WIDE2 backbone</option>
+          <option value="igate">iGate</option>
+          <option value="meshtastic">Meshtastic Router</option>
+        </select>
+      </div>
+      <div class="param-group">
+        <label class="param-label">Enabled</label>
+        <div class="param-row">
+          <input id="edit-rx-enabled" type="checkbox" />
+          <span class="param-unit">include in analysis</span>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary"   id="edit-rx-save">Save</button>
+      <button class="btn btn-secondary" id="edit-rx-cancel">Cancel</button>
     </div>
   </div>
 </div>

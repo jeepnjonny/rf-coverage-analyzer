@@ -840,6 +840,11 @@ function _addRxMarker(rx, i) {
       const { lat: newLat, lng: newLon } = e.target.getLatLng();
       await updateReceiverPosition(i, newLat, newLon, e.target);
     })
+    .on('contextmenu', function (e) {
+      L.DomEvent.stopPropagation(e);
+      e.originalEvent.preventDefault();
+      _showRxContextMenu(e.originalEvent, i);
+    })
     .addTo(rxLayer);
 }
 
@@ -3141,6 +3146,117 @@ function _iaDrawTestCoverage(coveredIndices, trackPts) {
       .addTo(state.iaTestLayer);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Receiver right-click context menu + edit modal
+// ---------------------------------------------------------------------------
+
+let _editRxIdx = -1;
+
+function _showRxContextMenu(domEvent, rxIdx) {
+  _hideIaTestMenu();
+  const rx = state.receivers[rxIdx];
+  if (!rx) return;
+
+  const canFocus = !!(state.kmlFile && state.csvFile);
+
+  const div = document.createElement('div');
+  div.id        = 'ia-test-menu';
+  div.className = 'ia-test-popup';
+  div.style.left = domEvent.clientX + 'px';
+  div.style.top  = domEvent.clientY + 'px';
+  div.innerHTML =
+    `<div class="ia-test-coords">${rx.name || `RX${rxIdx + 1}`}</div>` +
+    `<button class="btn btn-primary" id="rx-ctx-edit">✏️ Edit parameters</button>` +
+    (canFocus
+      ? `<button class="btn btn-primary" id="rx-ctx-focus">📡 Focus analysis</button>`
+      : '') +
+    `<button class="btn" id="ia-test-cancel">Cancel</button>`;
+  document.body.appendChild(div);
+
+  div.querySelector('#rx-ctx-edit').addEventListener('click', () => {
+    _hideIaTestMenu();
+    _openRxEditModal(rxIdx);
+  });
+  if (canFocus) {
+    div.querySelector('#rx-ctx-focus').addEventListener('click', () => {
+      _hideIaTestMenu();
+      const sel = document.getElementById('single-rx-select');
+      if (sel) sel.value = rx.name;
+      startAnalysis('track');
+    });
+  }
+  div.querySelector('#ia-test-cancel').addEventListener('click', _hideIaTestMenu);
+  setTimeout(() => document.addEventListener('click', _hideIaTestMenu, { once: true }), 10);
+}
+
+function _openRxEditModal(rxIdx) {
+  const rx = state.receivers[rxIdx];
+  if (!rx) return;
+  _editRxIdx = rxIdx;
+
+  document.getElementById('edit-rx-title').textContent   = `Edit — ${rx.name || `RX${rxIdx + 1}`}`;
+  document.getElementById('edit-rx-name').value          = rx.name             || '';
+  document.getElementById('edit-rx-height').value        = rx.height_agl_m     ?? 2;
+  document.getElementById('edit-rx-gain').value          = rx.antenna_gain_dbi ?? 0;
+  document.getElementById('edit-rx-power').value         = rx.tx_power_dbm     ?? 28;
+  document.getElementById('edit-rx-role').value          = _rxRole(rx);
+  document.getElementById('edit-rx-enabled').checked     = _rxEnabled(rx);
+
+  document.getElementById('edit-rx-modal').classList.remove('hidden');
+}
+
+function _closeRxEditModal() {
+  document.getElementById('edit-rx-modal').classList.add('hidden');
+  _editRxIdx = -1;
+}
+
+document.getElementById('edit-rx-modal-close').addEventListener('click', _closeRxEditModal);
+document.getElementById('edit-rx-cancel').addEventListener('click', _closeRxEditModal);
+
+document.getElementById('edit-rx-save').addEventListener('click', async () => {
+  const rxIdx = _editRxIdx;
+  if (rxIdx < 0 || rxIdx >= state.receivers.length) return;
+
+  const rx = state.receivers[rxIdx];
+  rx.name             = document.getElementById('edit-rx-name').value.trim() || rx.name;
+  rx.height_agl_m     = document.getElementById('edit-rx-height').value;
+  rx.antenna_gain_dbi = document.getElementById('edit-rx-gain').value;
+  rx.tx_power_dbm     = document.getElementById('edit-rx-power').value;
+  rx.role             = document.getElementById('edit-rx-role').value;
+  rx.enabled          = document.getElementById('edit-rx-enabled').checked ? '1' : '0';
+
+  _closeRxEditModal();
+
+  // Rebuild only receiver markers (preserve analysis overlay)
+  rxLayer.clearLayers();
+  state.receivers.forEach((r, i) => _addRxMarker(r, i));
+  updateLegend();
+  updateSingleRxSelect();
+
+  if (!state.csvFile) { setStatus(`${rx.name} updated (no CSV file to save).`); return; }
+
+  showTransferSpinner(`Saving ${rx.name}…`);
+  try {
+    const res  = await fetch(`/api/csv/${encodeURIComponent(state.csvFile)}`, {
+      method:  'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ rows: state.receivers }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      fm.editorFile = state.csvFile;
+      fm.editorRows = state.receivers.map(r => ({ ...r }));
+      setStatus(`${rx.name} saved to ${state.csvFile}.`);
+    } else {
+      setStatus(`${rx.name} updated in memory — CSV save failed.`);
+    }
+  } catch (err) {
+    setStatus(`${rx.name} updated in memory — save error: ${err.message}`);
+  } finally {
+    hideTransferSpinner();
+  }
+});
 
 // Right-click context menu for manual placement testing
 function _hideIaTestMenu() {
