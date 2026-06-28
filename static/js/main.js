@@ -9,9 +9,9 @@
 // ---------------------------------------------------------------------------
 
 const RX_COLORS = [
-  '#e63946', '#2196f3', '#4caf50', '#ff9800',
-  '#9c27b0', '#00bcd4', '#ffeb3b', '#f06292',
-  '#8bc34a', '#ff5722',
+  '#009688', '#2196f3', '#4caf50', '#ff9800',
+  '#9c27b0', '#00bcd4', '#ffeb3b', '#5c6bc0',
+  '#8bc34a', '#26a69a',
 ];
 
 const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled','role'];
