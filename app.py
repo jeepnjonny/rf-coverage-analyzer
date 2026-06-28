@@ -3437,12 +3437,27 @@ def suggest_locations():
                 _los_args.append((ci2, c["lat"], c["lon"], antenna_height_m,
                                   [(track_pts[ti][0], track_pts[ti][1])
                                    for ti in range(start, end)]))
-            _los_chunk = max(1, len(_los_args) // (_POOL_WORKERS * 4))
-            _los_pool  = _get_analysis_pool()
-            _los_ok    = {res["ci"]
-                          for res in _los_pool.map(_los_check_task, _los_args,
-                                                    chunksize=_los_chunk)
-                          if res["ok"]}
+            _los_pool    = _get_analysis_pool()
+            _los_pending = {_los_pool.submit(_los_check_task, a) for a in _los_args}
+            _los_ok: set[int] = set()
+            _los_done = 0
+            _n_los    = len(_los_args)
+            while _los_pending:
+                _just_done, _los_pending = cf_wait(_los_pending, timeout=8)
+                if not _just_done:
+                    yield sse({"type": "status",
+                               "message": f"LOS pre-filter: {_los_done}/{_n_los}…"})
+                    continue
+                for _fut in _just_done:
+                    try:
+                        _r = _fut.result()
+                        if _r["ok"]:
+                            _los_ok.add(_r["ci"])
+                    except Exception as _exc:
+                        app.logger.warning("LOS check failed: %s", _exc)
+                    _los_done += 1
+                yield sse({"type": "status",
+                           "message": f"LOS pre-filter: {_los_done}/{_n_los}…"})
             _los_survivors = [c for ci2, c in enumerate(candidates) if ci2 in _los_ok]
             if _los_survivors:
                 candidates = _los_survivors
