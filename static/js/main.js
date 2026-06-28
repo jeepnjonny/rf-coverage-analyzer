@@ -1165,13 +1165,13 @@ function startAnalysis(mode, opts = {}) {
   setProgress('Starting…', 0);
   setStatus('');
 
-  const _focusedRx = document.getElementById('single-rx-select').value;
+  const _focusedRx = mode === 'track' && document.getElementById('single-rx-select').value;
   const params = {
     kml_file:        state.kmlFile,
     csv_file:        state.csvFile,
     // Send receivers directly so the server always uses the live UI state
     // (enabled flags, dragged positions) without requiring an explicit CSV save first.
-    // When a single site is focused, temporarily disable all others in this request only.
+    // Focus filter only applies to track coverage — links always run against all receivers.
     receivers:       _focusedRx
                        ? state.receivers.map(rx => rx.name === _focusedRx ? rx : { ...rx, enabled: '0' })
                        : state.receivers,
