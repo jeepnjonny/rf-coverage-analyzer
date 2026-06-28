@@ -2974,11 +2974,15 @@ def suggest_locations():
             tile_thread.join()
             yield sse({"type": "elev_progress", "current": _prog[1], "total": _prog[1]})
 
-            # Pre-score existing receivers so greedy set-cover only fills gaps
+            # Pre-score existing receivers so greedy set-cover only fills gaps.
+            # Parallelize across track points (same strategy as /api/analyze) rather
+            # than per-receiver futures — with only 2–10 receivers the old approach
+            # left most workers idle; 300 track-point tasks saturate all cores.
             pre_covered: set[int] = set()
             if existing_receivers:
                 yield sse({"type": "status",
                            "message": f"Scoring {len(existing_receivers)} existing receiver(s)…"})
+
                 def _rx_site_gain(r: dict) -> float:
                     # Use the CSV value; fall back to WIDE_APRS_RX_GAIN_DBI for
                     # WIDE1/WIDE2/iGate when the CSV entry was left at zero.
@@ -2986,35 +2990,25 @@ def suggest_locations():
                     if raw == 0.0 and str(r.get("role", "")).lower() in ("wide1", "wide2", "igate"):
                         return WIDE_APRS_RX_GAIN_DBI
                     return raw
-                pre_args = [
-                    (i, float(r["latitude"]), float(r["longitude"]),
-                     float(r.get("height_agl_m") or 2),
-                     track_pts, freq_mhz, tx_power_dbm,
-                     tx_gain_dbi + _rx_site_gain(r),   # tracker TX gain + site RX gain
+
+                _eff_existing = [
+                    {**r, "antenna_gain_dbi": _rx_site_gain(r)}
+                    for r in existing_receivers
+                ]
+                _pre_chk = max(1, len(track_pts) // (_POOL_WORKERS * 4))
+                pre_point_args = [
+                    (idx, plat, plon, _eff_existing,
+                     freq_mhz, tx_power_dbm, tx_gain_dbi,
                      sensitivity_dbm, veg_type, fade_margin_db,
-                     None,                             # no backbone check for existing receivers
-                     max_practical_range_m)
-                    for i, r in enumerate(existing_receivers)
+                     False, frozenset())   # chain_mode off — raw coverage only
+                    for idx, (plat, plon) in enumerate(track_pts)
                 ]
                 pool = _get_analysis_pool()
-                pre_pending = {pool.submit(score_candidate, a) for a in pre_args}
-                n_pre = len(existing_receivers)
-                pre_done_count = 0
-                while pre_pending:
-                    just_done, pre_pending = cf_wait(pre_pending, timeout=8)
-                    if not just_done:
-                        yield sse({"type": "status",
-                                   "message": f"Scoring existing receivers… {pre_done_count}/{n_pre}"})
-                        continue
-                    for fut in just_done:
-                        try:
-                            res = fut.result()
-                            pre_covered |= set(res["covered_set"])
-                        except Exception as exc:
-                            app.logger.warning("pre-score failed: %s", exc)
-                        pre_done_count += 1
-                    yield sse({"type": "status",
-                               "message": f"Scoring existing receivers… {pre_done_count}/{n_pre}"})
+                pre_covered = {
+                    pt["idx"]
+                    for pt in pool.map(_point_task, pre_point_args, chunksize=_pre_chk)
+                    if pt["coverage"]
+                }
                 yield sse({
                     "type":            "existing_coverage",
                     "coverage_pct":    round(len(pre_covered) / total_pts * 100, 1),
