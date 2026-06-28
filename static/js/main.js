@@ -1061,7 +1061,6 @@ function updateLegend() {
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#4caf50"></div><span>Strong link (&gt;15 dB margin)</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ffeb3b"></div><span>Good link (5–15 dB)</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ff9800"></div><span>Marginal link (0–5 dB)</span></div>');
-    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#505060"></div><span>Terrain blocked</span></div>');
   }
   el.innerHTML = lines.join('');
 }
@@ -3420,19 +3419,13 @@ async function _iaLinkCovMap(latlng) {
 
 function _renderLinkCovBatch(cells, threshold, canvasR) {
   for (const c of cells) {
-    let fill;
-    if (c.viable) {
-      const margin = c.rssi - threshold;
-      fill = margin > 15 ? '#4caf50'   // strong link — green
-           : margin >  5 ? '#ffeb3b'   // good link — yellow
-                         : '#ff9800';  // marginal — orange
-    } else if (c.hard_fail) {
-      fill = '#505060';                // terrain/veg blocked — dark grey
-    } else {
-      continue;                        // range-limited only — omit (not informative for placement)
-    }
+    if (!c.viable) continue;
+    const margin = c.rssi - threshold;
+    const fill = margin > 15 ? '#4caf50'   // strong link — green
+               : margin >  5 ? '#ffeb3b'   // good link — yellow
+                             : '#ff9800';  // marginal — orange
     L.circleMarker([c.lat, c.lon], {
-      radius: 4, color: 'none',
+      radius: 4, weight: 0,
       fillColor: fill, fillOpacity: 0.70,
       renderer: canvasR,
     }).addTo(state.linkCovLayer);
