@@ -8,11 +8,13 @@
 // Constants
 // ---------------------------------------------------------------------------
 
-const RX_COLORS = [
-  '#009688', '#2196f3', '#4caf50', '#ff9800',
-  '#9c27b0', '#00bcd4', '#ffeb3b', '#5c6bc0',
-  '#8bc34a', '#26a69a',
-];
+// Generate a receiver color by index, spread evenly across H=45°–315°
+// (avoiding the red zone H=315°..45°) scaled to the current receiver count.
+function rxColor(idx) {
+  const total = Math.max(state.receivers?.length ?? 1, 1);
+  const h = 45 + (idx % total) * (270 / total);
+  return `hsl(${h.toFixed(1)},75%,50%)`;
+}
 
 const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled','role'];
 
@@ -202,7 +204,7 @@ function onCursorMove(lat, lon) {
     if (nr.coverage) {
       const name  = state.receivers[nr.best_rx_idx]?.name || `RX${nr.best_rx_idx + 1}`;
       sigEl.textContent = `${nr.best_rssi} dBm (${name})`;
-      sigEl.style.color = RX_COLORS[nr.best_rx_idx % RX_COLORS.length];
+      sigEl.style.color = rxColor(nr.best_rx_idx);
     } else {
       sigEl.textContent = nr.hard_fail ? 'No signal · blocked' : 'No signal · faded';
       sigEl.style.color = nr.hard_fail ? 'var(--danger)' : 'var(--text-dim)';
@@ -254,7 +256,7 @@ function _updateSignalPanel(nr) {
     const rxIdx = rr.rx_idx ?? -1;
     const rx    = rxIdx >= 0 ? state.receivers[rxIdx] : null;
     const name  = rx?.name || (rxIdx >= 0 ? `RX${rxIdx + 1}` : 'RX?');
-    const color = rxIdx >= 0 ? RX_COLORS[rxIdx % RX_COLORS.length] : '#888';
+    const color = rxIdx >= 0 ? rxColor(rxIdx) : '#888';
 
     const sensitivity = parseFloat(document.getElementById('rx-sens').value) || -135;
     const fadeMargin  = parseFloat(document.getElementById('fade-margin').value) || 0;
@@ -818,7 +820,7 @@ function _rxTooltip(rx, i) {
 function _addRxMarker(rx, i) {
   const lat       = parseFloat(rx.latitude);
   const lon       = parseFloat(rx.longitude);
-  const color     = RX_COLORS[i % RX_COLORS.length];
+  const color     = rxColor(i);
   const disabled  = !_rxEnabled(rx);
   const role      = _rxRole(rx);
   const roleClass = role === 'wide2'       ? ' rx-wide2'
@@ -1291,8 +1293,8 @@ function handleSSE(evt, ctx) {
         state.pathResults.push(pt);
 
         // covered → receiver colour  |  blocked (terrain/veg) → deep orange  |  faded → dark grey
-        const color  = pt.coverage   ? RX_COLORS[pt.best_rx_idx % RX_COLORS.length]
-                     : pt.hard_fail  ? '#ff5722'   // terrain/veg blocked — deep orange (distinct from all receiver reds)
+        const color  = pt.coverage   ? rxColor(pt.best_rx_idx)
+                     : pt.hard_fail  ? '#ff5722'   // terrain/veg blocked — deep orange
                      :                 '#505060';   // below threshold / faded — dark blue-grey
         const latlng = [pt.lat, pt.lon];
 
@@ -1332,7 +1334,7 @@ function handleSSE(evt, ctx) {
       const r2 = _rxRole(rx2);
       const isBackbone = (r1 === 'wide1' && (r2 === 'wide2' || r2 === 'igate'))
                       || (r2 === 'wide1' && (r1 === 'wide2' || r1 === 'igate'));
-      const color  = isBackbone ? '#ffb300' : RX_COLORS[evt.rx1_idx % RX_COLORS.length];
+      const color  = isBackbone ? '#ffb300' : rxColor(evt.rx1_idx);
       const weight = isBackbone ? 3.5 : 2.5;
       const opts   = { color, weight, opacity: isBackbone ? 0.95 : 0.75,
                        rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx };
@@ -1469,7 +1471,7 @@ function _drawPathResults(results) {
   };
 
   for (const pt of sorted) {
-    const color  = pt.coverage   ? RX_COLORS[pt.best_rx_idx % RX_COLORS.length]
+    const color  = pt.coverage   ? rxColor(pt.best_rx_idx)
                  : pt.hard_fail  ? '#ff5722'
                  :                 '#505060';
     const latlng = [pt.lat, pt.lon];
@@ -1494,7 +1496,7 @@ function _drawInterRxResults(results, receivers) {
     const rx2 = receivers[evt.rx2_idx];
     if (!rx1 || !rx2) continue;
     if (!_rxEnabled(rx1) || !_rxEnabled(rx2)) continue;
-    const color = RX_COLORS[evt.rx1_idx % RX_COLORS.length];
+    const color = rxColor(evt.rx1_idx);
     const pl = L.polyline(
       [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
        [parseFloat(rx2.latitude), parseFloat(rx2.longitude)]],
@@ -1675,7 +1677,7 @@ function renderResults(stats, totalPct, doSwitchTab = true) {
   tfoot.innerHTML = '';
 
   stats.forEach((s, i) => {
-    const color = RX_COLORS[(s.color_idx ?? i) % RX_COLORS.length];
+    const color = rxColor(s.color_idx ?? i);
     const tr    = document.createElement('tr');
     tr.innerHTML = `
       <td><span class="rx-swatch" style="background:${color}"></span>${s.name}</td>
@@ -1742,8 +1744,8 @@ async function showTerrainProfile(rx1, rx2, rx1Idx = 0, rx2Idx = 1) {
     if (data.error) throw new Error(data.error);
 
     // Attach display metadata consumed by drawProfile
-    data._rx1Color = RX_COLORS[rx1Idx % RX_COLORS.length];
-    data._rx2Color = RX_COLORS[rx2Idx % RX_COLORS.length];
+    data._rx1Color = rxColor(rx1Idx);
+    data._rx2Color = rxColor(rx2Idx);
     data._rx1Name  = rx1.name || `RX${rx1Idx + 1}`;
     data._rx2Name  = rx2.name || `RX${rx2Idx + 1}`;
     const txPow  = parseFloat(rx1.tx_power_dbm)     || 22;
@@ -1828,7 +1830,7 @@ async function showPathPointProfile(pt, forceRxIdx = null) {
 
     const fsplVal = fspl_db(state.lastFreqMhz, data.dist_m);
     data._rx1Color    = '#aaaaaa';
-    data._rx2Color    = RX_COLORS[rxIdx % RX_COLORS.length];
+    data._rx2Color    = rxColor(rxIdx);
     data._rx1Name     = 'Tracker';
     data._rx2Name     = rx.name || `RX${rxIdx + 1}`;
     data._txPow       = txPow;
@@ -1867,7 +1869,7 @@ function _renderProfileSidebar(pt, activeRxIdx) {
     const idx   = rr.rx_idx ?? -1;
     const rx    = idx >= 0 ? state.receivers[idx] : null;
     const name  = rx?.name || (idx >= 0 ? `RX${idx + 1}` : 'RX?');
-    const color = idx >= 0 ? RX_COLORS[idx % RX_COLORS.length] : '#888';
+    const color = idx >= 0 ? rxColor(idx) : '#888';
     const sensitivity = parseFloat(document.getElementById('rx-sens').value) || -135;
     const fadeMargin  = parseFloat(document.getElementById('fade-margin').value) || 0;
     const covered     = !rr.hard_fail && rr.rssi >= sensitivity + fadeMargin;
