@@ -1290,9 +1290,9 @@ function handleSSE(evt, ctx) {
         // Store for cursor hover RSSI
         state.pathResults.push(pt);
 
-        // covered → receiver colour  |  blocked (terrain/veg) → red  |  faded (below threshold) → grey
+        // covered → receiver colour  |  blocked (terrain/veg) → deep orange  |  faded → dark grey
         const color  = pt.coverage   ? RX_COLORS[pt.best_rx_idx % RX_COLORS.length]
-                     : pt.hard_fail  ? '#c0392b'   // hard blocked — bright red
+                     : pt.hard_fail  ? '#ff5722'   // terrain/veg blocked — deep orange (distinct from all receiver reds)
                      :                 '#505060';   // below threshold / faded — dark blue-grey
         const latlng = [pt.lat, pt.lon];
 
@@ -1470,7 +1470,7 @@ function _drawPathResults(results) {
 
   for (const pt of sorted) {
     const color  = pt.coverage   ? RX_COLORS[pt.best_rx_idx % RX_COLORS.length]
-                 : pt.hard_fail  ? '#c0392b'
+                 : pt.hard_fail  ? '#ff5722'
                  :                 '#505060';
     const latlng = [pt.lat, pt.lon];
     if (color !== segColor) {
