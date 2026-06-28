@@ -1863,6 +1863,41 @@ def _link_task(args: tuple) -> dict:
     }
 
 
+def _grid_link_task(args: tuple) -> dict:
+    """Compute RF link viability from a fixed test point to one grid cell. Designed to run in a process pool."""
+    (gi,
+     test_lat, test_lon, test_elev_m,
+     grid_lat, grid_lon, grid_agl_m,
+     freq_mhz, tx_power_dbm, tx_gain_dbi,
+     sensitivity_dbm, veg_type, fade_margin_db) = args
+
+    grid_elev_m = _get_elev(_rc(grid_lat), _rc(grid_lon)) + grid_agl_m
+    profile, dist_m = _terrain_profile_cached(
+        _rc(test_lat), _rc(test_lon),
+        _rc(grid_lat), _rc(grid_lon),
+    )
+    if dist_m < 50:
+        return {"gi": gi, "lat": grid_lat, "lon": grid_lon,
+                "viable": False, "hard_fail": False, "rssi": None}
+
+    diff_db = deygout_loss_db(profile, test_elev_m, grid_elev_m, dist_m, freq_mhz)
+    veg_db  = vegetation_loss_db(profile, test_elev_m, grid_elev_m, dist_m, freq_mhz, veg_type)
+    path_db = fspl_db(freq_mhz, dist_m)
+    rssi    = tx_power_dbm + tx_gain_dbi - path_db - diff_db - veg_db
+
+    hard_fail = diff_db >= HARD_FAIL_DB or veg_db >= HARD_FAIL_DB
+    viable    = (not hard_fail) and rssi >= (sensitivity_dbm + fade_margin_db)
+
+    return {
+        "gi":        gi,
+        "lat":       grid_lat,
+        "lon":       grid_lon,
+        "viable":    viable,
+        "hard_fail": hard_fail,
+        "rssi":      round(rssi, 1),
+    }
+
+
 def _point_task(args: tuple) -> dict:
     """Compute RF coverage for one path point against all receivers. Designed to run in a thread pool."""
     (idx, plat, plon, receivers,
@@ -3964,6 +3999,131 @@ def test_location():
         "track_pts":       [[round(p[0], 5), round(p[1], 5)] for p in track_pts],
         "longest_gap_km":  round(longest_gap_m / 1000, 1),
     })
+
+
+# ---------------------------------------------------------------------------
+# Link coverage map — radio horizon from a single test point
+# ---------------------------------------------------------------------------
+
+def _make_circle_grid(
+    center_lat: float, center_lon: float,
+    radius_m: float, spacing_m: float,
+) -> list[tuple[float, float]]:
+    """Return lat/lon points on a uniform rectangular grid inside a circle."""
+    lat_step = spacing_m / 111_320.0
+    lon_step = spacing_m / (111_320.0 * math.cos(math.radians(center_lat)))
+    n = int(radius_m / spacing_m) + 1
+    pts: list[tuple[float, float]] = []
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            lat = center_lat + i * lat_step
+            lon = center_lon + j * lon_step
+            d   = haversine(center_lat, center_lon, lat, lon)
+            if 50.0 <= d <= radius_m:
+                pts.append((_rc(lat), _rc(lon)))
+    return pts
+
+
+@app.route("/api/link-coverage", methods=["POST"])
+def link_coverage():
+    data             = request.get_json(force=True)
+    lat              = float(data["lat"])
+    lon              = float(data["lon"])
+    height_agl_m     = float(data.get("height_agl_m",      4))
+    grid_agl_m       = float(data.get("grid_agl_m",        4))
+    radius_m         = float(data.get("radius_m",      10_000))
+    freq_mhz         = float(data.get("freq_mhz",        915))
+    tx_power_dbm     = float(data.get("tx_power_dbm",     22))
+    tx_gain_dbi      = float(data.get("tx_gain_dbi",       0))
+    sensitivity_dbm  = float(data.get("sensitivity_dbm", -135))
+    veg_type         = data.get("veg_type",              "none")
+    fade_margin_db   = float(data.get("fade_margin_db",    0))
+
+    # Auto-size spacing to keep grid ≈ 3 000–5 000 cells
+    if "spacing_m" in data:
+        spacing_m = float(data["spacing_m"])
+    elif radius_m <= 6_000:
+        spacing_m = 150.0
+    elif radius_m <= 12_000:
+        spacing_m = 250.0
+    else:
+        spacing_m = 500.0
+
+    def generate():
+        try:
+            yield sse({"type": "status", "message": "Generating grid…"})
+            grid_pts = _make_circle_grid(lat, lon, radius_m, spacing_m)
+            total    = len(grid_pts)
+            test_elev_m = _get_elev(_rc(lat), _rc(lon)) + height_agl_m
+
+            yield sse({"type": "status", "message": f"Analyzing {total} grid cells…"})
+
+            pool      = _get_analysis_pool()
+            args_list = [
+                (gi,
+                 lat, lon, test_elev_m,
+                 glat, glon, grid_agl_m,
+                 freq_mhz, tx_power_dbm, tx_gain_dbi,
+                 sensitivity_dbm, veg_type, fade_margin_db)
+                for gi, (glat, glon) in enumerate(grid_pts)
+            ]
+
+            _fmap    = {}
+            for _a in args_list:
+                try:
+                    _fmap[pool.submit(_grid_link_task, _a)] = _a[0]
+                except Exception as _se:
+                    app.logger.warning("grid_link submit failed: %s", _se)
+            _pending = set(_fmap)
+            batch: list  = []
+            done_n       = 0
+            viable_ct    = 0
+            FLUSH        = 200
+
+            while _pending:
+                _done, _pending = cf_wait(_pending, timeout=8)
+                if not _done:
+                    yield sse({"type": "status",
+                               "message": f"Analyzing grid… {done_n}/{total}"})
+                    continue
+                for _f in _done:
+                    try:
+                        cell = _f.result()
+                        batch.append(cell)
+                        if cell.get("viable"):
+                            viable_ct += 1
+                    except Exception as _fe:
+                        app.logger.warning("grid_link_task failed: %s", _fe)
+                    done_n += 1
+                    if len(batch) >= FLUSH:
+                        yield sse({"type": "link_grid_batch", "cells": batch,
+                                   "done": done_n, "total": total})
+                        batch = []
+
+            if batch:
+                yield sse({"type": "link_grid_batch", "cells": batch,
+                           "done": done_n, "total": total})
+
+            yield sse({"type": "complete",
+                       "total": total, "viable": viable_ct,
+                       "radius_m": radius_m})
+
+        except GeneratorExit:
+            pass
+        except BaseException as exc:
+            import traceback
+            app.logger.exception("link-coverage SSE crashed: %r", exc)
+            try:
+                yield sse({"type": "error",
+                           "message": f"{exc!r}\n{traceback.format_exc()}"})
+            except Exception:
+                pass
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 # ---------------------------------------------------------------------------

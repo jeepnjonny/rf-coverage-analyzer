@@ -988,8 +988,10 @@ function updateLegend() {
   const hasIaHotZones    = state.iaHotZoneLayer    && state.iaHotZoneLayer.getLayers().length > 0;
   const hasIaTrackPrev   = state.iaTrackPreviewLayer && state.iaTrackPreviewLayer.getLayers().length > 0;
   const hasIaHeat        = !!state.iaHeatLayer;
+  const hasLinkCov       = state.linkCovLayer && state.linkCovLayer.getLayers().length > 0;
   if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack && !hasIaCandidates
-      && !hasIaRoads && !hasIaExclusions && !hasIaHotZones && !hasIaTrackPrev && !hasIaHeat) {
+      && !hasIaRoads && !hasIaExclusions && !hasIaHotZones && !hasIaTrackPrev
+      && !hasIaHeat && !hasLinkCov) {
     el.style.display = 'none'; return;
   }
   el.style.display = '';
@@ -1052,6 +1054,14 @@ function updateLegend() {
   if (hasIaHeat) {
     lines.push('<div class="legend-sep"></div>');
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:linear-gradient(90deg,#2196f3,#ff9800,#f44336)"></div><span>RF score heat map (top 20%)</span></div>');
+  }
+  if (hasLinkCov) {
+    if (lines.length) lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-title">Link Coverage Map</div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#4caf50"></div><span>Strong link (&gt;15 dB margin)</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ffeb3b"></div><span>Good link (5–15 dB)</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ff9800"></div><span>Marginal link (0–5 dB)</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#505060"></div><span>Terrain blocked</span></div>');
   }
   el.innerHTML = lines.join('');
 }
@@ -2496,6 +2506,11 @@ state.iaExclusionsLayer   = L.layerGroup().addTo(map);  // water/building exclus
 state.iaHotZoneLayer      = L.layerGroup().addTo(map);  // coarse-scoring hot zone circles
 state.iaRefineLayer       = L.layerGroup().addTo(map);  // 150 m refinement radius rings
 state.iaHeatLayer         = null;                       // L.heatLayer — top-20% RF score overlay
+// Link coverage map (radio horizon from a single point)
+state.linkCovLayer     = L.layerGroup().addTo(map);
+state.linkCovMarker    = null;
+state.linkCovRunning   = false;
+state.linkCovAbortCtrl = null;
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -3171,6 +3186,14 @@ function _showRxContextMenu(domEvent, rxIdx) {
     (canFocus
       ? `<button class="btn btn-primary" id="rx-ctx-focus">📡 Focus analysis</button>`
       : '') +
+    `<div style="display:flex;align-items:center;gap:6px;margin:4px 0">` +
+    `<label style="font-size:11px;color:#a0a8c0;white-space:nowrap">Link radius:</label>` +
+    `<select id="linkcov-radius" class="ctrl-input" style="flex:1">` +
+    `<option value="5">5 km</option>` +
+    `<option value="10" selected>10 km</option>` +
+    `<option value="20">20 km</option>` +
+    `</select></div>` +
+    `<button class="btn btn-primary" id="rx-ctx-linkcov">🔗 Link coverage map</button>` +
     `<button class="btn" id="ia-test-cancel">Cancel</button>`;
   document.body.appendChild(div);
 
@@ -3186,6 +3209,10 @@ function _showRxContextMenu(domEvent, rxIdx) {
       startAnalysis('track');
     });
   }
+  div.querySelector('#rx-ctx-linkcov').addEventListener('click', () => {
+    _hideIaTestMenu();
+    _iaLinkCovMap({ lat: parseFloat(rx.latitude), lng: parseFloat(rx.longitude) });
+  });
   div.querySelector('#ia-test-cancel').addEventListener('click', _hideIaTestMenu);
   setTimeout(() => document.addEventListener('click', _hideIaTestMenu, { once: true }), 10);
 }
@@ -3265,7 +3292,6 @@ function _hideIaTestMenu() {
 }
 
 map.on('contextmenu', (e) => {
-  if (!state.kmlFile) return;
   e.originalEvent.preventDefault();
   _hideIaTestMenu();
   if (_altPinMarker) { map.removeLayer(_altPinMarker); _altPinMarker = null; }
@@ -3277,19 +3303,176 @@ map.on('contextmenu', (e) => {
   div.style.top  = e.originalEvent.clientY + 'px';
   div.innerHTML  =
     `<div class="ia-test-coords">${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}</div>` +
-    `<button class="btn btn-primary" id="ia-test-go">📡 Test site here</button>` +
+    (state.kmlFile
+      ? `<button class="btn btn-primary" id="ia-test-go">📡 Test site coverage</button>`
+      : '') +
+    `<div style="display:flex;align-items:center;gap:6px;margin:4px 0">` +
+    `<label style="font-size:11px;color:#a0a8c0;white-space:nowrap">Link radius:</label>` +
+    `<select id="linkcov-radius" class="ctrl-input" style="flex:1">` +
+    `<option value="5">5 km</option>` +
+    `<option value="10" selected>10 km</option>` +
+    `<option value="20">20 km</option>` +
+    `</select></div>` +
+    `<button class="btn btn-primary" id="ia-linkcov-go">🔗 Link coverage map</button>` +
     `<button class="btn" id="ia-test-cancel">Cancel</button>`;
   document.body.appendChild(div);
 
-  div.querySelector('#ia-test-go').addEventListener('click', () => {
+  if (state.kmlFile) {
+    div.querySelector('#ia-test-go').addEventListener('click', () => {
+      _hideIaTestMenu();
+      _iaTestLocation(e.latlng);
+    });
+  }
+  div.querySelector('#ia-linkcov-go').addEventListener('click', () => {
     _hideIaTestMenu();
-    _iaTestLocation(e.latlng);
+    _iaLinkCovMap(e.latlng);
   });
   div.querySelector('#ia-test-cancel').addEventListener('click', _hideIaTestMenu);
 
   // Dismiss on next map click or outside click
   setTimeout(() => document.addEventListener('click', _hideIaTestMenu, { once: true }), 10);
 });
+
+// ---------------------------------------------------------------------------
+// Link coverage map — radio horizon from a single test point
+// ---------------------------------------------------------------------------
+
+function _linkCovRadius() {
+  return parseFloat(document.getElementById('linkcov-radius')?.value || '10');
+}
+
+async function _iaLinkCovMap(latlng) {
+  if (state.linkCovRunning) state.linkCovAbortCtrl?.abort();
+  state.linkCovLayer.clearLayers();
+  if (state.linkCovMarker) { map.removeLayer(state.linkCovMarker); state.linkCovMarker = null; }
+
+  state.linkCovMarker = L.marker([latlng.lat, latlng.lng], {
+    icon: L.divIcon({
+      className: '',
+      html: '<div class="ia-test-marker">⏳</div>',
+      iconSize: [28, 28], iconAnchor: [14, 14],
+    }),
+  }).addTo(map);
+
+  const radiusKm = _linkCovRadius();
+  const threshold = (parseFloat(document.getElementById('sensitivity')?.value) || -135)
+                  + (parseFloat(document.getElementById('fade-margin')?.value) || 0);
+  const params = {
+    lat:             latlng.lat,
+    lon:             latlng.lng,
+    height_agl_m:    parseFloat(document.getElementById('ia-ant-height')?.value) || 4,
+    grid_agl_m:      parseFloat(document.getElementById('ia-ant-height')?.value) || 4,
+    radius_m:        radiusKm * 1000,
+    freq_mhz:        parseFloat(document.getElementById('freq')?.value)          || 433,
+    tx_power_dbm:    parseFloat(document.getElementById('tx-power')?.value)      || 22,
+    tx_gain_dbi:     parseFloat(document.getElementById('tx-gain')?.value)       || 0,
+    sensitivity_dbm: parseFloat(document.getElementById('sensitivity')?.value)   || -135,
+    veg_type:        document.getElementById('veg-type')?.value                  || 'none',
+    fade_margin_db:  parseFloat(document.getElementById('fade-margin')?.value)   || 0,
+  };
+
+  state.linkCovRunning   = true;
+  state.linkCovAbortCtrl = new AbortController();
+  setStatus('Link coverage: connecting…');
+
+  const canvasR = L.canvas({ padding: 0.5 });
+
+  try {
+    const res = await fetch('/api/link-coverage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(params),
+      signal:  state.linkCovAbortCtrl.signal,
+    });
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'status') {
+            setStatus(evt.message);
+          } else if (evt.type === 'link_grid_batch') {
+            _renderLinkCovBatch(evt.cells, threshold, canvasR);
+            setStatus(`Link coverage… ${evt.done}/${evt.total} cells`);
+          } else if (evt.type === 'complete') {
+            _onLinkCovComplete(latlng, evt, params);
+          } else if (evt.type === 'error') {
+            setStatus(`Link coverage error: ${evt.message}`);
+          }
+        } catch { /* ignore parse errors */ }
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') setStatus(`Link coverage failed: ${err.message}`);
+  } finally {
+    state.linkCovRunning = false;
+    updateLegend();
+  }
+}
+
+function _renderLinkCovBatch(cells, threshold, canvasR) {
+  for (const c of cells) {
+    let fill;
+    if (c.viable) {
+      const margin = c.rssi - threshold;
+      fill = margin > 15 ? '#4caf50'   // strong link — green
+           : margin >  5 ? '#ffeb3b'   // good link — yellow
+                         : '#ff9800';  // marginal — orange
+    } else if (c.hard_fail) {
+      fill = '#505060';                // terrain/veg blocked — dark grey
+    } else {
+      continue;                        // range-limited only — omit (not informative for placement)
+    }
+    L.circleMarker([c.lat, c.lon], {
+      radius: 4, color: 'none',
+      fillColor: fill, fillOpacity: 0.70,
+      renderer: canvasR,
+    }).addTo(state.linkCovLayer);
+  }
+}
+
+function _onLinkCovComplete(latlng, evt, params) {
+  if (state.linkCovMarker) { map.removeLayer(state.linkCovMarker); state.linkCovMarker = null; }
+  const pct      = evt.total > 0 ? ((evt.viable / evt.total) * 100).toFixed(1) : '0';
+  const radiusKm = (params.radius_m / 1000).toFixed(0);
+  state.linkCovMarker = L.marker([latlng.lat, latlng.lng], {
+    icon: L.divIcon({
+      className: '',
+      html: '<div class="ia-test-marker">🔗</div>',
+      iconSize: [28, 28], iconAnchor: [14, 14],
+    }),
+  }).addTo(map);
+  L.popup({ maxWidth: 240 })
+    .setLatLng([latlng.lat, latlng.lng])
+    .setContent(
+      `<b>Link Coverage Map</b><br>` +
+      `Viable area: <b>${pct}%</b> of ${radiusKm} km radius<br>` +
+      `<span style="font-size:11px;color:#888">${evt.viable} of ${evt.total} grid cells linkable</span><br>` +
+      `<div style="margin-top:6px">` +
+      `<button onclick="window._clearLinkCov()" ` +
+      `style="width:100%;padding:3px 0;background:#2a2e45;color:#dde1f0;` +
+      `border:1px solid #2e3350;border-radius:4px;cursor:pointer">Clear</button>` +
+      `</div>`,
+    )
+    .openOn(map);
+  setStatus(`Link coverage: ${pct}% viable within ${radiusKm} km.`);
+  updateLegend();
+}
+
+window._clearLinkCov = function () {
+  map.closePopup();
+  state.linkCovLayer.clearLayers();
+  if (state.linkCovMarker) { map.removeLayer(state.linkCovMarker); state.linkCovMarker = null; }
+  updateLegend();
+};
 
 async function _iaTestLocation(latlng) {
   // Remove previous test
