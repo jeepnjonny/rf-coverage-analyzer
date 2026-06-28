@@ -1648,9 +1648,10 @@ def list_analyses():
                 # Fast path: tiny sidecar with pre-extracted listing fields
                 items.append(json.loads(meta_path.read_text(encoding="utf-8")))
             else:
-                # Fallback for analyses saved before sidecar support
+                # Fallback for analyses saved before sidecar support.
+                # Generate the sidecar now so future listings use the fast path.
                 data = json.loads(f.read_text(encoding="utf-8"))
-                items.append({
+                meta = {
                     "id":                 data.get("id"),
                     "name":               data.get("name", "Unnamed"),
                     "saved_at":           data.get("saved_at"),
@@ -1658,7 +1659,12 @@ def list_analyses():
                     "csv_file":           data.get("csv_file"),
                     "total_coverage_pct": data.get("total_coverage_pct"),
                     "mode":               data.get("params", {}).get("mode"),
-                })
+                }
+                try:
+                    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+                except Exception as _we:
+                    app.logger.debug("Could not write sidecar for %s: %s", f.name, _we)
+                items.append(meta)
         except Exception as exc:
             app.logger.warning("Skipping corrupt analysis file %s: %s", f.name, exc)
     return jsonify(items)
