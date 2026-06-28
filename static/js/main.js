@@ -2745,7 +2745,9 @@ function _handleIaSSE(evt) {
       } else {
         pct = 27 + frac * 23;   // 'score' phase
       }
-      progressEl.textContent = evt.message || `Coarse scoring: ${evt.current}/${evt.total}`;
+      const msg = evt.message || `Coarse scoring: ${evt.current}/${evt.total}`;
+      statusEl.textContent   = msg;
+      progressEl.textContent = msg;
       barEl.style.width = `${pct}%`;
       break;
     }

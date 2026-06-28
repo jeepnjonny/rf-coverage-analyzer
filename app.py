@@ -3370,8 +3370,9 @@ def suggest_locations():
 
                     _phase_candidates[0] = coarse_survivors
 
-                except Exception as exc:
-                    _phase_state["error"] = str(exc)
+                except BaseException as exc:
+                    _phase_state["error"] = repr(exc)
+                    app.logger.exception("_run_phases_012 crashed: %r", exc)
                 finally:
                     _phase_state["done"] = True
 
@@ -3400,6 +3401,12 @@ def suggest_locations():
                 "total":   max(1, _phase_state["total"]),
                 "message": _phase_state["message"],
             })
+
+            # Diagnostic breadcrumb — this status event lets the user (and logs)
+            # distinguish a crash during the coarse filter from one after it.
+            _pre_los_count = len(_phase_candidates[0]) if _phase_candidates[0] is not None else len(candidates)
+            yield sse({"type": "status",
+                       "message": f"Coarse filter done — {_pre_los_count} candidates, running LOS pre-filter…"})
 
             # Emit hot zone circles for map visualization
             _hz = _phase_state.get("hot_zones") or []
@@ -3731,9 +3738,13 @@ def suggest_locations():
 
         except GeneratorExit:
             pass
-        except Exception as exc:
+        except BaseException as exc:
             import traceback
-            yield sse({"type": "error", "message": f"{exc}\n{traceback.format_exc()}"})
+            app.logger.exception("Advisor SSE generator crashed: %r", exc)
+            try:
+                yield sse({"type": "error", "message": f"{exc!r}\n{traceback.format_exc()}"})
+            except Exception:
+                pass
 
     return Response(
         stream_with_context(generate()),
