@@ -2995,7 +2995,6 @@ def suggest_locations():
                     {**r, "antenna_gain_dbi": _rx_site_gain(r)}
                     for r in existing_receivers
                 ]
-                _pre_chk = max(1, len(track_pts) // (_POOL_WORKERS * 4))
                 pre_point_args = [
                     (idx, plat, plon, _eff_existing,
                      freq_mhz, tx_power_dbm, tx_gain_dbi,
@@ -3004,11 +3003,28 @@ def suggest_locations():
                     for idx, (plat, plon) in enumerate(track_pts)
                 ]
                 pool = _get_analysis_pool()
-                pre_covered = {
-                    pt["idx"]
-                    for pt in pool.map(_point_task, pre_point_args, chunksize=_pre_chk)
-                    if pt["coverage"]
-                }
+                # Use submit+cf_wait (not pool.map) so the generator keeps yielding
+                # SSE heartbeats — pool.map blocks the generator entirely and the
+                # browser SSE connection times out on longer tracks.
+                pre_pending = {pool.submit(_point_task, a) for a in pre_point_args}
+                n_pre_pts = len(pre_point_args)
+                pre_done_count = 0
+                while pre_pending:
+                    just_done, pre_pending = cf_wait(pre_pending, timeout=8)
+                    if not just_done:
+                        yield sse({"type": "status",
+                                   "message": f"Scoring existing receivers… {pre_done_count}/{n_pre_pts} pts"})
+                        continue
+                    for fut in just_done:
+                        try:
+                            pt = fut.result()
+                            if pt["coverage"]:
+                                pre_covered.add(pt["idx"])
+                        except Exception as exc:
+                            app.logger.warning("pre-score point failed: %s", exc)
+                        pre_done_count += 1
+                    yield sse({"type": "status",
+                               "message": f"Scoring existing receivers… {pre_done_count}/{n_pre_pts} pts"})
                 yield sse({
                     "type":            "existing_coverage",
                     "coverage_pct":    round(len(pre_covered) / total_pts * 100, 1),
