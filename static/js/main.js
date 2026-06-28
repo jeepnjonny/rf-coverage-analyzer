@@ -3498,50 +3498,59 @@ async function _iaTestLocation(latlng) {
   };
 
   try {
-    const res  = await fetch('/api/test-location', {
+    const res     = await fetch('/api/test-location', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     });
-    const data = await res.json();
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
 
-    map.removeLayer(state.iaTestMarker);
-
-    if (data.error) {
-      setStatus(`Test error: ${data.error}`);
-      state.iaTestMarker = null;
-      return;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'status') {
+            setStatus(evt.message);
+          } else if (evt.type === 'complete') {
+            map.removeLayer(state.iaTestMarker);
+            _iaDrawTestCoverage(evt.covered_indices, evt.track_pts);
+            state.iaTestMarker = L.marker([latlng.lat, latlng.lng], {
+              icon: L.divIcon({
+                className: '',
+                html: '<div class="ia-test-marker">📡</div>',
+                iconSize: [28, 28], iconAnchor: [14, 14],
+              }),
+            }).addTo(map);
+            L.popup({ maxWidth: 220 })
+              .setLatLng([latlng.lat, latlng.lng])
+              .setContent(
+                `<b>Test Site</b><br>` +
+                `Coverage: <b>${evt.coverage_pct}%</b><br>` +
+                `Longest uncovered gap: <b>${evt.longest_gap_km} km</b><br>` +
+                `<div style="display:flex;gap:6px;margin-top:6px">` +
+                `<button onclick="window._iaAddTestSite(${latlng.lat},${latlng.lng})" ` +
+                `style="flex:1;padding:3px 0;background:#4caf7d;color:#fff;border:none;border-radius:4px;cursor:pointer">` +
+                `+ Add as Receiver</button>` +
+                `<button onclick="window._iaClearTest()" ` +
+                `style="flex:1;padding:3px 0;background:#2a2e45;color:#dde1f0;border:1px solid #2e3350;border-radius:4px;cursor:pointer">` +
+                `Clear</button></div>`
+              )
+              .openOn(map);
+            state.iaTestMarker._testData = { lat: latlng.lat, lon: latlng.lng, coverage_pct: evt.coverage_pct };
+            setStatus(`Test site: ${evt.coverage_pct}% coverage, longest gap ${evt.longest_gap_km} km`);
+          } else if (evt.type === 'error') {
+            if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
+            setStatus(`Test error: ${evt.message.split('\n')[0]}`);
+          }
+        } catch { /* ignore SSE parse errors */ }
+      }
     }
-
-    _iaDrawTestCoverage(data.covered_indices, data.track_pts);
-
-    // Result marker with popup
-    state.iaTestMarker = L.marker([latlng.lat, latlng.lng], {
-      icon: L.divIcon({
-        className: '',
-        html: '<div class="ia-test-marker">📡</div>',
-        iconSize: [28, 28], iconAnchor: [14, 14],
-      }),
-    }).addTo(map);
-
-    const popup = L.popup({ maxWidth: 220 })
-      .setLatLng([latlng.lat, latlng.lng])
-      .setContent(
-        `<b>Test Site</b><br>` +
-        `Coverage: <b>${data.coverage_pct}%</b><br>` +
-        `Longest uncovered gap: <b>${data.longest_gap_km} km</b><br>` +
-        `<div style="display:flex;gap:6px;margin-top:6px">` +
-        `<button onclick="window._iaAddTestSite(${latlng.lat},${latlng.lng})" ` +
-        `style="flex:1;padding:3px 0;background:#4caf7d;color:#fff;border:none;border-radius:4px;cursor:pointer">` +
-        `+ Add as Receiver</button>` +
-        `<button onclick="window._iaClearTest()" ` +
-        `style="flex:1;padding:3px 0;background:#2a2e45;color:#dde1f0;border:1px solid #2e3350;border-radius:4px;cursor:pointer">` +
-        `Clear</button></div>`
-      )
-      .openOn(map);
-
-    // Store result data for the Add button
-    state.iaTestMarker._testData = { lat: latlng.lat, lon: latlng.lng, coverage_pct: data.coverage_pct };
-
   } catch (err) {
     if (state.iaTestMarker) { map.removeLayer(state.iaTestMarker); state.iaTestMarker = null; }
     setStatus(`Test failed: ${err.message}`);

@@ -3931,22 +3931,22 @@ def suggest_locations():
 
 
 # ---------------------------------------------------------------------------
-# Route – Single-location RF tester (synchronous JSON, for map right-click)
+# Route – Single-location RF tester (SSE, parallelised across all CPUs)
 # ---------------------------------------------------------------------------
 
 @app.route("/api/test-location", methods=["POST"])
 def test_location():
-    data             = request.get_json()
-    lat              = float(data["lat"])
-    lon              = float(data["lon"])
-    height_agl       = float(data.get("height_agl_m",      4))
-    kml_file         = data.get("kml_file")
-    freq_mhz         = float(data.get("freq_mhz",        915))
-    tx_power_dbm     = float(data.get("tx_power_dbm",     22))
-    tx_gain_dbi      = float(data.get("tx_gain_dbi",       0))
-    sensitivity_dbm  = float(data.get("sensitivity_dbm", -135))
-    veg_type         = data.get("veg_type",             "none")
-    fade_margin_db   = float(data.get("fade_margin_db",    0))
+    data            = request.get_json()
+    lat             = float(data["lat"])
+    lon             = float(data["lon"])
+    height_agl      = float(data.get("height_agl_m",      4))
+    kml_file        = data.get("kml_file")
+    freq_mhz        = float(data.get("freq_mhz",        915))
+    tx_power_dbm    = float(data.get("tx_power_dbm",     22))
+    tx_gain_dbi     = float(data.get("tx_gain_dbi",       0))
+    sensitivity_dbm = float(data.get("sensitivity_dbm", -135))
+    veg_type        = data.get("veg_type",             "none")
+    fade_margin_db  = float(data.get("fade_margin_db",    0))
 
     if not kml_file:
         return jsonify({"error": "kml_file required"}), 400
@@ -3964,41 +3964,92 @@ def test_location():
         return jsonify({"error": "No track coordinates found"}), 400
 
     track_pts = interpolate_path(waypoints, max_pts=300)
+    total     = len(track_pts)
 
-    pool = _get_analysis_pool()
-    fut  = pool.submit(score_candidate, (
-        0, lat, lon, height_agl,
-        track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
-        sensitivity_dbm, veg_type, fade_margin_db,
-        None, float('inf'),
-    ))
-    try:
-        result = fut.result(timeout=90)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    # Represent the test site as a single-element receiver list so _point_task
+    # can be reused directly — one future per track point, all CPUs engaged.
+    test_rx = [{
+        "latitude":         lat,
+        "longitude":        lon,
+        "height_agl_m":     height_agl,
+        "antenna_gain_dbi": 0,
+        "enabled":          "1",
+    }]
 
-    covered_set = set(result["covered_set"])
+    def generate():
+        try:
+            yield sse({"type": "status", "message": f"Analyzing {total} track points…"})
 
-    # Compute longest contiguous uncovered stretch (km)
-    longest_gap_m = 0.0
-    current_gap_m = 0.0
-    last_uncov: tuple | None = None
-    for i, pt in enumerate(track_pts):
-        if i not in covered_set:
-            if last_uncov is not None:
-                current_gap_m += haversine(last_uncov[0], last_uncov[1], pt[0], pt[1])
-                longest_gap_m  = max(longest_gap_m, current_gap_m)
-            last_uncov = pt
-        else:
+            pool    = _get_analysis_pool()
+            fmap    = {
+                pool.submit(_point_task, (
+                    i, _rc(float(pt[0])), _rc(float(pt[1])), test_rx,
+                    freq_mhz, tx_power_dbm, tx_gain_dbi,
+                    sensitivity_dbm, veg_type, fade_margin_db,
+                    False, frozenset(),
+                )): i
+                for i, pt in enumerate(track_pts)
+            }
+            pending = set(fmap)
+            results = {}
+            done_n  = 0
+
+            while pending:
+                just_done, pending = cf_wait(pending, timeout=8)
+                if not just_done:
+                    yield sse({"type": "status",
+                               "message": f"Testing… {done_n}/{total}"})
+                    continue
+                for f in just_done:
+                    try:
+                        r = f.result()
+                        results[r["idx"]] = r
+                    except Exception as exc:
+                        app.logger.warning("test_loc point failed: %s", exc)
+                    done_n += 1
+                yield sse({"type": "status",
+                           "message": f"Testing… {done_n}/{total}"})
+
+            covered_set  = {idx for idx, r in results.items() if r.get("coverage")}
+            coverage_pct = round(len(covered_set) / total * 100, 1) if total else 0.0
+
+            longest_gap_m = 0.0
             current_gap_m = 0.0
             last_uncov    = None
+            for i, pt in enumerate(track_pts):
+                if i not in covered_set:
+                    if last_uncov is not None:
+                        current_gap_m += haversine(last_uncov[0], last_uncov[1], pt[0], pt[1])
+                        longest_gap_m  = max(longest_gap_m, current_gap_m)
+                    last_uncov = pt
+                else:
+                    current_gap_m = 0.0
+                    last_uncov    = None
 
-    return jsonify({
-        "coverage_pct":    result["coverage_pct"],
-        "covered_indices": sorted(covered_set),
-        "track_pts":       [[round(p[0], 5), round(p[1], 5)] for p in track_pts],
-        "longest_gap_km":  round(longest_gap_m / 1000, 1),
-    })
+            yield sse({
+                "type":            "complete",
+                "coverage_pct":    coverage_pct,
+                "covered_indices": sorted(covered_set),
+                "track_pts":       [[round(p[0], 5), round(p[1], 5)] for p in track_pts],
+                "longest_gap_km":  round(longest_gap_m / 1000, 1),
+            })
+
+        except GeneratorExit:
+            pass
+        except BaseException as exc:
+            import traceback
+            app.logger.exception("test-location SSE crashed: %r", exc)
+            try:
+                yield sse({"type": "error",
+                           "message": f"{exc!r}\n{traceback.format_exc()}"})
+            except Exception:
+                pass
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------------------------------------------------------------------------
