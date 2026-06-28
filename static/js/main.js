@@ -2745,12 +2745,15 @@ function _handleIaSSE(evt) {
       } else {
         pct = 27 + frac * 23;   // 'score' phase
       }
-      const msg = evt.message || `Coarse scoring: ${evt.current}/${evt.total}`;
-      statusEl.textContent   = msg;
-      progressEl.textContent = msg;
+      progressEl.textContent = evt.message || `Coarse scoring: ${evt.current}/${evt.total}`;
       barEl.style.width = `${pct}%`;
       break;
     }
+
+    case 'step_progress':
+      // x/N count for the current step — above-bar label only, status line unchanged
+      progressEl.textContent = evt.message;
+      break;
 
     case 'refine_progress': {
       // Draw 150 m dashed rings around each selected site on the first event

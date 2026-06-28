@@ -3012,7 +3012,7 @@ def suggest_locations():
                 while pre_pending:
                     just_done, pre_pending = cf_wait(pre_pending, timeout=8)
                     if not just_done:
-                        yield sse({"type": "status",
+                        yield sse({"type": "step_progress",
                                    "message": f"Scoring existing receivers… {pre_done_count}/{n_pre_pts} pts"})
                         continue
                     for fut in just_done:
@@ -3023,7 +3023,7 @@ def suggest_locations():
                         except Exception as exc:
                             app.logger.warning("pre-score point failed: %s", exc)
                         pre_done_count += 1
-                    yield sse({"type": "status",
+                    yield sse({"type": "step_progress",
                                "message": f"Scoring existing receivers… {pre_done_count}/{n_pre_pts} pts"})
                 yield sse({
                     "type":            "existing_coverage",
@@ -3454,7 +3454,7 @@ def suggest_locations():
             while _los_pending:
                 _just_done, _los_pending = cf_wait(_los_pending, timeout=8)
                 if not _just_done:
-                    yield sse({"type": "status",
+                    yield sse({"type": "step_progress",
                                "message": f"LOS pre-filter: {_los_done}/{_n_los}…"})
                     continue
                 for _fut in _just_done:
@@ -3465,7 +3465,7 @@ def suggest_locations():
                     except Exception as _exc:
                         app.logger.warning("LOS check failed: %s", _exc)
                     _los_done += 1
-                yield sse({"type": "status",
+                yield sse({"type": "step_progress",
                            "message": f"LOS pre-filter: {_los_done}/{_n_los}…"})
             _los_survivors = [c for ci2, c in enumerate(candidates) if ci2 in _los_ok]
             if _los_survivors:
