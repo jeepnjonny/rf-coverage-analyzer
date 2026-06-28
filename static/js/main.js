@@ -3355,7 +3355,7 @@ async function _iaLinkCovMap(latlng) {
   }).addTo(map);
 
   const radiusKm = _linkCovRadius();
-  const threshold = (parseFloat(document.getElementById('sensitivity')?.value) || -135)
+  const threshold = (parseFloat(document.getElementById('rx-sens')?.value) || -135)
                   + (parseFloat(document.getElementById('fade-margin')?.value) || 0);
   const params = {
     lat:             latlng.lat,
@@ -3363,11 +3363,11 @@ async function _iaLinkCovMap(latlng) {
     height_agl_m:    parseFloat(document.getElementById('ia-ant-height')?.value) || 4,
     grid_agl_m:      parseFloat(document.getElementById('ia-ant-height')?.value) || 4,
     radius_m:        radiusKm * 1000,
-    freq_mhz:        parseFloat(document.getElementById('freq')?.value)          || 433,
+    freq_mhz:        parseFloat(document.getElementById('freq-select')?.value)   || 433,
     tx_power_dbm:    parseFloat(document.getElementById('tx-power')?.value)      || 22,
     tx_gain_dbi:     parseFloat(document.getElementById('tx-gain')?.value)       || 0,
-    sensitivity_dbm: parseFloat(document.getElementById('sensitivity')?.value)   || -135,
-    veg_type:        document.getElementById('veg-type')?.value                  || 'none',
+    sensitivity_dbm: parseFloat(document.getElementById('rx-sens')?.value)       || -135,
+    veg_type:        document.getElementById('veg-loss')?.value                  || 'none',
     fade_margin_db:  parseFloat(document.getElementById('fade-margin')?.value)   || 0,
   };
 
@@ -3494,11 +3494,11 @@ async function _iaTestLocation(latlng) {
     lon:             latlng.lng,
     height_agl_m:    antH,
     kml_file:        state.kmlFile,
-    freq_mhz:        parseFloat(document.getElementById('freq').value)         || 433,
+    freq_mhz:        parseFloat(document.getElementById('freq-select').value)  || 433,
     tx_power_dbm:    parseFloat(document.getElementById('tx-power').value)     || 22,
     tx_gain_dbi:     parseFloat(document.getElementById('tx-gain').value)      || 0,
-    sensitivity_dbm: parseFloat(document.getElementById('sensitivity').value)  || -135,
-    veg_type:        document.getElementById('veg-type').value                 || 'none',
+    sensitivity_dbm: parseFloat(document.getElementById('rx-sens').value)      || -135,
+    veg_type:        document.getElementById('veg-loss').value                 || 'none',
     fade_margin_db:  parseFloat(document.getElementById('fade-margin').value)  || 0,
   };
 
