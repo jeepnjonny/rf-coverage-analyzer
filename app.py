@@ -3970,7 +3970,7 @@ def test_location():
         0, lat, lon, height_agl,
         track_pts, freq_mhz, tx_power_dbm, tx_gain_dbi,
         sensitivity_dbm, veg_type, fade_margin_db,
-        None, None,
+        None, float('inf'),
     ))
     try:
         result = fut.result(timeout=90)
