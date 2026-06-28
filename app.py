@@ -3068,7 +3068,7 @@ def suggest_locations():
                 else:
                     msg = "Fetching road/trail and terrain exclusion data from OpenStreetMap…"
                 yield sse({"type": "status", "message": msg})
-                time.sleep(3)
+                time.sleep(1)
             osm_thread.join()
             excl_thread.join()
             if _osm_exc[0]:
@@ -3145,13 +3145,15 @@ def suggest_locations():
                 while hp_thread.is_alive():
                     yield sse({"type": "status",
                                "message": "Scanning for elevated hike-accessible sites…"})
-                    time.sleep(3)
+                    time.sleep(1)
                 hp_thread.join()
                 if _hp_exc[0]:
                     app.logger.warning("Highpoint scan error: %s", _hp_exc[0])
                     # Non-fatal: continue without Tier-2 candidates
                 else:
                     tier2 = _hp_result[0] or []
+
+            yield sse({"type": "status", "message": "Merging candidate pool…"})
 
             # Merge and deduplicate into raw pool (up to RAW_CANDIDATES_CAP).
             # WIDE2: elevation highpoints → roads → on-route fallback.
