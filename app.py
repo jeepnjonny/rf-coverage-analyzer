@@ -1020,8 +1020,11 @@ def _worker_init(tile_dir_str: str, elev_db_str: str) -> None:
 
 
 def _get_analysis_pool() -> ProcessPoolExecutor:
-    """Return the module-level process pool, creating it lazily on first call."""
+    """Return the module-level analysis process pool, creating it lazily on first call.
+    Resets automatically if a worker crash has left the pool in a broken state."""
     global _analysis_pool
+    if _analysis_pool is not None and getattr(_analysis_pool, '_broken', False):
+        _analysis_pool = None
     if _analysis_pool is None:
         with _analysis_pool_lock:
             if _analysis_pool is None:
@@ -1034,6 +1037,32 @@ def _get_analysis_pool() -> ProcessPoolExecutor:
                 atexit.register(pool.shutdown, wait=False)
                 _analysis_pool = pool
     return _analysis_pool
+
+
+# Separate pool for the Infrastructure Advisor.  The advisor daemon thread
+# can run thousands of pool.map() tasks in the background; isolating it
+# prevents zombie tasks from blocking /api/analyze link/track requests.
+_advisor_pool:      ProcessPoolExecutor | None = None
+_advisor_pool_lock: threading.Lock              = threading.Lock()
+
+
+def _get_advisor_pool() -> ProcessPoolExecutor:
+    """Return the module-level advisor process pool, creating/resetting lazily."""
+    global _advisor_pool
+    if _advisor_pool is not None and getattr(_advisor_pool, '_broken', False):
+        _advisor_pool = None
+    if _advisor_pool is None:
+        with _advisor_pool_lock:
+            if _advisor_pool is None:
+                import atexit
+                pool = ProcessPoolExecutor(
+                    max_workers=_POOL_WORKERS,
+                    initializer=_worker_init,
+                    initargs=(str(TILE_DIR), str(ELEV_DB)),
+                )
+                atexit.register(pool.shutdown, wait=False)
+                _advisor_pool = pool
+    return _advisor_pool
 
 
 def _terrain_check_task(args: tuple) -> dict:
@@ -2189,11 +2218,26 @@ def analyze():
                     if j > i and str(rx2.get("enabled", "1")).strip() != "0"
                 ]
                 pool = _get_analysis_pool()
-                chunksize = max(1, len(link_args) // (_POOL_WORKERS * 4)) if link_args else 1
-                for result in pool.map(_link_task, link_args, chunksize=chunksize):
-                    link_results_cache.append(result)
-                    if mode in ("links", "both"):
-                        yield sse(result)
+                _link_fmap: dict = {}
+                for _la in link_args:
+                    try:
+                        _link_fmap[pool.submit(_link_task, _la)] = _la
+                    except Exception as _lse:
+                        app.logger.warning("link submit failed: %s", _lse)
+                _link_pending = set(_link_fmap)
+                while _link_pending:
+                    _lj_done, _link_pending = cf_wait(_link_pending, timeout=8)
+                    if not _lj_done:
+                        yield sse({"type": "status", "message": status_msg})
+                        continue
+                    for _lf in _lj_done:
+                        try:
+                            result = _lf.result()
+                            link_results_cache.append(result)
+                            if mode in ("links", "both"):
+                                yield sse(result)
+                        except Exception as _le:
+                            app.logger.warning("link task failed: %s", _le)
 
             # Build the set of WIDE1 receivers with a viable backbone link to a terminal node.
             # Used by _point_task when chain_mode is True.
@@ -2262,27 +2306,54 @@ def analyze():
                 ]
 
                 pool = _get_analysis_pool()
-                for pt in pool.map(_point_task, point_args, chunksize=1):
-                        if pt["coverage"]:
-                            total_covered += 1
-                            bx = pt["best_rx_idx"]
-                            rx_stats[bx]["covered"]    += 1
-                            rx_stats[bx]["rssi_sum"]   += pt["best_rssi"]
-                            rx_stats[bx]["rssi_count"] += 1
+                _pt_fmap: dict = {}
+                _pt_errors: set[int] = set()
+                for _pta in point_args:
+                    try:
+                        _pt_fmap[pool.submit(_point_task, _pta)] = _pta[0]
+                    except Exception as _pse:
+                        app.logger.warning("point submit failed (idx %d): %s", _pta[0], _pse)
+                        _pt_errors.add(_pta[0])
+                _pt_pending = set(_pt_fmap)
+                _pt_buf: dict[int, dict] = {}
+                _pt_next = 0
 
-                        batch.append({
-                            "type":        "point",
-                            "idx":         pt["idx"],
-                            "lat":         pt["lat"],
-                            "lon":         pt["lon"],
-                            "coverage":    pt["coverage"],
-                            "hard_fail":   pt["hard_fail"],
-                            "best_rx_idx": pt["best_rx_idx"],
-                            "best_rssi":   pt["best_rssi"],
-                            "rx_results":  pt["rx_results"],
-                        })
-
-                        if len(batch) >= FLUSH or pt["idx"] == total_pts - 1:
+                while _pt_pending:
+                    _ptj_done, _pt_pending = cf_wait(_pt_pending, timeout=8)
+                    if not _ptj_done:
+                        yield sse({"type": "status",
+                                   "message": f"RF analysis… {_pt_next}/{total_pts} pts"})
+                    for _ptf in _ptj_done:
+                        try:
+                            _pt_r = _ptf.result()
+                            _pt_buf[_pt_r["idx"]] = _pt_r
+                        except Exception as _pte:
+                            app.logger.warning("point task failed: %s", _pte)
+                            _pt_errors.add(_pt_fmap[_ptf])
+                    # Flush consecutive results in order
+                    while _pt_next in _pt_buf or _pt_next in _pt_errors:
+                        if _pt_next not in _pt_errors:
+                            pt = _pt_buf.pop(_pt_next)
+                            if pt["coverage"]:
+                                total_covered += 1
+                                bx = pt["best_rx_idx"]
+                                rx_stats[bx]["covered"]    += 1
+                                rx_stats[bx]["rssi_sum"]   += pt["best_rssi"]
+                                rx_stats[bx]["rssi_count"] += 1
+                            batch.append({
+                                "type":        "point",
+                                "idx":         pt["idx"],
+                                "lat":         pt["lat"],
+                                "lon":         pt["lon"],
+                                "coverage":    pt["coverage"],
+                                "hard_fail":   pt["hard_fail"],
+                                "best_rx_idx": pt["best_rx_idx"],
+                                "best_rssi":   pt["best_rssi"],
+                                "rx_results":  pt["rx_results"],
+                            })
+                        else:
+                            _pt_errors.discard(_pt_next)
+                        if batch and (len(batch) >= FLUSH or _pt_next == total_pts - 1):
                             _istats = []
                             for _ii, _s in enumerate(rx_stats):
                                 if str(receivers[_ii].get("enabled", "1")).strip() == "0":
@@ -2299,13 +2370,40 @@ def analyze():
                             yield sse({
                                 "type":               "points_batch",
                                 "points":             batch,
-                                "progress":           pt["idx"] + 1,
+                                "progress":           _pt_next + 1,
                                 "total":              total_pts,
                                 "stats":              _istats,
                                 "total_coverage_pct": round(total_covered / total_pts * 100, 1)
                                                       if total_pts else 0,
                             })
                             batch = []
+                        _pt_next += 1
+
+                # Safety flush for any remaining batch (e.g. total_pts < FLUSH)
+                if batch:
+                    _istats = []
+                    for _ii, _s in enumerate(rx_stats):
+                        if str(receivers[_ii].get("enabled", "1")).strip() == "0":
+                            continue
+                        _avg = (_s["rssi_sum"] / _s["rssi_count"]
+                                if _s["rssi_count"] > 0 else None)
+                        _istats.append({
+                            "name":         _s["name"],
+                            "coverage_pct": round(_s["covered"] / total_pts * 100, 1)
+                                            if total_pts else 0,
+                            "avg_rssi":     round(_avg, 1) if _avg is not None else None,
+                            "color_idx":    _ii,
+                        })
+                    yield sse({
+                        "type":               "points_batch",
+                        "points":             batch,
+                        "progress":           total_pts,
+                        "total":              total_pts,
+                        "stats":              _istats,
+                        "total_coverage_pct": round(total_covered / total_pts * 100, 1)
+                                              if total_pts else 0,
+                    })
+                    batch = []
 
                 # ---- Summary ----
                 stats = []
@@ -2334,9 +2432,13 @@ def analyze():
 
         except GeneratorExit:
             pass
-        except Exception as exc:
+        except BaseException as exc:
             import traceback
-            yield sse({"type": "error", "message": f"{exc}\n{traceback.format_exc()}"})
+            app.logger.exception("Analyze SSE generator crashed: %r", exc)
+            try:
+                yield sse({"type": "error", "message": f"{exc!r}\n{traceback.format_exc()}"})
+            except Exception:
+                pass
 
     return Response(
         stream_with_context(generate()),
@@ -2929,6 +3031,7 @@ def suggest_locations():
 
     def generate():
         try:
+            _stop_flag: list = [False]  # set True on generator exit to halt filter_thread
             # Determine backbone anchors for chain-aware scoring (WIDE1 and WIDE2).
             # Both tiers require a relay path to a WIDE2/iGate to be network-useful.
             # Load an iGate or existing WIDE2 in the receivers CSV to enable this check.
@@ -3024,7 +3127,7 @@ def suggest_locations():
                      False, frozenset())   # chain_mode off — raw coverage only
                     for idx, (plat, plon) in enumerate(track_pts)
                 ]
-                pool = _get_analysis_pool()
+                pool = _get_advisor_pool()
                 # Use submit+cf_wait (not pool.map) so the generator keeps yielding
                 # SSE heartbeats — pool.map blocks the generator entirely and the
                 # browser SSE connection times out on longer tracks.
@@ -3252,7 +3355,7 @@ def suggest_locations():
 
             def _run_phases_012():
                 try:
-                    _pool = _get_analysis_pool()
+                    _pool = _get_advisor_pool()
 
                     # ── Phase 0b: terrain accessibility filter (parallel) ─
                     _phase_state["phase"] = "terrain"
@@ -3276,6 +3379,9 @@ def suggest_locations():
                         _phase_state["current"] = res["ci"] + 1
                         _phase_state["message"] = (
                             f"Terrain check: {res['ci'] + 1}/{len(candidates)}…")
+
+                    if _stop_flag[0]:
+                        return
 
                     total_rej = slope_rej + excl_rej
                     filtered = terrain_ok if terrain_ok else candidates
@@ -3313,6 +3419,9 @@ def suggest_locations():
                         _phase_state["current"] = res["ci"] + 1
                         _phase_state["message"] = (
                             f"Coarse scoring: {res['ci'] + 1}/{len(filtered)}…")
+
+                    if _stop_flag[0]:
+                        return
 
                     filtered.sort(key=lambda c: c["_coarse"], reverse=True)
                     n_keep = max(50, int(len(filtered) * (1.0 - COARSE_REJECT_BOTTOM)))
@@ -3468,8 +3577,14 @@ def suggest_locations():
                 _los_args.append((ci2, c["lat"], c["lon"], antenna_height_m,
                                   [(track_pts[ti][0], track_pts[ti][1])
                                    for ti in range(start, end)]))
-            _los_pool    = _get_analysis_pool()
-            _los_pending = {_los_pool.submit(_los_check_task, a) for a in _los_args}
+            _los_pool    = _get_advisor_pool()
+            _los_pending: set = set()
+            for _la in _los_args:
+                try:
+                    _los_pending.add(_los_pool.submit(_los_check_task, _la))
+                except Exception as _lse:
+                    app.logger.warning("LOS submit failed: %s", _lse)
+                    _los_done += 1
             _los_ok: set[int] = set()
             _los_done = 0
             _n_los    = len(_los_args)
@@ -3576,7 +3691,7 @@ def suggest_locations():
 
             scored: list[dict] = []
             backbone_blocked_count = 0
-            pool = _get_analysis_pool()
+            pool = _get_advisor_pool()
             futures = {pool.submit(score_candidate, a): a[0] for a in score_args}
             done_count  = 0
             skip_count  = 0
@@ -3689,7 +3804,7 @@ def suggest_locations():
                             _refine_meta[ridx] = sel_i
 
                 if _refine_args:
-                    _refine_pool    = _get_analysis_pool()
+                    _refine_pool    = _get_advisor_pool()
                     _refine_futures = {_refine_pool.submit(score_candidate, a): a[0]
                                        for a in _refine_args}
                     _refine_pending = set(_refine_futures.keys())
@@ -3759,8 +3874,9 @@ def suggest_locations():
             })
 
         except GeneratorExit:
-            pass
+            _stop_flag[0] = True
         except BaseException as exc:
+            _stop_flag[0] = True
             import traceback
             app.logger.exception("Advisor SSE generator crashed: %r", exc)
             try:
