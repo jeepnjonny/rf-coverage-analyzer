@@ -1611,17 +1611,25 @@ def list_analyses():
     """Return lightweight metadata for all saved analyses, newest first."""
     items = []
     for f in sorted(ANALYSES_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if f.name.endswith(".meta.json"):
+            continue  # sidecar files handled below
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            items.append({
-                "id":                 data.get("id"),
-                "name":               data.get("name", "Unnamed"),
-                "saved_at":           data.get("saved_at"),
-                "kml_file":           data.get("kml_file"),
-                "csv_file":           data.get("csv_file"),
-                "total_coverage_pct": data.get("total_coverage_pct"),
-                "mode":               data.get("params", {}).get("mode"),
-            })
+            meta_path = f.with_suffix("").with_suffix(".meta.json")
+            if meta_path.exists():
+                # Fast path: tiny sidecar with pre-extracted listing fields
+                items.append(json.loads(meta_path.read_text(encoding="utf-8")))
+            else:
+                # Fallback for analyses saved before sidecar support
+                data = json.loads(f.read_text(encoding="utf-8"))
+                items.append({
+                    "id":                 data.get("id"),
+                    "name":               data.get("name", "Unnamed"),
+                    "saved_at":           data.get("saved_at"),
+                    "kml_file":           data.get("kml_file"),
+                    "csv_file":           data.get("csv_file"),
+                    "total_coverage_pct": data.get("total_coverage_pct"),
+                    "mode":               data.get("params", {}).get("mode"),
+                })
         except Exception as exc:
             app.logger.warning("Skipping corrupt analysis file %s: %s", f.name, exc)
     return jsonify(items)
@@ -1636,6 +1644,15 @@ def save_analysis():
     aid = str(uuid.uuid4())
     payload["id"]       = aid
     payload["saved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta = {
+        "id":                 aid,
+        "name":               payload.get("name", "Unnamed"),
+        "saved_at":           payload["saved_at"],
+        "kml_file":           payload.get("kml_file"),
+        "csv_file":           payload.get("csv_file"),
+        "total_coverage_pct": payload.get("total_coverage_pct"),
+        "mode":               payload.get("params", {}).get("mode"),
+    }
     # Atomic write: temp file then rename so a crash never leaves a corrupt file
     tmp = ANALYSES_DIR / f".{aid}.tmp"
     try:
@@ -1644,7 +1661,9 @@ def save_analysis():
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
-    return jsonify({"id": aid, "name": payload.get("name"), "saved_at": payload["saved_at"]}), 201
+    # Sidecar metadata file — list_analyses() reads this instead of the full JSON
+    (ANALYSES_DIR / f"{aid}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return jsonify({"id": aid, "name": meta["name"], "saved_at": meta["saved_at"]}), 201
 
 
 @app.route("/api/analyses/<aid>", methods=["GET"])
@@ -1658,10 +1677,13 @@ def load_analysis(aid: str):
 
 @app.route("/api/analyses/<aid>", methods=["DELETE"])
 def delete_analysis(aid: str):
-    """Delete a saved analysis file."""
+    """Delete a saved analysis file and its metadata sidecar."""
     p = ANALYSES_DIR / secure_filename(f"{aid}.json")
     if p.exists():
         p.unlink()
+    meta = ANALYSES_DIR / secure_filename(f"{aid}.meta.json")
+    if meta.exists():
+        meta.unlink()
     return jsonify({"ok": True})
 
 
