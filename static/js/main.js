@@ -3188,13 +3188,14 @@ function _showRxContextMenu(domEvent, rxIdx) {
     `<div style="display:flex;align-items:center;gap:6px;margin:4px 0">` +
     `<label style="font-size:11px;color:#a0a8c0;white-space:nowrap">Link radius:</label>` +
     `<select id="linkcov-radius" class="ctrl-input" style="flex:1">` +
-    `<option value="5">5 km</option>` +
-    `<option value="10" selected>10 km</option>` +
-    `<option value="20">20 km</option>` +
+    `<option value="10">10 km</option>` +
+    `<option value="25" selected>25 km</option>` +
+    `<option value="50">50 km</option>` +
     `</select></div>` +
     `<button class="btn btn-primary" id="rx-ctx-linkcov">🔗 Link coverage map</button>` +
     `<button class="btn" id="ia-test-cancel">Cancel</button>`;
   document.body.appendChild(div);
+  div.addEventListener('click', e => e.stopPropagation());
 
   div.querySelector('#rx-ctx-edit').addEventListener('click', () => {
     _hideIaTestMenu();
@@ -3308,13 +3309,14 @@ map.on('contextmenu', (e) => {
     `<div style="display:flex;align-items:center;gap:6px;margin:4px 0">` +
     `<label style="font-size:11px;color:#a0a8c0;white-space:nowrap">Link radius:</label>` +
     `<select id="linkcov-radius" class="ctrl-input" style="flex:1">` +
-    `<option value="5">5 km</option>` +
-    `<option value="10" selected>10 km</option>` +
-    `<option value="20">20 km</option>` +
+    `<option value="10">10 km</option>` +
+    `<option value="25" selected>25 km</option>` +
+    `<option value="50">50 km</option>` +
     `</select></div>` +
     `<button class="btn btn-primary" id="ia-linkcov-go">🔗 Link coverage map</button>` +
     `<button class="btn" id="ia-test-cancel">Cancel</button>`;
   document.body.appendChild(div);
+  div.addEventListener('click', e => e.stopPropagation());
 
   if (state.kmlFile) {
     div.querySelector('#ia-test-go').addEventListener('click', () => {
@@ -3337,7 +3339,7 @@ map.on('contextmenu', (e) => {
 // ---------------------------------------------------------------------------
 
 function _linkCovRadius() {
-  return parseFloat(document.getElementById('linkcov-radius')?.value || '10');
+  return parseFloat(document.getElementById('linkcov-radius')?.value || '25');
 }
 
 async function _iaLinkCovMap(latlng) {
