@@ -1300,7 +1300,7 @@ function handleSSE(evt, ctx) {
       setProgress(progressLabel, pct);
 
       if (evt.stats && evt.stats.length)
-        renderResults(evt.stats, evt.total_coverage_pct ?? 0, false);
+        renderResults(evt.stats, evt.total_coverage_pct ?? 0, false, evt.track_dist_m ?? 0);
 
       evt.points.forEach(pt => {
         // Store for cursor hover RSSI
@@ -1375,7 +1375,7 @@ function handleSSE(evt, ctx) {
 
     case 'complete':
       ctx.flushSeg(null);
-      if (evt.mode !== 'links') renderResults(evt.stats, evt.total_coverage_pct);
+      if (evt.mode !== 'links') renderResults(evt.stats, evt.total_coverage_pct, true, evt.track_dist_m ?? 0);
       setProgress('Complete', 100);
       setStatus(evt.mode === 'links'
         ? 'Receiver link analysis complete.'
@@ -1684,31 +1684,32 @@ function hideResults() {
   document.getElementById('results-scroll').classList.add('hidden');
 }
 
-function renderResults(stats, totalPct, doSwitchTab = true) {
+function renderResults(stats, totalPct, doSwitchTab = true, trackDistM = 0) {
   const tbody = document.getElementById('results-tbody');
   const tfoot = document.getElementById('results-tfoot');
   tbody.innerHTML = '';
   tfoot.innerHTML = '';
 
   stats.forEach((s, i) => {
-    const color = rxColor(s.color_idx ?? i);
-    const tr    = document.createElement('tr');
+    const color   = rxColor(s.color_idx ?? i);
+    const distM   = trackDistM > 0 ? Math.round(trackDistM * s.coverage_pct / 100) : null;
+    const distMi  = distM !== null ? (distM * 0.000621371).toFixed(2) : null;
+    const tr      = document.createElement('tr');
     tr.innerHTML = `
       <td><span class="rx-swatch" style="background:${color}"></span>${s.name}</td>
       <td>${s.coverage_pct}%</td>
       <td>${s.avg_rssi !== null ? s.avg_rssi + ' dBm' : '—'}</td>
-      <td>
-        <div class="cov-bar-wrap">
-          <div class="cov-bar-fill" style="width:${s.coverage_pct}%;background:${coverageColor(s.coverage_pct)}"></div>
-        </div>
-      </td>`;
+      <td>${distM !== null ? distM.toLocaleString() : '—'}</td>
+      <td>${distMi !== null ? distMi : '—'}</td>`;
     tbody.appendChild(tr);
   });
 
+  const totalDistM  = trackDistM > 0 ? Math.round(trackDistM * totalPct / 100) : null;
+  const totalDistMi = totalDistM !== null ? (totalDistM * 0.000621371).toFixed(2) : null;
   const tf = document.createElement('tr');
   tf.innerHTML = `<td>Total Course Coverage</td><td>${totalPct}%</td><td>—</td>
-    <td><div class="cov-bar-wrap"><div class="cov-bar-fill"
-      style="width:${totalPct}%;background:${coverageColor(totalPct)}"></div></div></td>`;
+    <td>${totalDistM !== null ? totalDistM.toLocaleString() : '—'}</td>
+    <td>${totalDistMi !== null ? totalDistMi : '—'}</td>`;
   tfoot.appendChild(tf);
 
   document.getElementById('results-empty').classList.add('hidden');

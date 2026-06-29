@@ -2141,6 +2141,13 @@ def analyze():
                 if not waypoints:
                     yield sse({"type": "error", "message": "No track coordinates found in file"}); return
                 path_pts = interpolate_path(waypoints)
+                track_dist_m = sum(
+                    haversine(path_pts[i][0], path_pts[i][1],
+                              path_pts[i + 1][0], path_pts[i + 1][1])
+                    for i in range(len(path_pts) - 1)
+                ) if len(path_pts) > 1 else 0.0
+            else:
+                track_dist_m = 0.0
 
             yield sse({
                 "type":              "path_info",
@@ -2416,6 +2423,7 @@ def analyze():
                                 "stats":              _istats,
                                 "total_coverage_pct": round(total_covered / total_pts * 100, 1)
                                                       if total_pts else 0,
+                                "track_dist_m":       round(track_dist_m),
                             })
                             batch = []
                         _pt_next += 1
@@ -2443,6 +2451,7 @@ def analyze():
                         "stats":              _istats,
                         "total_coverage_pct": round(total_covered / total_pts * 100, 1)
                                               if total_pts else 0,
+                        "track_dist_m":       round(track_dist_m),
                     })
                     batch = []
 
@@ -2465,6 +2474,7 @@ def analyze():
                     "chain_mode":         chain_mode,
                     "stats":              stats,
                     "total_coverage_pct": round(total_covered / total_pts * 100, 1) if total_pts else 0,
+                    "track_dist_m":       round(track_dist_m),
                 })
             else:
                 # Links-only: no coverage stats to report
