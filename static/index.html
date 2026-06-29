@@ -281,6 +281,7 @@
       <div class="bottom-tabs">
         <button class="tab-btn active" data-tab="coverage">Coverage Results</button>
         <button class="tab-btn" data-tab="profile">Terrain Profile</button>
+        <button class="tab-btn" data-tab="hardware">Hardware</button>
         <span class="tab-sep"></span>
         <span class="profile-link-label hidden" id="profile-link-label"></span>
       </div>
@@ -312,6 +313,12 @@
         </div>
         <div class="profile-rx-sidebar hidden" id="profile-rx-sidebar"></div>
         <canvas id="profile-canvas" style="display:none"></canvas>
+      </div>
+
+      <!-- Hardware tab -->
+      <div class="tab-pane" id="tab-hardware">
+        <div class="results-empty" id="hardware-empty">No receivers loaded</div>
+        <div class="hw-grid hidden" id="hw-grid"></div>
       </div>
     </div>
 
@@ -354,10 +361,15 @@
       </div>
       <div class="param-group">
         <label class="param-label">Tx Power</label>
-        <div class="param-row">
-          <input id="add-rx-power" class="ctrl-input" type="number" value="28" step="1" min="-30" max="43" />
-          <span class="param-unit">dBm</span>
-        </div>
+        <select id="add-rx-power" class="ctrl-input full-width">
+          <option value="20">20 dBm</option>
+          <option value="22">22 dBm</option>
+          <option value="28" selected>28 dBm</option>
+          <option value="30">30 dBm (1W)</option>
+          <option value="33">33 dBm (2W)</option>
+          <option value="37">37 dBm (5W)</option>
+          <option value="40">40 dBm (10W)</option>
+        </select>
       </div>
       <div class="param-group">
         <label class="param-label">Enabled</label>
@@ -402,10 +414,15 @@
       </div>
       <div class="param-group">
         <label class="param-label">Tx Power</label>
-        <div class="param-row">
-          <input id="edit-rx-power" class="ctrl-input" type="number" step="1" min="-30" max="43" />
-          <span class="param-unit">dBm</span>
-        </div>
+        <select id="edit-rx-power" class="ctrl-input full-width">
+          <option value="20">20 dBm</option>
+          <option value="22">22 dBm</option>
+          <option value="28">28 dBm</option>
+          <option value="30">30 dBm (1W)</option>
+          <option value="33">33 dBm (2W)</option>
+          <option value="37">37 dBm (5W)</option>
+          <option value="40">40 dBm (10W)</option>
+        </select>
       </div>
       <div class="param-group">
         <label class="param-label">Role</label>

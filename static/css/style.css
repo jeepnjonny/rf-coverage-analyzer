@@ -216,6 +216,17 @@ html, body {
 /* Terrain profile tab */
 #tab-profile { position: relative; background: var(--bg); flex-direction: row; }
 
+/* Hardware tab */
+#tab-hardware { overflow: auto; flex-direction: row; padding: 8px 12px; gap: 20px; align-items: flex-start; }
+.hw-grid { display: flex; flex-wrap: wrap; gap: 20px; align-content: flex-start; }
+.hw-section { display: flex; flex-direction: column; min-width: 160px; }
+.hw-section-title {
+  font-size: 11px; font-weight: 700; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.5px;
+  padding-bottom: 4px; border-bottom: 1px solid var(--border); margin-bottom: 0;
+}
+.hw-count { text-align: right !important; }
+
 .profile-empty {
   position: absolute;
   inset: 0;

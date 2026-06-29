@@ -19,6 +19,15 @@ function rxColor(idx) {
 const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled','role'];
 
 const ROLE_LABEL  = { wide1: 'WIDE1 fill-in', wide2: 'WIDE2 backbone', igate: 'iGate', meshtastic: 'Meshtastic Router' };
+const TX_POWER_OPTIONS = [
+  [20, '20 dBm'], [22, '22 dBm'], [28, '28 dBm'],
+  [30, '30 dBm (1W)'], [33, '33 dBm (2W)'], [37, '37 dBm (5W)'], [40, '40 dBm (10W)'],
+];
+function _snapPower(dbm) {
+  const v = parseFloat(dbm) || 28;
+  return TX_POWER_OPTIONS.reduce((best, [opt]) =>
+    Math.abs(opt - v) < Math.abs(best - v) ? opt : best, TX_POWER_OPTIONS[0][0]);
+}
 const COORD_DP    = 6;   // decimal places — matches server _rc()
 
 function rc(v) { return parseFloat(v.toFixed(COORD_DP)); }
@@ -157,6 +166,7 @@ function switchTab(name) {
   if (name === 'profile' && state.currentProfileData) {
     drawProfile(state.currentProfileData, document.getElementById('profile-canvas'));
   }
+  if (name === 'hardware') renderHardwareTab();
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +586,18 @@ function renderFmEditorTable() {
         td.style.textAlign = 'center';
         cb.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.checked ? '1' : '0'; });
         td.appendChild(cb);
+      } else if (col === 'tx_power_dbm') {
+        const sel = document.createElement('select');
+        sel.className = 'editor-select';
+        const snapped = _snapPower(row[col] ?? 28);
+        TX_POWER_OPTIONS.forEach(([v, label]) => {
+          const opt = document.createElement('option');
+          opt.value = v; opt.textContent = label;
+          if (v === snapped) opt.selected = true;
+          sel.appendChild(opt);
+        });
+        sel.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.value; });
+        td.appendChild(sel);
       } else if (col === 'role') {
         const sel = document.createElement('select');
         sel.className = 'editor-select';
@@ -1063,6 +1085,58 @@ function updateLegend() {
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ff9800"></div><span>Marginal link (0–5 dB)</span></div>');
   }
   el.innerHTML = lines.join('');
+  if (document.getElementById('tab-hardware')?.classList.contains('active')) renderHardwareTab();
+}
+
+function renderHardwareTab() {
+  const empty = document.getElementById('hardware-empty');
+  const grid  = document.getElementById('hw-grid');
+  if (!empty || !grid) return;
+
+  const rxs = state.receivers || [];
+  if (!rxs.length) {
+    empty.classList.remove('hidden');
+    grid.classList.add('hidden');
+    grid.innerHTML = '';
+    return;
+  }
+  empty.classList.add('hidden');
+  grid.classList.remove('hidden');
+
+  const byRole  = {}, byGain = {}, byPower = {};
+  rxs.forEach(r => {
+    const role  = _rxRole(r);
+    const gain  = (parseFloat(r.antenna_gain_dbi) ?? 0).toString();
+    const power = _snapPower(r.tx_power_dbm ?? 28).toString();
+    byRole[role]   = (byRole[role]  || 0) + 1;
+    byGain[gain]   = (byGain[gain]  || 0) + 1;
+    byPower[power] = (byPower[power] || 0) + 1;
+  });
+
+  const mkTable = (title, rows) => {
+    const trs = rows.map(([k, v]) =>
+      `<tr><td>${k}</td><td class="hw-count">${v}</td></tr>`).join('');
+    return `<div class="hw-section">
+      <div class="hw-section-title">${title}</div>
+      <table class="results-table">
+        <thead><tr><th></th><th class="hw-count">Count</th></tr></thead>
+        <tbody>${trs}</tbody>
+      </table>
+    </div>`;
+  };
+
+  const roleRows  = Object.entries(byRole).sort().map(([k, v]) => [ROLE_LABEL[k] || k, v]);
+  const gainRows  = Object.entries(byGain).sort((a, b) => +a[0] - +b[0])
+                         .map(([k, v]) => [`${k} dBi`, v]);
+  const powerRows = Object.entries(byPower).sort((a, b) => +a[0] - +b[0])
+                         .map(([k, v]) => {
+                           const label = (TX_POWER_OPTIONS.find(([vv]) => vv == +k) || [0, `${k} dBm`])[1];
+                           return [label, v];
+                         });
+
+  grid.innerHTML = mkTable('By Role', roleRows)
+                 + mkTable('By Antenna Gain', gainRows)
+                 + mkTable('By Tx Power', powerRows);
 }
 
 function updateSingleRxSelect() {
@@ -3242,7 +3316,7 @@ function _openRxEditModal(rxIdx) {
   document.getElementById('edit-rx-name').value          = rx.name             || '';
   document.getElementById('edit-rx-height').value        = rx.height_agl_m     ?? 2;
   document.getElementById('edit-rx-gain').value          = rx.antenna_gain_dbi ?? 0;
-  document.getElementById('edit-rx-power').value         = rx.tx_power_dbm     ?? 28;
+  document.getElementById('edit-rx-power').value         = _snapPower(rx.tx_power_dbm ?? 28);
   document.getElementById('edit-rx-role').value          = _rxRole(rx);
   document.getElementById('edit-rx-enabled').checked     = _rxEnabled(rx);
 
