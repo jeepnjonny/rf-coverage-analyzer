@@ -1093,9 +1093,11 @@ function renderHardwareTab() {
   const grid  = document.getElementById('hw-grid');
   if (!empty || !grid) return;
 
-  const rxs = state.receivers || [];
-  if (!rxs.length) {
+  const rxs     = state.receivers || [];
+  const enabled = rxs.filter(_rxEnabled);
+  if (!enabled.length) {
     empty.classList.remove('hidden');
+    empty.textContent = rxs.length ? 'No enabled receivers' : 'No receivers loaded';
     grid.classList.add('hidden');
     grid.innerHTML = '';
     return;
@@ -1104,7 +1106,7 @@ function renderHardwareTab() {
   grid.classList.remove('hidden');
 
   const byRole  = {}, byGain = {}, byPower = {};
-  rxs.forEach(r => {
+  rxs.filter(_rxEnabled).forEach(r => {
     const role  = _rxRole(r);
     const gain  = (parseFloat(r.antenna_gain_dbi) ?? 0).toString();
     const power = _snapPower(r.tx_power_dbm ?? 28).toString();
