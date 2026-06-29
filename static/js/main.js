@@ -1506,7 +1506,19 @@ async function saveAnalysis() {
     kml_coords:         state.kmlCoords,
     params:             state.lastAnalysisParams,
     receivers:          state.receivers,
-    path_results:       state.pathResults,
+    // Strip per-point rx_results (one entry per receiver per point) to keep
+    // payload size manageable — they are only used for the hover signal panel
+    // and terrain-profile receiver switcher, neither of which is critical for
+    // a saved/restored view.
+    path_results:       state.pathResults.map(pt => ({
+      idx:         pt.idx,
+      lat:         pt.lat,
+      lon:         pt.lon,
+      coverage:    pt.coverage,
+      hard_fail:   pt.hard_fail,
+      best_rx_idx: pt.best_rx_idx,
+      best_rssi:   pt.best_rssi,
+    })),
     inter_rx_results:   state.interRxResults,
     stats:              state.lastAnalysisStats    || [],
     total_coverage_pct: state.lastAnalysisTotalPct ?? null,
