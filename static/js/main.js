@@ -1343,9 +1343,11 @@ function handleSSE(evt, ctx) {
       // Defensive: never draw a link involving a disabled receiver
       if (!_rxEnabled(rx1) || !_rxEnabled(rx2)) break;
 
-      // Backbone links (WIDE1 ↔ WIDE2 or WIDE1 ↔ iGate) get a distinct amber dashed style
       const r1 = _rxRole(rx1);
       const r2 = _rxRole(rx2);
+      // wide1↔wide1 is not a valid APRS relay path — skip drawing
+      if (r1 === 'wide1' && r2 === 'wide1') break;
+      // Backbone links (WIDE1 ↔ WIDE2 or WIDE1 ↔ iGate) get a distinct amber dashed style
       const isBackbone = (r1 === 'wide1' && (r2 === 'wide2' || r2 === 'igate'))
                       || (r2 === 'wide1' && (r1 === 'wide2' || r1 === 'igate'));
       const color  = isBackbone ? '#ffb300' : rxColor(evt.rx1_idx);
@@ -1510,14 +1512,27 @@ function _drawInterRxResults(results, receivers) {
     const rx2 = receivers[evt.rx2_idx];
     if (!rx1 || !rx2) continue;
     if (!_rxEnabled(rx1) || !_rxEnabled(rx2)) continue;
-    const color = rxColor(evt.rx1_idx);
+    const r1 = _rxRole(rx1);
+    const r2 = _rxRole(rx2);
+    if (r1 === 'wide1' && r2 === 'wide1') continue;
+    const isBackbone = (r1 === 'wide1' && (r2 === 'wide2' || r2 === 'igate'))
+                    || (r2 === 'wide1' && (r1 === 'wide2' || r1 === 'igate'));
+    const color  = isBackbone ? '#ffb300' : rxColor(evt.rx1_idx);
+    const weight = isBackbone ? 3.5 : 2.5;
+    const opts   = { color, weight, opacity: isBackbone ? 0.95 : 0.75,
+                     rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx };
+    if (isBackbone) opts.dashArray = '9 5';
+    const roleDesc = r => (ROLE_LABEL[r] || r.toUpperCase());
+    const linkLabel = isBackbone
+      ? `Backbone: ${rx1.name} (${roleDesc(r1)}) ↔ ${rx2.name} (${roleDesc(r2)})`
+      : `${rx1.name} ↔ ${rx2.name}`;
     const pl = L.polyline(
       [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
        [parseFloat(rx2.latitude), parseFloat(rx2.longitude)]],
-      { color, weight: 2.5, opacity: 0.75, rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx }
+      opts
     );
     pl.bindTooltip(
-      `${rx1.name} ↔ ${rx2.name}<br>${evt.rssi} dBm · ${evt.dist_km} km · diff: ${evt.diff_db} dB`,
+      `${linkLabel}<br>${evt.rssi} dBm · ${evt.dist_km} km · diff: ${evt.diff_db} dB`,
       { sticky: true }
     );
     pl.on('click', () => showTerrainProfile(rx1, rx2, evt.rx1_idx, evt.rx2_idx));
