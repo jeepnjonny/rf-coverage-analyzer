@@ -4,17 +4,19 @@
 # Run from the project root directory:
 #   chmod +x setup.sh && sudo ./setup.sh
 #
-# Installs the app as a location block inside nginx's existing default server.
-# The app is reachable at:  http://<host>/rf-analyzer/index.html
+# Installs the app as a location block inside the nginx server for TARGET_HOST.
+# The app is reachable at:  http://TARGET_HOST/rf-analyzer/index.html
 #
-# NOTE: The app uses top-level paths /static/ and /api/.  If your nginx server
-# already serves content at those paths, those locations will conflict.
+# NOTE: The app uses top-level paths /static/ and /api/.  Only deploy this
+# into a server block whose other locations don't already use those paths
+# (e.g. don't share a vhost with CourseSentry, which owns /api/ at its root).
 set -euo pipefail
 
 INSTALL_DIR="/srv/rfanalysis"
 SERVICE_NAME="rf-coverage-analyzer"
 SNIPPET="/etc/nginx/snippets/$SERVICE_NAME.conf"
-APP_URL="http://$(hostname -I | awk '{print $1}')/rf-analyzer/index.html"
+TARGET_HOST="${RF_ANALYZER_HOST:-apps.k7swi.org}"
+APP_URL="http://${TARGET_HOST}/rf-analyzer/index.html"
 
 echo "=== RF Coverage Analyzer -- $([ -d "$INSTALL_DIR" ] && echo 'Update' || echo 'Fresh install') ==="
 
@@ -66,31 +68,28 @@ echo "[5/6] Configuring nginx..."
 mkdir -p /etc/nginx/snippets
 cp "$INSTALL_DIR/nginx.conf" "$SNIPPET"
 
-# Find the nginx server config that is listening on port 80.
-# Prefer the default site; fall back to the first enabled site.
+# Find the nginx server config that already handles TARGET_HOST.
+# Never fall back to "default" or "first enabled site" -- a wrong guess here
+# means this snippet's top-level /api/ and /static/ locations silently
+# shadow another app's routes on whatever vhost gets picked.
 NGINX_SITE=""
-for candidate in \
-    /etc/nginx/sites-enabled/default \
-    $(ls /etc/nginx/sites-enabled/ 2>/dev/null | head -1 | sed "s|^|/etc/nginx/sites-enabled/|")
-do
-    if [ -f "$candidate" ] || [ -L "$candidate" ]; then
-        NGINX_SITE="$(realpath "$candidate")"
-        break
-    fi
-done
+MATCH=$(grep -rl "server_name[[:space:]].*${TARGET_HOST}" /etc/nginx/sites-enabled/ 2>/dev/null | head -1)
+if [ -n "$MATCH" ]; then
+    NGINX_SITE="$(realpath "$MATCH")"
+fi
 
 if [ -z "$NGINX_SITE" ]; then
-    # No existing server config -- create a minimal one
-    NGINX_SITE="/etc/nginx/sites-available/default"
-    cat > "$NGINX_SITE" << 'SITEOF'
+    # No existing server block for this host -- create one
+    NGINX_SITE="/etc/nginx/sites-available/${TARGET_HOST}"
+    cat > "$NGINX_SITE" << SITEOF
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
+    listen 80;
+    listen [::]:80;
+    server_name ${TARGET_HOST};
 }
 SITEOF
-    ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/default
-    echo "  Created minimal default site at $NGINX_SITE"
+    ln -sf "$NGINX_SITE" "/etc/nginx/sites-enabled/${TARGET_HOST}"
+    echo "  Created site for ${TARGET_HOST} at $NGINX_SITE"
 fi
 
 # Inject the include line inside the server block if not already present
