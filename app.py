@@ -1615,7 +1615,9 @@ def get_csv(filename: str):
     p = CSV_DIR / secure_filename(filename)
     if not p.exists():
         return jsonify({"error": "Not found"}), 404
-    return jsonify({"columns": CSV_COLUMNS, "rows": parse_csv_file(p)})
+    resp = jsonify({"columns": CSV_COLUMNS, "rows": parse_csv_file(p)})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/csv/<filename>", methods=["PUT"])

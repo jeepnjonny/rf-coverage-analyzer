@@ -558,7 +558,7 @@ async function loadCsvForEditor(name) {
   emptyEl.textContent   = 'Loading…';
   wrapEl.classList.add('hidden');
   try {
-    const res  = await fetch(`/api/csv/${encodeURIComponent(name)}`);
+    const res  = await fetch(`/api/csv/${encodeURIComponent(name)}`, { cache: 'no-store' });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     fm.editorFile = name;
@@ -650,7 +650,7 @@ async function loadFmCsv() {
   // Use editor rows if already loaded for this file, otherwise fetch
   let rows = (fm.editorFile === name) ? fm.editorRows : null;
   if (!rows) {
-    const res  = await fetch(`/api/csv/${encodeURIComponent(name)}`);
+    const res  = await fetch(`/api/csv/${encodeURIComponent(name)}`, { cache: 'no-store' });
     const data = await res.json();
     if (data.error) { alert(data.error); return; }
     rows = data.rows;
@@ -2434,9 +2434,11 @@ document.getElementById('add-rx-confirm').addEventListener('click', async () => 
       });
       const data = await res.json();
       if (data.ok) {
-        // Keep file manager editor in sync
-        fm.editorFile = state.csvFile;
-        fm.editorRows = state.receivers.map(r => ({ ...r }));
+        // Keep file manager editor in sync, but only if it's showing this file
+        if (fm.editorFile === state.csvFile) {
+          fm.editorRows = state.receivers.map(r => ({ ...r }));
+          renderFmEditorTable();
+        }
         setStatus(`Added ${newRx.name} and saved to ${state.csvFile}.`);
       } else {
         setStatus(`Added ${newRx.name} — save failed, check server logs.`);
@@ -3376,8 +3378,12 @@ document.getElementById('edit-rx-save').addEventListener('click', async () => {
     });
     const data = await res.json();
     if (data.ok) {
-      fm.editorFile = state.csvFile;
-      fm.editorRows = state.receivers.map(r => ({ ...r }));
+      // Only sync the FM editor cache if it's currently showing this same
+      // file — otherwise we'd clobber unsaved edits on a different file.
+      if (fm.editorFile === state.csvFile) {
+        fm.editorRows = state.receivers.map(r => ({ ...r }));
+        renderFmEditorTable();
+      }
       setStatus(`${rx.name} saved to ${state.csvFile}.`);
     } else {
       setStatus(`${rx.name} updated in memory — CSV save failed.`);
