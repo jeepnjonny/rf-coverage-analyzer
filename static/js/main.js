@@ -183,10 +183,12 @@ map.on('mousemove', e => {
   onCursorMove(lat, lon);
 });
 map.on('mouseout', () => {
-  document.getElementById('info-gps').textContent    = '—';
-  document.getElementById('info-elev').textContent   = '—';
-  document.getElementById('info-signal').textContent = '—';
-  document.getElementById('info-signal').style.color = '';
+  document.getElementById('info-gps').textContent         = '—';
+  document.getElementById('info-elev').textContent        = '—';
+  document.getElementById('info-signal').textContent      = '—';
+  document.getElementById('info-signal').style.color      = '';
+  document.getElementById('info-heat-signal').textContent = '—';
+  document.getElementById('info-heat-signal').style.color = '';
   // Delay hiding the signal panel so cursor can slide onto it without it vanishing
   _signalHideTimer = setTimeout(() => {
     document.getElementById('map-signal-panel').classList.add('hidden');
@@ -224,6 +226,25 @@ function onCursorMove(lat, lon) {
     sigEl.textContent = '—';
     sigEl.style.color = '';
     document.getElementById('map-signal-panel').classList.add('hidden');
+  }
+
+  // --- Predicted signal from nearest heat map cell (shown alongside the
+  // track signal above, not instead of it, so both are visible when both
+  // a track analysis and a heat map are active) ---
+  const hc     = findNearestHeatCell(lat, lon);
+  const heatEl = document.getElementById('info-heat-signal');
+  if (hc) {
+    if (hc.coverage) {
+      const name = state.receivers[hc.best_rx_idx]?.name || `RX${hc.best_rx_idx + 1}`;
+      heatEl.textContent = `${hc.best_rssi} dBm (${name})`;
+      heatEl.style.color = rxColor(hc.best_rx_idx);
+    } else {
+      heatEl.textContent = hc.hard_fail ? 'No signal · blocked' : 'No signal · faded';
+      heatEl.style.color = hc.hard_fail ? 'var(--danger)' : 'var(--text-dim)';
+    }
+  } else {
+    heatEl.textContent = '—';
+    heatEl.style.color = '';
   }
 
   // --- Elevation (debounced) ---
@@ -304,6 +325,21 @@ function findNearestResult(lat, lon) {
   }
   // Only show if cursor is within ~500 m (≈ 0.005°)
   return bestD < 2.5e-5 ? best : null;
+}
+
+function findNearestHeatCell(lat, lon) {
+  if (!state.heatMapResults.length) return null;
+  let best = null, bestD = Infinity;
+  for (const c of state.heatMapResults) {
+    const d = (c.lat - lat) ** 2 + (c.lon - lon) ** 2;
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  // Cutoff scales with the grid spacing (roughly one cell's footprint) rather
+  // than a fixed distance -- heat map spacing ranges from 25 m to 400 m across
+  // resolution tiers, unlike the ~fixed spacing of interpolated track points.
+  const spacingM  = state.heatMapSpacingM || 200;
+  const degThresh = (spacingM * 0.75) / 111_320;
+  return bestD < degThresh ** 2 ? best : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2627,6 +2663,8 @@ state.heatMapLayer     = L.layerGroup().addTo(map);   // true-footprint colored 
 state.heatMapRunning   = false;
 state.heatMapAbortCtrl = null;
 state.heatMapStartTime = null;   // for time-remaining estimate
+state.heatMapResults   = [];     // flat cell array, for cursor-signal lookup
+state.heatMapSpacingM  = null;   // meters; nearest-cell lookup distance cutoff
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -3643,6 +3681,15 @@ function _hmFmtRemaining(secs) {
   return `${mm}:${ss}`;
 }
 
+// Show/hide the "Heat" field in the cursor info bar based on whether any
+// heat map data currently exists to look up (independent of the "Signal"
+// field above it, so both a track analysis and a heat map can show at once).
+function _hmUpdateInfoBarVisibility() {
+  const hasHeat = state.heatMapResults.length > 0;
+  document.getElementById('info-heat-sep').classList.toggle('hidden', !hasHeat);
+  document.getElementById('info-heat-group').classList.toggle('hidden', !hasHeat);
+}
+
 async function _hmGenerate() {
   if (state.heatMapRunning) { state.heatMapAbortCtrl?.abort(); return; }
   if (!state.receivers || state.receivers.length === 0) {
@@ -3673,6 +3720,9 @@ async function _hmGenerate() {
   state.heatMapRunning   = true;
   state.heatMapAbortCtrl = new AbortController();
   state.heatMapStartTime = null;
+  state.heatMapResults   = [];
+  state.heatMapSpacingM  = null;
+  _hmUpdateInfoBarVisibility();
   checkReady();
   _hmSetUI({ progressVisible: true, label: 'Initializing…', pct: 0, status: '', summaryHtml: '' });
 
@@ -3700,6 +3750,7 @@ async function _hmGenerate() {
           if (evt.type === 'grid_info') {
             spacingM = evt.spacing_m;
             totalCt  = evt.total;
+            state.heatMapSpacingM = evt.spacing_m;
           } else if (evt.type === 'status') {
             _hmSetUI({ label: evt.message, status: evt.message });
           } else if (evt.type === 'elev_progress') {
@@ -3709,6 +3760,7 @@ async function _hmGenerate() {
           } else if (evt.type === 'area_batch') {
             if (!state.heatMapStartTime) state.heatMapStartTime = Date.now();
             for (const c of evt.cells) {
+              state.heatMapResults.push(c);
               if (c.coverage) {
                 const margin = Math.max(0, Math.min(1, (c.best_rssi - threshold) / 30));
                 const color  = _hmColor(margin);
@@ -3717,6 +3769,7 @@ async function _hmGenerate() {
                 }).addTo(state.heatMapLayer);
               }
             }
+            _hmUpdateInfoBarVisibility();
             let label = `Processing ${evt.done}/${evt.total} cells…`;
             const elapsed = (Date.now() - state.heatMapStartTime) / 1000;
             if (elapsed > 4 && evt.done > 20) {
@@ -3727,6 +3780,7 @@ async function _hmGenerate() {
             _hmSetUI({ label, pct: 20 + Math.min(80, (evt.done / evt.total) * 80) });
           } else if (evt.type === 'complete') {
             coveredCt = evt.covered; totalCt = evt.total; spacingM = evt.spacing_m;
+            state.heatMapSpacingM = evt.spacing_m;
           } else if (evt.type === 'error') {
             errored = true;
             _hmSetUI({ status: `Heat map error: ${evt.message}`, summaryHtml: '' });
@@ -3760,8 +3814,11 @@ async function _hmGenerate() {
 
 function _hmClear() {
   state.heatMapAbortCtrl?.abort();
-  state.heatMapRunning = false;
+  state.heatMapRunning  = false;
+  state.heatMapResults  = [];
+  state.heatMapSpacingM = null;
   state.heatMapLayer.clearLayers();
+  _hmUpdateInfoBarVisibility();
   _hmSetUI({ progressVisible: false, status: '', summaryHtml: '' });
   checkReady();
   updateLegend();
