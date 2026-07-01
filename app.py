@@ -4134,14 +4134,31 @@ def _make_rect_grid(
     ne_lat: float, ne_lon: float,
     spacing_m: float,
 ) -> list[tuple[float, float]]:
-    """Return lat/lon points on a uniform rectangular grid inside the given bounds."""
-    mid_lat  = (sw_lat + ne_lat) / 2.0
+    """Return lat/lon points on a grid covering the given bounds, anchored to a
+    fixed lattice (multiples of lat_step/lon_step from the equator/meridian)
+    rather than the bounds' own corner. This keeps cell boundaries identical
+    across repeated calls at the same spacing regardless of where the viewport
+    happens to sit, so heat maps generated over overlapping areas tile
+    together instead of each having an arbitrary, pan-dependent offset.
+    """
+    mid_lat = (sw_lat + ne_lat) / 2.0
+    # Quantize the reference latitude used for lon_step (nearest whole degree,
+    # ~111 km bands) instead of the viewport's exact mid_lat. lon0 is ~105
+    # degrees of longitude (tens of thousands of steps) from the anchor at
+    # lon=0, so even a sub-1e-6-degree difference in lon_step between two
+    # calls -- which raw mid_lat would produce for any two slightly different
+    # viewports -- accumulates over that many steps into a full misaligned
+    # lattice. Sharing one lon_step per latitude band keeps regenerated grids
+    # over the same region bit-for-bit aligned.
+    ref_lat  = round(mid_lat)
     lat_step = spacing_m / 111_320.0
-    lon_step = spacing_m / (111_320.0 * max(1e-6, math.cos(math.radians(mid_lat))))
+    lon_step = spacing_m / (111_320.0 * max(1e-6, math.cos(math.radians(ref_lat))))
+    lat0 = math.floor(sw_lat / lat_step) * lat_step
+    lon0 = math.floor(sw_lon / lon_step) * lon_step
     pts: list[tuple[float, float]] = []
-    lat = sw_lat
+    lat = lat0
     while lat <= ne_lat:
-        lon = sw_lon
+        lon = lon0
         while lon <= ne_lon:
             pts.append((_rc(lat), _rc(lon)))
             lon += lon_step
