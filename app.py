@@ -4258,15 +4258,19 @@ def link_coverage():
 # wins, same as the per-track-point analysis in /api/analyze.
 # ---------------------------------------------------------------------------
 
-# Base grid spacing per resolution tier, further coarsened if the estimated
-# work (cells × enabled receivers) exceeds AREA_COVERAGE_WORK_BUDGET — each
-# cell costs one terrain profile per receiver, so cost scales with both.
+# Grid spacing per resolution tier. Cost is one terrain profile per cell per
+# enabled receiver, so a request is rejected outright (not silently coarsened)
+# if the estimated cells × enabled-receiver-count exceeds AREA_COVERAGE_MAX_WORK
+# — the caller picked a resolution on purpose; changing it for them produced
+# confusing, inconsistent-looking results across zoom levels.
 AREA_COVERAGE_RESOLUTION_M: dict[str, float] = {
     "fast":     400.0,
     "balanced": 200.0,
     "detailed": 100.0,
+    "fine":      50.0,
+    "ultra":     25.0,
 }
-AREA_COVERAGE_WORK_BUDGET = 40_000   # target cells × enabled-receiver-count
+AREA_COVERAGE_MAX_WORK    = 150_000   # hard cap: cells × enabled-receiver-count
 AREA_COVERAGE_MAX_SPAN_M  = 60_000.0  # reject viewports wider/taller than this
 
 
@@ -4310,12 +4314,21 @@ def area_coverage():
             enabled_ct = sum(1 for rx in receivers if str(rx.get("enabled", "1")).strip() != "0")
 
             spacing_m = AREA_COVERAGE_RESOLUTION_M.get(resolution, 200.0)
+            grid_pts  = _make_rect_grid(sw_lat, sw_lon, ne_lat, ne_lon, spacing_m)
+            total     = len(grid_pts)
+            est_work  = total * enabled_ct
 
-            def _cell_estimate(sp: float) -> int:
-                return (max(1, int(width_m / sp) + 1)) * (max(1, int(height_m / sp) + 1))
+            if est_work > AREA_COVERAGE_MAX_WORK:
+                yield sse({"type": "error",
+                           "message": f"This view at '{resolution}' resolution would need "
+                                      f"~{total:,} cells × {enabled_ct} receiver(s) ≈ "
+                                      f"{est_work:,} calculations — too many to compute. "
+                                      f"Zoom in, pick a coarser resolution, or disable some "
+                                      f"receivers, then try again."})
+                return
 
-            while _cell_estimate(spacing_m) * enabled_ct > AREA_COVERAGE_WORK_BUDGET and spacing_m < 2000.0:
-                spacing_m *= 1.5
+            yield sse({"type": "grid_info", "total": total, "spacing_m": spacing_m,
+                       "enabled_receivers": enabled_ct})
 
             yield sse({"type": "status", "message": "Prefetching terrain tiles…"})
             _prog = [0, 1]
@@ -4350,11 +4363,7 @@ def area_coverage():
                 except StopIteration as _lsi:
                     _, viable_w1_idxs = _lsi.value
 
-            grid_pts = _make_rect_grid(sw_lat, sw_lon, ne_lat, ne_lon, spacing_m)
-            total    = len(grid_pts)
-            yield sse({"type": "status",
-                       "message": f"Analyzing {total} cells × {enabled_ct} receiver(s) "
-                                  f"(spacing ≈ {spacing_m:.0f} m)…"})
+            yield sse({"type": "status", "message": "Analyzing area…"})
 
             args_list = [
                 (gi, glat, glon, receivers,

@@ -1011,7 +1011,7 @@ function updateLegend() {
   const hasIaTrackPrev   = state.iaTrackPreviewLayer && state.iaTrackPreviewLayer.getLayers().length > 0;
   const hasIaHeat        = !!state.iaHeatLayer;
   const hasLinkCov       = state.linkCovLayer && state.linkCovLayer.getLayers().length > 0;
-  const hasHeatMap       = !!state.heatMapLayer;
+  const hasHeatMap       = state.heatMapLayer && state.heatMapLayer.getLayers().length > 0;
   if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack && !hasIaCandidates
       && !hasIaRoads && !hasIaExclusions && !hasIaHotZones && !hasIaTrackPrev
       && !hasIaHeat && !hasLinkCov && !hasHeatMap) {
@@ -2623,9 +2623,10 @@ state.linkCovMarker    = null;
 state.linkCovRunning   = false;
 state.linkCovAbortCtrl = null;
 // Area heat map (network coverage across the visible viewport)
-state.heatMapLayer     = null;   // L.heatLayer, created fresh on each run
+state.heatMapLayer     = L.layerGroup().addTo(map);   // true-footprint colored cells
 state.heatMapRunning   = false;
 state.heatMapAbortCtrl = null;
+state.heatMapStartTime = null;   // for time-remaining estimate
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -3610,6 +3611,38 @@ function _hmSetUI({ progressVisible, label, pct, status, summaryHtml } = {}) {
   }
 }
 
+// 3-stop gradient (weak → strong), matching the app's existing RF-score
+// heat overlay colors, evaluated per-cell instead of screen-space blurred.
+function _hmColor(t) {
+  const stops = [[0, 33, 150, 243], [0.3, 33, 150, 243], [0.6, 255, 152, 0], [1, 244, 67, 54]];
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < stops.length; i++) {
+    const [t0, r0, g0, b0] = stops[i - 1];
+    const [t1, r1, g1, b1] = stops[i];
+    if (t <= t1) {
+      const f = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+      return `rgb(${Math.round(r0 + (r1 - r0) * f)},${Math.round(g0 + (g1 - g0) * f)},${Math.round(b0 + (b1 - b0) * f)})`;
+    }
+  }
+  return 'rgb(244,67,54)';
+}
+
+// True-footprint rectangle for one grid cell, sized to the analysis spacing
+// in real-world meters rather than a fixed pixel radius, so the same cell
+// always covers the same ground area -- no reflow/reinterpretation on zoom.
+function _hmCellBounds(lat, lon, spacingM) {
+  const dLat = (spacingM / 111320) / 2;
+  const dLon = (spacingM / (111320 * Math.cos(lat * Math.PI / 180))) / 2;
+  return [[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]];
+}
+
+function _hmFmtRemaining(secs) {
+  secs = Math.max(0, Math.round(secs));
+  const mm = String(Math.floor(secs / 60)).padStart(2, '0');
+  const ss = String(secs % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
 async function _hmGenerate() {
   if (state.heatMapRunning) { state.heatMapAbortCtrl?.abort(); return; }
   if (!state.receivers || state.receivers.length === 0) {
@@ -3633,11 +3666,13 @@ async function _hmGenerate() {
   };
   const threshold = params.sensitivity_dbm + params.fade_margin_db;
 
-  if (state.heatMapLayer) { map.removeLayer(state.heatMapLayer); state.heatMapLayer = null; }
-  const heatPts = [];
+  state.heatMapLayer.clearLayers();
+  const canvasR = L.canvas({ padding: 0.5 });
+  let spacingM  = null;
 
   state.heatMapRunning   = true;
   state.heatMapAbortCtrl = new AbortController();
+  state.heatMapStartTime = null;
   checkReady();
   _hmSetUI({ progressVisible: true, label: 'Initializing…', pct: 0, status: '', summaryHtml: '' });
 
@@ -3651,7 +3686,7 @@ async function _hmGenerate() {
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
-    let coveredCt = 0, totalCt = 0, spacingM = 0;
+    let coveredCt = 0, totalCt = 0, errored = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -3662,48 +3697,57 @@ async function _hmGenerate() {
         if (!line.startsWith('data: ')) continue;
         try {
           const evt = JSON.parse(line.slice(6));
-          if (evt.type === 'status') {
+          if (evt.type === 'grid_info') {
+            spacingM = evt.spacing_m;
+            totalCt  = evt.total;
+          } else if (evt.type === 'status') {
             _hmSetUI({ label: evt.message, status: evt.message });
           } else if (evt.type === 'elev_progress') {
             if (evt.total > 0) {
               _hmSetUI({ label: evt.message, pct: Math.min(20, (evt.current / evt.total) * 20) });
             }
           } else if (evt.type === 'area_batch') {
+            if (!state.heatMapStartTime) state.heatMapStartTime = Date.now();
             for (const c of evt.cells) {
               if (c.coverage) {
                 const margin = Math.max(0, Math.min(1, (c.best_rssi - threshold) / 30));
-                heatPts.push([c.lat, c.lon, margin]);
+                const color  = _hmColor(margin);
+                L.rectangle(_hmCellBounds(c.lat, c.lon, spacingM || 200), {
+                  color, weight: 0, fillColor: color, fillOpacity: 0.55, renderer: canvasR,
+                }).addTo(state.heatMapLayer);
               }
             }
-            _hmSetUI({
-              label: `Analyzing area… ${evt.done}/${evt.total} cells`,
-              pct:   20 + Math.min(80, (evt.done / evt.total) * 80),
-            });
+            let label = `Processing ${evt.done}/${evt.total} cells…`;
+            const elapsed = (Date.now() - state.heatMapStartTime) / 1000;
+            if (elapsed > 4 && evt.done > 20) {
+              const rate     = evt.done / elapsed;
+              const secsLeft = (evt.total - evt.done) / rate;
+              label += ` ${_hmFmtRemaining(secsLeft)} remaining`;
+            }
+            _hmSetUI({ label, pct: 20 + Math.min(80, (evt.done / evt.total) * 80) });
           } else if (evt.type === 'complete') {
             coveredCt = evt.covered; totalCt = evt.total; spacingM = evt.spacing_m;
           } else if (evt.type === 'error') {
-            _hmSetUI({ status: `Heat map error: ${evt.message.split('\n')[0]}` });
+            errored = true;
+            _hmSetUI({ status: `Heat map error: ${evt.message}`, summaryHtml: '' });
           }
         } catch { /* ignore parse errors */ }
       }
     }
 
-    if (heatPts.length > 0) {
-      state.heatMapLayer = L.heatLayer(heatPts, {
-        radius: 35, blur: 25, maxZoom: 15,
-        gradient: { 0.3: '#2196f3', 0.6: '#ff9800', 1.0: '#f44336' },
-        max: 1.0,
-      }).addTo(map);
+    if (errored) {
+      _hmSetUI({ progressVisible: false });
+    } else {
+      const pct = totalCt > 0 ? ((coveredCt / totalCt) * 100).toFixed(1) : '0';
+      _hmSetUI({
+        progressVisible: false,
+        status: `Heat map: ${pct}% of visible area covered.`,
+        summaryHtml:
+          `<span class="ia-summary-stat">Covered: <strong>${pct}%</strong></span>` +
+          `<span class="ia-summary-stat">Cells: <strong>${totalCt}</strong></span>` +
+          `<span class="ia-summary-stat">Spacing: <strong>${(spacingM || 0).toFixed(0)} m</strong></span>`,
+      });
     }
-    const pct = totalCt > 0 ? ((coveredCt / totalCt) * 100).toFixed(1) : '0';
-    _hmSetUI({
-      progressVisible: false,
-      status: `Heat map: ${pct}% of visible area covered.`,
-      summaryHtml:
-        `<span class="ia-summary-stat">Covered: <strong>${pct}%</strong></span>` +
-        `<span class="ia-summary-stat">Cells: <strong>${totalCt}</strong></span>` +
-        `<span class="ia-summary-stat">Spacing: <strong>${spacingM.toFixed(0)} m</strong></span>`,
-    });
   } catch (err) {
     if (err.name !== 'AbortError') _hmSetUI({ status: `Heat map failed: ${err.message}` });
     _hmSetUI({ progressVisible: false });
@@ -3717,7 +3761,7 @@ async function _hmGenerate() {
 function _hmClear() {
   state.heatMapAbortCtrl?.abort();
   state.heatMapRunning = false;
-  if (state.heatMapLayer) { map.removeLayer(state.heatMapLayer); state.heatMapLayer = null; }
+  state.heatMapLayer.clearLayers();
   _hmSetUI({ progressVisible: false, status: '', summaryHtml: '' });
   checkReady();
   updateLegend();
