@@ -1123,8 +1123,15 @@ function updateLegend() {
   }
   if (hasHeatMap) {
     if (lines.length) lines.push('<div class="legend-sep"></div>');
+    const _hmSens   = parseFloat(document.getElementById('rx-sens').value)     || -135;
+    const _hmFade   = parseFloat(document.getElementById('fade-margin').value) || 0;
+    const _hmThresh = _hmSens + _hmFade;
     lines.push('<div class="legend-title">Coverage Heat Map</div>');
-    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:linear-gradient(90deg,#2196f3,#ff9800,#f44336)"></div><span>Signal margin (weak → strong)</span></div>');
+    lines.push(`<div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">Margin above your ${_hmThresh} dBm threshold (sensitivity + fade margin)</div>`);
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#2196f3"></div><span>0–10 dB — weak, near threshold</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:linear-gradient(90deg,#2196f3,#ff9800)"></div><span>10–20 dB — moderate margin</span></div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:linear-gradient(90deg,#ff9800,#f44336)"></div><span>20–30+ dB — strong margin</span></div>');
+    lines.push('<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Uncovered / blocked cells are left transparent</div>');
   }
   el.innerHTML = lines.join('');
   if (document.getElementById('tab-hardware')?.classList.contains('active')) renderHardwareTab();
@@ -3651,8 +3658,11 @@ function _hmSetUI({ progressVisible, label, pct, status, summaryHtml } = {}) {
 
 // 3-stop gradient (weak → strong), matching the app's existing RF-score
 // heat overlay colors, evaluated per-cell instead of screen-space blurred.
+// Stops land on clean 10 dB bands of the 0-30 dB margin range (see the
+// "Coverage Heat Map" legend in updateLegend()): 0-10 dB blue, 10-20 dB
+// blue->orange, 20-30 dB orange->red.
 function _hmColor(t) {
-  const stops = [[0, 33, 150, 243], [0.3, 33, 150, 243], [0.6, 255, 152, 0], [1, 244, 67, 54]];
+  const stops = [[0, 33, 150, 243], [1 / 3, 33, 150, 243], [2 / 3, 255, 152, 0], [1, 244, 67, 54]];
   t = Math.max(0, Math.min(1, t));
   for (let i = 1; i < stops.length; i++) {
     const [t0, r0, g0, b0] = stops[i - 1];
