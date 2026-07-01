@@ -1011,9 +1011,10 @@ function updateLegend() {
   const hasIaTrackPrev   = state.iaTrackPreviewLayer && state.iaTrackPreviewLayer.getLayers().length > 0;
   const hasIaHeat        = !!state.iaHeatLayer;
   const hasLinkCov       = state.linkCovLayer && state.linkCovLayer.getLayers().length > 0;
+  const hasHeatMap       = !!state.heatMapLayer;
   if (!hasRx && !hasCoverage && !hasIa && !hasIaTrack && !hasIaCandidates
       && !hasIaRoads && !hasIaExclusions && !hasIaHotZones && !hasIaTrackPrev
-      && !hasIaHeat && !hasLinkCov) {
+      && !hasIaHeat && !hasLinkCov && !hasHeatMap) {
     el.style.display = 'none'; return;
   }
   el.style.display = '';
@@ -1083,6 +1084,11 @@ function updateLegend() {
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#4caf50"></div><span>Strong link (&gt;15 dB margin)</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ffeb3b"></div><span>Good link (5–15 dB)</span></div>');
     lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:#ff9800"></div><span>Marginal link (0–5 dB)</span></div>');
+  }
+  if (hasHeatMap) {
+    if (lines.length) lines.push('<div class="legend-sep"></div>');
+    lines.push('<div class="legend-title">Coverage Heat Map</div>');
+    lines.push('<div class="legend-entry"><div class="legend-swatch" style="background:linear-gradient(90deg,#2196f3,#ff9800,#f44336)"></div><span>Signal margin (weak → strong)</span></div>');
   }
   el.innerHTML = lines.join('');
   if (document.getElementById('tab-hardware')?.classList.contains('active')) renderHardwareTab();
@@ -2616,6 +2622,10 @@ state.linkCovLayer     = L.layerGroup().addTo(map);
 state.linkCovMarker    = null;
 state.linkCovRunning   = false;
 state.linkCovAbortCtrl = null;
+// Area heat map (network coverage across the visible viewport)
+state.heatMapLayer     = null;   // L.heatLayer, created fresh on each run
+state.heatMapRunning   = false;
+state.heatMapAbortCtrl = null;
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -3579,6 +3589,162 @@ window._clearLinkCov = function () {
   updateLegend();
 };
 
+// ---------------------------------------------------------------------------
+// Area heat map — network coverage across the visible viewport, scored
+// against ALL enabled receivers (not tied to any loaded track/roads/trails)
+// ---------------------------------------------------------------------------
+
+function _hmSetUI({ progressVisible, label, pct, status, summaryHtml } = {}) {
+  const progressEl = document.getElementById('hm-progress-container');
+  const labelEl    = document.getElementById('hm-progress-label');
+  const barEl      = document.getElementById('hm-progress-bar');
+  const statusEl   = document.getElementById('hm-status-msg');
+  const summaryEl  = document.getElementById('hm-summary-bar');
+  if (progressVisible !== undefined) progressEl.classList.toggle('hidden', !progressVisible);
+  if (label       !== undefined) labelEl.textContent = label;
+  if (pct         !== undefined) barEl.style.width = `${pct}%`;
+  if (status      !== undefined) statusEl.textContent = status;
+  if (summaryHtml !== undefined) {
+    summaryEl.innerHTML = summaryHtml;
+    summaryEl.classList.toggle('hidden', !summaryHtml);
+  }
+}
+
+async function _hmGenerate() {
+  if (state.heatMapRunning) { state.heatMapAbortCtrl?.abort(); return; }
+  if (!state.receivers || state.receivers.length === 0) {
+    _hmSetUI({ status: 'Load a receivers CSV first.' });
+    return;
+  }
+
+  const b      = map.getBounds();
+  const params = {
+    sw_lat: b.getSouth(), sw_lon: b.getWest(),
+    ne_lat: b.getNorth(), ne_lon: b.getEast(),
+    resolution:      document.getElementById('hm-resolution').value,
+    freq_mhz:        parseFloat(document.getElementById('freq-select').value)   || 433,
+    tx_power_dbm:    parseFloat(document.getElementById('tx-power').value)      || 22,
+    tx_gain_dbi:     parseFloat(document.getElementById('tx-gain').value)       || 0,
+    sensitivity_dbm: parseFloat(document.getElementById('rx-sens').value)       || -135,
+    veg_type:        document.getElementById('veg-loss').value                 || 'none',
+    fade_margin_db:  parseFloat(document.getElementById('fade-margin').value)   || 0,
+    chain_mode:      document.getElementById('chain-mode-toggle').checked,
+    receivers:       state.receivers,
+  };
+  const threshold = params.sensitivity_dbm + params.fade_margin_db;
+
+  if (state.heatMapLayer) { map.removeLayer(state.heatMapLayer); state.heatMapLayer = null; }
+  const heatPts = [];
+
+  state.heatMapRunning   = true;
+  state.heatMapAbortCtrl = new AbortController();
+  checkReady();
+  _hmSetUI({ progressVisible: true, label: 'Initializing…', pct: 0, status: '', summaryHtml: '' });
+
+  try {
+    const res = await fetch('/api/area-coverage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(params),
+      signal:  state.heatMapAbortCtrl.signal,
+    });
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let coveredCt = 0, totalCt = 0, spacingM = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'status') {
+            _hmSetUI({ label: evt.message, status: evt.message });
+          } else if (evt.type === 'elev_progress') {
+            if (evt.total > 0) {
+              _hmSetUI({ label: evt.message, pct: Math.min(20, (evt.current / evt.total) * 20) });
+            }
+          } else if (evt.type === 'area_batch') {
+            for (const c of evt.cells) {
+              if (c.coverage) {
+                const margin = Math.max(0, Math.min(1, (c.best_rssi - threshold) / 30));
+                heatPts.push([c.lat, c.lon, margin]);
+              }
+            }
+            _hmSetUI({
+              label: `Analyzing area… ${evt.done}/${evt.total} cells`,
+              pct:   20 + Math.min(80, (evt.done / evt.total) * 80),
+            });
+          } else if (evt.type === 'complete') {
+            coveredCt = evt.covered; totalCt = evt.total; spacingM = evt.spacing_m;
+          } else if (evt.type === 'error') {
+            _hmSetUI({ status: `Heat map error: ${evt.message.split('\n')[0]}` });
+          }
+        } catch { /* ignore parse errors */ }
+      }
+    }
+
+    if (heatPts.length > 0) {
+      state.heatMapLayer = L.heatLayer(heatPts, {
+        radius: 35, blur: 25, maxZoom: 15,
+        gradient: { 0.3: '#2196f3', 0.6: '#ff9800', 1.0: '#f44336' },
+        max: 1.0,
+      }).addTo(map);
+    }
+    const pct = totalCt > 0 ? ((coveredCt / totalCt) * 100).toFixed(1) : '0';
+    _hmSetUI({
+      progressVisible: false,
+      status: `Heat map: ${pct}% of visible area covered.`,
+      summaryHtml:
+        `<span class="ia-summary-stat">Covered: <strong>${pct}%</strong></span>` +
+        `<span class="ia-summary-stat">Cells: <strong>${totalCt}</strong></span>` +
+        `<span class="ia-summary-stat">Spacing: <strong>${spacingM.toFixed(0)} m</strong></span>`,
+    });
+  } catch (err) {
+    if (err.name !== 'AbortError') _hmSetUI({ status: `Heat map failed: ${err.message}` });
+    _hmSetUI({ progressVisible: false });
+  } finally {
+    state.heatMapRunning = false;
+    checkReady();
+    updateLegend();
+  }
+}
+
+function _hmClear() {
+  state.heatMapAbortCtrl?.abort();
+  state.heatMapRunning = false;
+  if (state.heatMapLayer) { map.removeLayer(state.heatMapLayer); state.heatMapLayer = null; }
+  _hmSetUI({ progressVisible: false, status: '', summaryHtml: '' });
+  checkReady();
+  updateLegend();
+}
+
+document.getElementById('hm-run-btn').addEventListener('click', _hmGenerate);
+document.getElementById('hm-clear-btn').addEventListener('click', _hmClear);
+
+// Gate the heat map button alongside the advisor button
+const _origCheckReadyHm = checkReady;
+checkReady = function () {
+  _origCheckReadyHm();
+  const hmBtn = document.getElementById('hm-run-btn');
+  if (hmBtn) {
+    if (state.heatMapRunning) {
+      hmBtn.textContent = '◼ Stop';
+      hmBtn.className   = 'btn btn-danger';
+      hmBtn.style.flex  = '1';
+    } else {
+      hmBtn.textContent = '▶ Generate Heat Map';
+      hmBtn.className   = 'btn btn-primary';
+      hmBtn.style.flex  = '1';
+      hmBtn.disabled    = !state.receivers || state.receivers.length === 0;
+    }
+  }
+};
+
 async function _iaTestLocation(latlng) {
   // Remove previous test
   state.iaTestLayer.clearLayers();
@@ -3967,7 +4133,7 @@ async function _iaImportReceivers() {
 }
 
 // Accordion toggles for collapsible panels
-['rf-params-toggle', 'ia-panel-toggle'].forEach(id => {
+['rf-params-toggle', 'ia-panel-toggle', 'heatmap-panel-toggle'].forEach(id => {
   const h3 = document.getElementById(id);
   if (h3) h3.addEventListener('click', () => h3.closest('.panel').classList.toggle('collapsed'));
 });

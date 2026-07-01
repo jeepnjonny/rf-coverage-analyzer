@@ -1871,6 +1871,110 @@ def _link_task(args: tuple) -> dict:
     }
 
 
+def _run_link_analysis(receivers, freq_mhz, sensitivity_dbm, fade_margin_db,
+                        veg_type, chain_mode, emit_links, pool):
+    """Run inter-receiver link analysis and, if chain_mode, derive the set of WIDE1
+    receivers with a viable backbone link to a WIDE2/iGate.
+
+    Generator: yields SSE-ready event dicts (status messages, and inter_rx results
+    when emit_links is True). Returns (link_results_cache, viable_w1_idxs) as the
+    generator's return value — capture it via `next()`/StopIteration, e.g.:
+
+        _gen = _run_link_analysis(...)
+        try:
+            while True:
+                yield sse(next(_gen))
+        except StopIteration as _si:
+            link_results_cache, viable_w1_idxs = _si.value
+
+    Shared by /api/analyze and /api/area-coverage so the backbone-viability logic
+    (and its rx1/rx2-index direction quirk, see below) isn't duplicated.
+    """
+    link_results_cache: list[dict] = []
+    viable_w1_idxs: frozenset[int] = frozenset()
+    if not (emit_links or chain_mode):
+        return link_results_cache, viable_w1_idxs
+
+    status_msg = (
+        "Building APRS backbone map for chain analysis…"
+        if chain_mode and not emit_links
+        else "Analyzing inter-receiver links…"
+    )
+    yield {"type": "status", "message": status_msg}
+    link_args = [
+        (i, rx1, j, rx2, freq_mhz, sensitivity_dbm, fade_margin_db, veg_type)
+        for i, rx1 in enumerate(receivers)
+        if str(rx1.get("enabled", "1")).strip() != "0"
+        for j, rx2 in enumerate(receivers)
+        if j > i and str(rx2.get("enabled", "1")).strip() != "0"
+    ]
+    _link_fmap: dict = {}
+    for _la in link_args:
+        try:
+            _link_fmap[pool.submit(_link_task, _la)] = _la
+        except Exception as _lse:
+            app.logger.warning("link submit failed: %s", _lse)
+    _link_pending = set(_link_fmap)
+    while _link_pending:
+        _lj_done, _link_pending = cf_wait(_link_pending, timeout=8)
+        if not _lj_done:
+            yield {"type": "status", "message": status_msg}
+            continue
+        for _lf in _lj_done:
+            try:
+                result = _lf.result()
+                link_results_cache.append(result)
+                if emit_links:
+                    yield result
+            except Exception as _le:
+                app.logger.warning("link task failed: %s", _le)
+
+    # Build the set of WIDE1 receivers with a viable backbone link to a terminal node.
+    #
+    # _link_task evaluates links as rx1→rx2 (rx1 = lower index, rx1 transmits).
+    # When WIDE1 has a higher index it becomes rx2, so the cached good_link reflects
+    # the terminal→WIDE1 direction (wrong for relay viability). For that case we
+    # re-derive the RSSI with WIDE1 as transmitter using the same cached path losses.
+    if chain_mode:
+        _w1: set[int] = set()
+        for _res in link_results_cache:
+            if _res.get("hard_fail"):
+                continue
+            _i, _j = _res["rx1_idx"], _res["rx2_idx"]
+            _r1 = (receivers[_i].get("role") or "").strip().lower()
+            _r2 = (receivers[_j].get("role") or "").strip().lower()
+
+            # Case A: WIDE1 is rx1 (lower index) — link was evaluated WIDE1→terminal ✓
+            if _r1 == "wide1" and _r2 in W1_RELAY_ROLES and _res.get("good_link"):
+                _w1.add(_i)
+
+            # Case B: WIDE1 is rx2 (higher index) — link was evaluated terminal→WIDE1 ✗
+            # Re-compute RSSI for the WIDE1→terminal direction using cached path losses.
+            if _r2 == "wide1" and _r1 in W1_RELAY_ROLES:
+                _pl   = fspl_db(freq_mhz, _res["dist_km"] * 1000)
+                _rssi = (
+                    float(receivers[_j].get("tx_power_dbm",    22) or 22)
+                    + float(receivers[_j].get("antenna_gain_dbi", 0) or 0)
+                    + float(receivers[_i].get("antenna_gain_dbi", 0) or 0)
+                    - _pl - _res["diff_db"] - _res["veg_db"]
+                )
+                if _rssi >= (sensitivity_dbm + fade_margin_db):
+                    _w1.add(_j)
+
+        viable_w1_idxs = frozenset(_w1)
+        if not any(
+            (rx.get("role") or "").strip().lower() in W1_RELAY_ROLES
+            for rx in receivers
+            if str(rx.get("enabled", "1")).strip() != "0"
+        ):
+            yield {"type": "status",
+                   "message": "⚠ Chain mode: no WIDE2 or iGate receivers found — "
+                              "WIDE1 fill-in digis cannot relay without a backbone node. "
+                              "Add receivers with role=wide2 or role=igate, or disable chain mode."}
+
+    return link_results_cache, viable_w1_idxs
+
+
 def _grid_link_task(args: tuple) -> dict:
     """Compute RF link viability from a fixed test point to one grid cell. Designed to run in a process pool."""
     (gi,
@@ -2253,86 +2357,18 @@ def analyze():
             # Always run when mode includes "links"/"both", OR when chain_mode is on
             # (need link results to determine which WIDE1s have backbone to WIDE2/iGate).
             link_results_cache: list[dict] = []
-            if mode in ("links", "both") or chain_mode:
-                status_msg = (
-                    "Building APRS backbone map for chain analysis…"
-                    if chain_mode and mode not in ("links", "both")
-                    else "Analyzing inter-receiver links…"
-                )
-                yield sse({"type": "status", "message": status_msg})
-                link_args = [
-                    (i, rx1, j, rx2, freq_mhz, sensitivity_dbm, fade_margin_db, veg_type)
-                    for i, rx1 in enumerate(receivers)
-                    if str(rx1.get("enabled", "1")).strip() != "0"
-                    for j, rx2 in enumerate(receivers)
-                    if j > i and str(rx2.get("enabled", "1")).strip() != "0"
-                ]
-                pool = _get_analysis_pool()
-                _link_fmap: dict = {}
-                for _la in link_args:
-                    try:
-                        _link_fmap[pool.submit(_link_task, _la)] = _la
-                    except Exception as _lse:
-                        app.logger.warning("link submit failed: %s", _lse)
-                _link_pending = set(_link_fmap)
-                while _link_pending:
-                    _lj_done, _link_pending = cf_wait(_link_pending, timeout=8)
-                    if not _lj_done:
-                        yield sse({"type": "status", "message": status_msg})
-                        continue
-                    for _lf in _lj_done:
-                        try:
-                            result = _lf.result()
-                            link_results_cache.append(result)
-                            if mode in ("links", "both"):
-                                yield sse(result)
-                        except Exception as _le:
-                            app.logger.warning("link task failed: %s", _le)
-
-            # Build the set of WIDE1 receivers with a viable backbone link to a terminal node.
-            # Used by _point_task when chain_mode is True.
-            #
-            # _link_task evaluates links as rx1→rx2 (rx1 = lower index, rx1 transmits).
-            # When WIDE1 has a higher index it becomes rx2, so the cached good_link reflects
-            # the terminal→WIDE1 direction (wrong for relay viability). For that case we
-            # re-derive the RSSI with WIDE1 as transmitter using the same cached path losses.
             viable_w1_idxs: frozenset[int] = frozenset()
-            if chain_mode:
-                _w1: set[int] = set()
-                for _res in link_results_cache:
-                    if _res.get("hard_fail"):
-                        continue
-                    _i, _j = _res["rx1_idx"], _res["rx2_idx"]
-                    _r1 = (receivers[_i].get("role") or "").strip().lower()
-                    _r2 = (receivers[_j].get("role") or "").strip().lower()
-
-                    # Case A: WIDE1 is rx1 (lower index) — link was evaluated WIDE1→terminal ✓
-                    if _r1 == "wide1" and _r2 in W1_RELAY_ROLES and _res.get("good_link"):
-                        _w1.add(_i)
-
-                    # Case B: WIDE1 is rx2 (higher index) — link was evaluated terminal→WIDE1 ✗
-                    # Re-compute RSSI for the WIDE1→terminal direction using cached path losses.
-                    if _r2 == "wide1" and _r1 in W1_RELAY_ROLES:
-                        _pl   = fspl_db(freq_mhz, _res["dist_km"] * 1000)
-                        _rssi = (
-                            float(receivers[_j].get("tx_power_dbm",    22) or 22)
-                            + float(receivers[_j].get("antenna_gain_dbi", 0) or 0)
-                            + float(receivers[_i].get("antenna_gain_dbi", 0) or 0)
-                            - _pl - _res["diff_db"] - _res["veg_db"]
-                        )
-                        if _rssi >= (sensitivity_dbm + fade_margin_db):
-                            _w1.add(_j)
-
-                viable_w1_idxs = frozenset(_w1)
-                if not any(
-                    (rx.get("role") or "").strip().lower() in W1_RELAY_ROLES
-                    for rx in receivers
-                    if str(rx.get("enabled", "1")).strip() != "0"
-                ):
-                    yield sse({"type": "status",
-                               "message": "⚠ Chain mode: no WIDE2 or iGate receivers found — "
-                                          "WIDE1 fill-in digis cannot relay without a backbone node. "
-                                          "Add receivers with role=wide2 or role=igate, or disable chain mode."})
+            if mode in ("links", "both") or chain_mode:
+                pool = _get_analysis_pool()
+                _lgen = _run_link_analysis(
+                    receivers, freq_mhz, sensitivity_dbm, fade_margin_db, veg_type,
+                    chain_mode, mode in ("links", "both"), pool,
+                )
+                try:
+                    while True:
+                        yield sse(next(_lgen))
+                except StopIteration as _lsi:
+                    link_results_cache, viable_w1_idxs = _lsi.value
 
             # ---- Per-path-point RF analysis ----
             if mode in ("track", "both"):
@@ -4093,6 +4129,26 @@ def _make_circle_grid(
     return pts
 
 
+def _make_rect_grid(
+    sw_lat: float, sw_lon: float,
+    ne_lat: float, ne_lon: float,
+    spacing_m: float,
+) -> list[tuple[float, float]]:
+    """Return lat/lon points on a uniform rectangular grid inside the given bounds."""
+    mid_lat  = (sw_lat + ne_lat) / 2.0
+    lat_step = spacing_m / 111_320.0
+    lon_step = spacing_m / (111_320.0 * max(1e-6, math.cos(math.radians(mid_lat))))
+    pts: list[tuple[float, float]] = []
+    lat = sw_lat
+    while lat <= ne_lat:
+        lon = sw_lon
+        while lon <= ne_lon:
+            pts.append((_rc(lat), _rc(lon)))
+            lon += lon_step
+        lat += lat_step
+    return pts
+
+
 @app.route("/api/link-coverage", methods=["POST"])
 def link_coverage():
     data             = request.get_json(force=True)
@@ -4182,6 +4238,180 @@ def link_coverage():
         except BaseException as exc:
             import traceback
             app.logger.exception("link-coverage SSE crashed: %r", exc)
+            try:
+                yield sse({"type": "error",
+                           "message": f"{exc!r}\n{traceback.format_exc()}"})
+            except Exception:
+                pass
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Area coverage heat map — network coverage across the visible viewport,
+# independent of any loaded track/roads/trails. Every grid cell is scored
+# against ALL enabled receivers (reusing _point_task) and the best result
+# wins, same as the per-track-point analysis in /api/analyze.
+# ---------------------------------------------------------------------------
+
+# Base grid spacing per resolution tier, further coarsened if the estimated
+# work (cells × enabled receivers) exceeds AREA_COVERAGE_WORK_BUDGET — each
+# cell costs one terrain profile per receiver, so cost scales with both.
+AREA_COVERAGE_RESOLUTION_M: dict[str, float] = {
+    "fast":     400.0,
+    "balanced": 200.0,
+    "detailed": 100.0,
+}
+AREA_COVERAGE_WORK_BUDGET = 40_000   # target cells × enabled-receiver-count
+AREA_COVERAGE_MAX_SPAN_M  = 60_000.0  # reject viewports wider/taller than this
+
+
+@app.route("/api/area-coverage", methods=["POST"])
+def area_coverage():
+    data            = request.get_json(force=True)
+    sw_lat          = float(data["sw_lat"])
+    sw_lon          = float(data["sw_lon"])
+    ne_lat          = float(data["ne_lat"])
+    ne_lon          = float(data["ne_lon"])
+    resolution      = data.get("resolution", "balanced")
+    freq_mhz        = float(data.get("freq_mhz",         915))
+    tx_power_dbm    = float(data.get("tx_power_dbm",      22))
+    tx_gain_dbi     = float(data.get("tx_gain_dbi",        0))
+    sensitivity_dbm = float(data.get("sensitivity_dbm", -135))
+    veg_type        = data.get("veg_type",              "none")
+    fade_margin_db  = float(data.get("fade_margin_db",     0))
+    chain_mode      = bool(data.get("chain_mode", False))
+    body_receivers  = data.get("receivers")   # list[dict] | None — live UI state
+
+    width_m  = haversine(sw_lat, sw_lon, sw_lat, ne_lon)
+    height_m = haversine(sw_lat, sw_lon, ne_lat, sw_lon)
+
+    def generate():
+        try:
+            if not body_receivers:
+                yield sse({"type": "error", "message": "No receivers loaded"}); return
+            receivers = body_receivers
+            if not any(str(rx.get("enabled", "1")).strip() != "0" for rx in receivers):
+                yield sse({"type": "error",
+                           "message": "All receivers are disabled — enable at least one in the CSV editor"})
+                return
+
+            if max(width_m, height_m) > AREA_COVERAGE_MAX_SPAN_M:
+                yield sse({"type": "error",
+                           "message": f"Visible area is too large "
+                                      f"({max(width_m, height_m) / 1000:.0f} km across) — "
+                                      f"zoom in further and try again"})
+                return
+
+            enabled_ct = sum(1 for rx in receivers if str(rx.get("enabled", "1")).strip() != "0")
+
+            spacing_m = AREA_COVERAGE_RESOLUTION_M.get(resolution, 200.0)
+
+            def _cell_estimate(sp: float) -> int:
+                return (max(1, int(width_m / sp) + 1)) * (max(1, int(height_m / sp) + 1))
+
+            while _cell_estimate(spacing_m) * enabled_ct > AREA_COVERAGE_WORK_BUDGET and spacing_m < 2000.0:
+                spacing_m *= 1.5
+
+            yield sse({"type": "status", "message": "Prefetching terrain tiles…"})
+            _prog = [0, 1]
+
+            def _tile_cb(done, total):
+                _prog[0], _prog[1] = done, max(1, total)
+
+            tile_thread = threading.Thread(
+                target=lambda: _tiles.prefetch_area(sw_lat, ne_lat, sw_lon, ne_lon, _tile_cb),
+                daemon=True,
+            )
+            tile_thread.start()
+            while tile_thread.is_alive():
+                yield sse({"type": "elev_progress",
+                           "current": _prog[0], "total": _prog[1],
+                           "message": f"Tile {_prog[0]}/{_prog[1]} cached…"})
+                time.sleep(0.6)
+            tile_thread.join()
+
+            pool = _get_analysis_pool()
+
+            # ---- Chain-mode backbone check (shared with /api/analyze) ----
+            viable_w1_idxs: frozenset[int] = frozenset()
+            if chain_mode:
+                _lgen = _run_link_analysis(
+                    receivers, freq_mhz, sensitivity_dbm, fade_margin_db, veg_type,
+                    chain_mode, False, pool,
+                )
+                try:
+                    while True:
+                        yield sse(next(_lgen))
+                except StopIteration as _lsi:
+                    _, viable_w1_idxs = _lsi.value
+
+            grid_pts = _make_rect_grid(sw_lat, sw_lon, ne_lat, ne_lon, spacing_m)
+            total    = len(grid_pts)
+            yield sse({"type": "status",
+                       "message": f"Analyzing {total} cells × {enabled_ct} receiver(s) "
+                                  f"(spacing ≈ {spacing_m:.0f} m)…"})
+
+            args_list = [
+                (gi, glat, glon, receivers,
+                 freq_mhz, tx_power_dbm, tx_gain_dbi,
+                 sensitivity_dbm, veg_type, fade_margin_db,
+                 chain_mode, viable_w1_idxs)
+                for gi, (glat, glon) in enumerate(grid_pts)
+            ]
+            _fmap: dict = {}
+            for _a in args_list:
+                try:
+                    _fmap[pool.submit(_point_task, _a)] = _a[0]
+                except Exception as _se:
+                    app.logger.warning("area cell submit failed: %s", _se)
+            _pending   = set(_fmap)
+            batch: list = []
+            done_n     = 0
+            covered_ct = 0
+            FLUSH      = 200
+
+            while _pending:
+                _done, _pending = cf_wait(_pending, timeout=8)
+                if not _done:
+                    yield sse({"type": "status", "message": f"Analyzing area… {done_n}/{total} cells"})
+                    continue
+                for _f in _done:
+                    try:
+                        cell = _f.result()
+                        if cell["coverage"]:
+                            covered_ct += 1
+                        batch.append({
+                            "gi":          cell["idx"],
+                            "lat":         cell["lat"],
+                            "lon":         cell["lon"],
+                            "coverage":    cell["coverage"],
+                            "hard_fail":   cell["hard_fail"],
+                            "best_rx_idx": cell["best_rx_idx"],
+                            "best_rssi":   cell["best_rssi"],
+                        })
+                    except Exception as _fe:
+                        app.logger.warning("area cell task failed: %s", _fe)
+                    done_n += 1
+                    if len(batch) >= FLUSH:
+                        yield sse({"type": "area_batch", "cells": batch, "done": done_n, "total": total})
+                        batch = []
+
+            if batch:
+                yield sse({"type": "area_batch", "cells": batch, "done": done_n, "total": total})
+
+            yield sse({"type": "complete",
+                       "total": total, "covered": covered_ct, "spacing_m": spacing_m})
+
+        except GeneratorExit:
+            pass
+        except BaseException as exc:
+            import traceback
+            app.logger.exception("area-coverage SSE crashed: %r", exc)
             try:
                 yield sse({"type": "error",
                            "message": f"{exc!r}\n{traceback.format_exc()}"})

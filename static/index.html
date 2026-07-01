@@ -203,6 +203,41 @@
       </button>
     </section>
 
+    <section class="panel collapsed" id="heatmap-panel">
+      <h3 class="panel-title panel-toggle" id="heatmap-panel-toggle">Coverage Heat Map <span class="panel-chevron">▼</span></h3>
+
+      <p style="margin:4px 0 8px;font-size:0.78em;color:var(--text-muted)">
+        Shows where the loaded receiver network covers the currently visible map
+        area — pan/zoom to frame the area, then generate. Not tied to any loaded track.
+      </p>
+
+      <div class="param-group">
+        <label class="param-label hint-label"
+               title="Grid spacing for the analysis. Finer resolution looks smoother but costs more compute — each cell is checked against every enabled receiver.">
+          Resolution <span class="hint-icon">?</span>
+        </label>
+        <select id="hm-resolution" class="ctrl-select full-width">
+          <option value="fast">Fast (coarse grid)</option>
+          <option value="balanced" selected>Balanced</option>
+          <option value="detailed">Detailed (fine grid)</option>
+        </select>
+      </div>
+
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-primary" id="hm-run-btn" style="flex:1">▶ Generate Heat Map</button>
+        <button class="btn" id="hm-clear-btn" title="Clear heat map" style="padding:0 10px">✕</button>
+      </div>
+
+      <div id="hm-progress-container" class="hidden">
+        <div class="progress-label" id="hm-progress-label">Initializing…</div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="hm-progress-bar" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="status-msg" id="hm-status-msg"></div>
+      <div id="hm-summary-bar" class="ia-summary-bar hidden"></div>
+    </section>
+
     <section class="panel">
       <div style="display:flex;align-items:center;gap:8px;padding:2px 0 6px">
         <input type="checkbox" id="chain-mode-toggle"
