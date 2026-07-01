@@ -73,7 +73,11 @@ cp "$INSTALL_DIR/nginx.conf" "$SNIPPET"
 # means this snippet's top-level /api/ and /static/ locations silently
 # shadow another app's routes on whatever vhost gets picked.
 NGINX_SITE=""
-MATCH=$(grep -rl "server_name[[:space:]].*${TARGET_HOST}" /etc/nginx/sites-enabled/ 2>/dev/null | head -1)
+# `|| true` is required: grep exits 1 when no site matches, which is the
+# normal "no vhost yet -- create one" case handled below. Under `set -e
+# -o pipefail` an unguarded grep failure here would abort the whole script
+# silently (stderr is redirected to /dev/null) before that fallback ever runs.
+MATCH=$(grep -rl "server_name[[:space:]].*${TARGET_HOST}" /etc/nginx/sites-enabled/ 2>/dev/null | head -1) || true
 if [ -n "$MATCH" ]; then
     NGINX_SITE="$(realpath "$MATCH")"
 fi
