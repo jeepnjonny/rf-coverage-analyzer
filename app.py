@@ -4288,7 +4288,7 @@ AREA_COVERAGE_RESOLUTION_M: dict[str, float] = {
     "ultra":     25.0,
 }
 AREA_COVERAGE_MAX_WORK    = 600_000   # hard cap: cells × enabled-receiver-count
-AREA_COVERAGE_MAX_SPAN_M  = 60_000.0  # reject viewports wider/taller than this
+AREA_COVERAGE_MAX_SPAN_M  = 120_000.0  # reject viewports wider/taller than this
 
 
 @app.route("/api/area-coverage", methods=["POST"])
