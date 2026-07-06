@@ -2,7 +2,12 @@
 
 A self-hosted web application for analyzing RF signal coverage along a GPS track or between a network of fixed receivers. Upload a KML track and a CSV receiver list, configure RF parameters, and get an interactive color-coded map showing predicted signal coverage based on real terrain elevation data.
 
-![RF Coverage Analyzer screenshot](https://raw.githubusercontent.com/placeholder/screenshot.png)
+Heat Map for 1 or more sites
+![Heat Map](https://github.com/jeepnjonny/rf-coverage-analyzer/blob/master/Images/Screenshot%202026-07-06%20165906.png)
+
+Track coverage analysis
+![Covarage Analisys](https://github.com/jeepnjonny/rf-coverage-analyzer/blob/master/Images/Screenshot%202026-07-06%20170112.png)
+
 
 ## Features
 
