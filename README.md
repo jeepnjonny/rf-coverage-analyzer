@@ -143,4 +143,6 @@ sudo systemctl restart rf-coverage-analyzer
 
 ## License
 
-MIT
+Copyright (C) 2026 jeepnjonny
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE). If you run a modified version of this app as a network service, you must make your modified source available to its users.
