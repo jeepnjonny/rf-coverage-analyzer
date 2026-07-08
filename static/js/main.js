@@ -235,7 +235,9 @@ function onCursorMove(lat, lon) {
   const heatEl = document.getElementById('info-heat-signal');
   if (hc) {
     if (hc.coverage) {
-      const name = state.receivers[hc.best_rx_idx]?.name || `RX${hc.best_rx_idx + 1}`;
+      // best_rx_idx indexes into the list the map was scored against, which for
+      // a single-site map is one clicked site — not state.receivers.
+      const name = state.heatMapReceivers[hc.best_rx_idx]?.name || `RX${hc.best_rx_idx + 1}`;
       heatEl.textContent = `${hc.best_rssi} dBm (${name})`;
       heatEl.style.color = rxColor(hc.best_rx_idx);
     } else {
@@ -2659,6 +2661,9 @@ state.heatMapAbortCtrl = null;
 state.heatMapStartTime = null;   // for time-remaining estimate
 state.heatMapResults   = [];     // flat cell array, for cursor-signal lookup
 state.heatMapSpacingM  = null;   // meters; nearest-cell lookup distance cutoff
+state.heatMapReceivers = [];     // the receiver list this map was scored against
+                                 // (best_rx_idx indexes into this, NOT state.receivers —
+                                 //  a single-site map is scored against just one site)
 
 // Haversine distance in km between two [lat,lon] points
 function _haversineKm(lat1, lon1, lat2, lon2) {
@@ -3581,6 +3586,7 @@ async function _hmGenerate(opts = {}) {
   state.heatMapStartTime = null;
   state.heatMapResults   = [];
   state.heatMapSpacingM  = null;
+  state.heatMapReceivers = receivers;
   _hmUpdateInfoBarVisibility();
   checkReady();
   _hmSetUI({ progressVisible: true, label: 'Initializing…', pct: 0, status: '', summaryHtml: '' });
@@ -3676,6 +3682,7 @@ function _hmClear() {
   state.heatMapRunning  = false;
   state.heatMapResults  = [];
   state.heatMapSpacingM = null;
+  state.heatMapReceivers = [];
   state.heatMapLayer.clearLayers();
   _hmUpdateInfoBarVisibility();
   _hmSetUI({ progressVisible: false, status: '', summaryHtml: '' });
