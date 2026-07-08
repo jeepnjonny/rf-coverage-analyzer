@@ -16,7 +16,7 @@ Track coverage analysis
 - **Track coverage analysis** — color-codes each point along a GPS track by which receiver (if any) provides the best signal
 - **Receiver link analysis** — evaluates line-of-sight and estimated RSSI between all pairs of fixed receivers, with a terrain profile / Fresnel zone view for any link
 - **Area coverage heat map** — shows network coverage across the currently visible map area (independent of any loaded track), rendered as true-footprint grid cells anchored to a fixed lat/lon lattice so results stay consistent across pans and zooms. Choose from five resolutions (Fast 400 m → Ultra 25 m); cells are colored by signal margin above threshold in dB bands (weak / moderate / strong)
-- **Link coverage map** — right-click any receiver to draw its radio horizon: a circular grid of reachable cells at a configurable AGL and radius, with terrain-blocked cells hidden
+- **Single-site heat coverage** — right-click any receiver (or any point on the map) to run the same heat map scored against just that one site over the current view at a 200 m grid
 - **Test a location** — right-click anywhere on the map to test coverage from a temporary transmitter, without adding it to the receiver list; reports coverage % and the longest remaining gap
 - **Signal hover panel & cursor info bar** — move the cursor over the track or heat map to see per-receiver RSSI, elevation, and predicted heat map signal at that point
 
