@@ -16,6 +16,7 @@ Propagation model (mesh_terrain + Radio-Mobile methodology):
   • Link budget: Pr = Pt + Gt + Gr − FSPL − L_diffraction
 """
 
+import atexit
 import csv
 import io
 import json
@@ -339,12 +340,18 @@ class ElevationTileService:
         lat_min: float, lat_max: float,
         lon_min: float, lon_max: float,
         progress_cb=None,
+        stop_flag: "list | None" = None,
     ) -> int:
         """Download & cache all tiles covering the padded bounding box.
 
         Tiles are fetched in parallel (up to 32 concurrent HTTP requests).
         The LRU lock is held only for brief dict operations — not during the
         actual HTTP download or PNG decode — so concurrent fetches are safe.
+
+        If `stop_flag` is given and `stop_flag[0]` becomes truthy mid-fetch
+        (SSE client disconnected), any tile not yet started is skipped —
+        already-queued HTTP fetches submitted to the internal thread pool
+        that haven't started yet just return immediately.
         """
         pad = 0.05  # ~5 km margin
         la0, la1 = lat_min - pad, lat_max + pad
@@ -367,6 +374,8 @@ class ElevationTileService:
         cb_lock    = threading.Lock()
 
         def _fetch_one(zxy: tuple[int, int, int]) -> None:
+            if stop_flag and stop_flag[0]:
+                return
             self._load_tile(*zxy)
             if progress_cb:
                 with cb_lock:
@@ -457,7 +466,8 @@ def _fetch_usgs_single(lat_lon: tuple[float, float]) -> tuple[float, float, floa
     return la, lo, None  # failure — caller must NOT store this in the cache
 
 
-def fetch_fallback_elevations(points: list[tuple[float, float]], progress_cb=None):
+def fetch_fallback_elevations(points: list[tuple[float, float]], progress_cb=None,
+                               stop_flag: "list | None" = None):
     """
     Fetch point elevations via API chain when tiles fail.  Writes to SQLite cache.
 
@@ -468,6 +478,9 @@ def fetch_fallback_elevations(points: list[tuple[float, float]], progress_cb=Non
 
     Already-cached points are skipped using a single chunked SQL IN-query
     rather than checking a full in-memory dict — O(n/900) round-trips.
+
+    If `stop_flag` is given and `stop_flag[0]` becomes truthy mid-fetch (SSE
+    client disconnected), remaining chunks are skipped before starting them.
     """
     uncached = _pt_uncached(points)
 
@@ -481,6 +494,8 @@ def fetch_fallback_elevations(points: list[tuple[float, float]], progress_cb=Non
     chunk_size = 100
 
     for i in range(0, len(uncached), chunk_size):
+        if stop_flag and stop_flag[0]:
+            break
         chunk = uncached[i : i + chunk_size]
 
         success = _fetch_opentopodata(chunk)
@@ -988,6 +1003,33 @@ REFINE_STEP_M          = 50.0   # grid step (m) for local refinement
 
 _POOL_WORKERS = max(2, (os.cpu_count() or 4) - 1)
 
+
+def _shutdown_pool_safely(pool: "ProcessPoolExecutor | None") -> None:
+    """Best-effort shutdown of a (possibly already-broken) pool. Safe to call
+    even while another gthread may still hold a stale reference to it — every
+    pool.submit()/pool.map() call site already wraps calls in try/except."""
+    if pool is None:
+        return
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+def _cancel_futures(futures) -> None:
+    """Cancel every not-yet-started future in `futures` (a set, list, or a
+    dict keyed by Future). Future.cancel() is a harmless no-op for futures
+    that are already running/done, so this is safe to call unconditionally
+    on whatever's still outstanding when an SSE client disconnects."""
+    if not futures:
+        return
+    for f in futures:
+        try:
+            f.cancel()
+        except Exception:
+            pass
+
+
 _analysis_pool:      ProcessPoolExecutor | None = None
 _analysis_pool_lock: threading.Lock              = threading.Lock()
 
@@ -1024,18 +1066,16 @@ def _get_analysis_pool() -> ProcessPoolExecutor:
     Resets automatically if a worker crash has left the pool in a broken state."""
     global _analysis_pool
     if _analysis_pool is not None and getattr(_analysis_pool, '_broken', False):
+        _shutdown_pool_safely(_analysis_pool)
         _analysis_pool = None
     if _analysis_pool is None:
         with _analysis_pool_lock:
             if _analysis_pool is None:
-                import atexit
-                pool = ProcessPoolExecutor(
+                _analysis_pool = ProcessPoolExecutor(
                     max_workers=_POOL_WORKERS,
                     initializer=_worker_init,
                     initargs=(str(TILE_DIR), str(ELEV_DB)),
                 )
-                atexit.register(pool.shutdown, wait=False)
-                _analysis_pool = pool
     return _analysis_pool
 
 
@@ -1050,19 +1090,25 @@ def _get_advisor_pool() -> ProcessPoolExecutor:
     """Return the module-level advisor process pool, creating/resetting lazily."""
     global _advisor_pool
     if _advisor_pool is not None and getattr(_advisor_pool, '_broken', False):
+        _shutdown_pool_safely(_advisor_pool)
         _advisor_pool = None
     if _advisor_pool is None:
         with _advisor_pool_lock:
             if _advisor_pool is None:
-                import atexit
-                pool = ProcessPoolExecutor(
+                _advisor_pool = ProcessPoolExecutor(
                     max_workers=_POOL_WORKERS,
                     initializer=_worker_init,
                     initargs=(str(TILE_DIR), str(ELEV_DB)),
                 )
-                atexit.register(pool.shutdown, wait=False)
-                _advisor_pool = pool
     return _advisor_pool
+
+
+def _shutdown_all_pools_atexit() -> None:
+    _shutdown_pool_safely(_analysis_pool)
+    _shutdown_pool_safely(_advisor_pool)
+
+
+atexit.register(_shutdown_all_pools_atexit)
 
 
 def _terrain_check_task(args: tuple) -> dict:
@@ -1909,25 +1955,29 @@ def _run_link_analysis(receivers, freq_mhz, sensitivity_dbm, fade_margin_db,
         if j > i and str(rx2.get("enabled", "1")).strip() != "0"
     ]
     _link_fmap: dict = {}
-    for _la in link_args:
-        try:
-            _link_fmap[pool.submit(_link_task, _la)] = _la
-        except Exception as _lse:
-            app.logger.warning("link submit failed: %s", _lse)
-    _link_pending = set(_link_fmap)
-    while _link_pending:
-        _lj_done, _link_pending = cf_wait(_link_pending, timeout=8)
-        if not _lj_done:
-            yield {"type": "status", "message": status_msg}
-            continue
-        for _lf in _lj_done:
+    try:
+        for _la in link_args:
             try:
-                result = _lf.result()
-                link_results_cache.append(result)
-                if emit_links:
-                    yield result
-            except Exception as _le:
-                app.logger.warning("link task failed: %s", _le)
+                _link_fmap[pool.submit(_link_task, _la)] = _la
+            except Exception as _lse:
+                app.logger.warning("link submit failed: %s", _lse)
+        _link_pending = set(_link_fmap)
+        while _link_pending:
+            _lj_done, _link_pending = cf_wait(_link_pending, timeout=8)
+            if not _lj_done:
+                yield {"type": "status", "message": status_msg}
+                continue
+            for _lf in _lj_done:
+                try:
+                    result = _lf.result()
+                    link_results_cache.append(result)
+                    if emit_links:
+                        yield result
+                except Exception as _le:
+                    app.logger.warning("link task failed: %s", _le)
+    except GeneratorExit:
+        _cancel_futures(_link_fmap)
+        raise
 
     # Build the set of WIDE1 receivers with a viable backbone link to a terminal node.
     #
@@ -2175,6 +2225,7 @@ def analyze():
     body_receivers   = data.get("receivers")       # list[dict] | None
 
     def generate():
+        _stop_flag: list = [False]
         try:
             yield sse({"type": "status", "message": "Parsing files…"})
 
@@ -2244,7 +2295,8 @@ def analyze():
                 _prog[0], _prog[1] = done, max(1, total)
 
             tile_thread = threading.Thread(
-                target=lambda: _tiles.prefetch_area(la_min, la_max, lo_min, lo_max, _tile_cb),
+                target=lambda: _tiles.prefetch_area(la_min, la_max, lo_min, lo_max, _tile_cb,
+                                                     stop_flag=_stop_flag),
                 daemon=True,
             )
             tile_thread.start()
@@ -2308,6 +2360,7 @@ def analyze():
                 api_thread = threading.Thread(
                     target=fetch_fallback_elevations,
                     args=(list(api_pts), _api_cb),
+                    kwargs={"stop_flag": _stop_flag},
                     daemon=True,
                 )
                 api_thread.start()
@@ -2485,7 +2538,14 @@ def analyze():
                            "stats": [], "total_coverage_pct": 0})
 
         except GeneratorExit:
-            pass
+            _stop_flag[0] = True
+            _cancel_futures(locals().get('_pt_fmap'))
+            _lg = locals().get('_lgen')
+            if _lg is not None:
+                try:
+                    _lg.close()
+                except Exception:
+                    pass
         except BaseException as exc:
             import traceback
             app.logger.exception("Analyze SSE generator crashed: %r", exc)
@@ -2948,12 +3008,16 @@ def find_highpoint_candidates(
     tier1_pts: list[dict],
     max_dist_m: float,
     grid_m: float,
+    stop_flag: "list | None" = None,
 ) -> list[dict]:
     """For each Tier-1 road point find the highest terrain point reachable by hike.
 
     Scans radially in HIGHPOINT_N_BEARINGS directions out to max_dist_m at
     grid_m intervals.  Returns each best-elevated point that is higher than
     its corresponding road point (deduplicated across all road points).
+
+    If `stop_flag` is given and `stop_flag[0]` becomes truthy mid-scan (SSE
+    client disconnected), remaining road points are skipped.
     """
     if not tier1_pts or max_dist_m <= 0:
         return []
@@ -2964,6 +3028,8 @@ def find_highpoint_candidates(
     candidates: list[dict] = []
 
     for road_pt in tier1_pts:
+        if stop_flag and stop_flag[0]:
+            break
         lat0, lon0 = road_pt["lat"], road_pt["lon"]
         road_elev  = _get_elev(_rc(lat0), _rc(lon0))
         best_elev  = road_elev
@@ -3141,7 +3207,8 @@ def suggest_locations():
                 _prog[0], _prog[1] = done, max(1, total)
 
             tile_thread = threading.Thread(
-                target=lambda: _tiles.prefetch_area(la_min, la_max, lo_min, lo_max, _tile_cb),
+                target=lambda: _tiles.prefetch_area(la_min, la_max, lo_min, lo_max, _tile_cb,
+                                                     stop_flag=_stop_flag),
                 daemon=True,
             )
             tile_thread.start()
@@ -3316,7 +3383,7 @@ def suggest_locations():
                 def _do_hp():
                     try:
                         _hp_result[0] = find_highpoint_candidates(
-                            tier1, max_walk_m, HIGHPOINT_GRID_M)
+                            tier1, max_walk_m, HIGHPOINT_GRID_M, stop_flag=_stop_flag)
                     except Exception as e:
                         _hp_exc[0] = e
                 hp_thread = threading.Thread(target=_do_hp, daemon=True)
@@ -3929,6 +3996,10 @@ def suggest_locations():
 
         except GeneratorExit:
             _stop_flag[0] = True
+            _loc = locals()
+            for _name in ('pre_pending', 'futures', 'pending',
+                          '_los_pending', '_refine_futures', '_refine_pending'):
+                _cancel_futures(_loc.get(_name))
         except BaseException as exc:
             _stop_flag[0] = True
             import traceback
@@ -4054,7 +4125,7 @@ def test_location():
             })
 
         except GeneratorExit:
-            pass
+            _cancel_futures(locals().get('fmap'))
         except BaseException as exc:
             import traceback
             app.logger.exception("test-location SSE crashed: %r", exc)
@@ -4152,6 +4223,7 @@ def area_coverage():
     height_m = haversine(sw_lat, sw_lon, ne_lat, sw_lon)
 
     def generate():
+        _stop_flag: list = [False]
         try:
             if not body_receivers:
                 yield sse({"type": "error", "message": "No receivers loaded"}); return
@@ -4194,7 +4266,8 @@ def area_coverage():
                 _prog[0], _prog[1] = done, max(1, total)
 
             tile_thread = threading.Thread(
-                target=lambda: _tiles.prefetch_area(sw_lat, ne_lat, sw_lon, ne_lon, _tile_cb),
+                target=lambda: _tiles.prefetch_area(sw_lat, ne_lat, sw_lon, ne_lon, _tile_cb,
+                                                     stop_flag=_stop_flag),
                 daemon=True,
             )
             tile_thread.start()
@@ -4274,7 +4347,14 @@ def area_coverage():
                        "total": total, "covered": covered_ct, "spacing_m": spacing_m})
 
         except GeneratorExit:
-            pass
+            _stop_flag[0] = True
+            _cancel_futures(locals().get('_fmap'))
+            _lg = locals().get('_lgen')
+            if _lg is not None:
+                try:
+                    _lg.close()
+                except Exception:
+                    pass
         except BaseException as exc:
             import traceback
             app.logger.exception("area-coverage SSE crashed: %r", exc)
