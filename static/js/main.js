@@ -1276,23 +1276,43 @@ function printDeploymentSummary() {
   window.print();
 }
 
-// Resize the map to fit the print container itself (not an attempt to
-// reproduce the on-screen pan/zoom -- the page has a fixed, very different
-// aspect ratio than the live viewport, so "same view" isn't a coherent goal;
-// "properly sized to the page" is). `getBoundingClientRect()` forces a
-// synchronous layout flush so invalidateSize reads the print CSS's real
-// dimensions instead of a stale pre-print size.
-function _resizeMapForContainer() {
+let _preprintView = null;
+
+// `getBoundingClientRect()` forces a synchronous layout flush so
+// invalidateSize reads the print CSS's real dimensions instead of a stale
+// pre-print size.
+function _reflowMap() {
   map.getContainer().getBoundingClientRect();
   map.invalidateSize({ animate: false, pan: false });
 }
 
+// Same "fit everything relevant into view" pattern used after an analysis
+// run (see the allPts/fitBounds block above) -- the print page has a fixed,
+// very different aspect ratio than the live viewport, so reproducing the
+// on-screen pan/zoom isn't the goal; showing the whole loaded track and
+// every receiver, uncropped, is.
+function _fitMapToContent() {
+  const allPts = [
+    ...(state.kmlCoords || []),
+    ...(state.receivers || []).map(rx => [parseFloat(rx.latitude), parseFloat(rx.longitude)]),
+  ].filter(([lat, lon]) => isFinite(lat) && isFinite(lon));
+  if (allPts.length) map.fitBounds(L.latLngBounds(allPts).pad(0.1), { animate: false });
+}
+
 window.addEventListener('beforeprint', () => {
   buildPrintReport();
-  _resizeMapForContainer();
+  _preprintView = { center: map.getCenter(), zoom: map.getZoom() };
+  _reflowMap();
+  _fitMapToContent();
 });
 
-window.addEventListener('afterprint', _resizeMapForContainer);
+window.addEventListener('afterprint', () => {
+  _reflowMap();
+  if (_preprintView) {
+    map.setView(_preprintView.center, _preprintView.zoom, { animate: false });
+    _preprintView = null;
+  }
+});
 
 function updateSingleRxSelect() {
   const sel = document.getElementById('single-rx-select');
