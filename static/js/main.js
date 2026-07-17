@@ -1276,9 +1276,20 @@ function printDeploymentSummary() {
   window.print();
 }
 
+let _preprintView = null;
+
 window.addEventListener('beforeprint', () => {
   buildPrintReport();
-  map.invalidateSize();
+  _preprintView = { center: map.getCenter(), zoom: map.getZoom(), bounds: map.getBounds() };
+  map.invalidateSize({ animate: false });
+  map.fitBounds(_preprintView.bounds, { animate: false });
+});
+
+window.addEventListener('afterprint', () => {
+  if (!_preprintView) return;
+  map.invalidateSize({ animate: false });
+  map.setView(_preprintView.center, _preprintView.zoom, { animate: false });
+  _preprintView = null;
 });
 
 function updateSingleRxSelect() {
