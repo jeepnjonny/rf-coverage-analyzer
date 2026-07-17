@@ -359,6 +359,9 @@
 
       <!-- Hardware tab -->
       <div class="tab-pane" id="tab-hardware">
+        <div class="hw-toolbar">
+          <button class="btn btn-sm" id="print-summary-btn" title="Prints the current map view + roster" disabled>Print Summary</button>
+        </div>
         <div class="results-empty" id="hardware-empty">No receivers loaded</div>
         <div class="hw-grid hidden" id="hw-grid"></div>
       </div>
@@ -366,6 +369,8 @@
 
   </div><!-- .right-pane -->
 </div><!-- .app-body -->
+
+<div class="print-only" id="print-report"></div>
 
 <!-- ═══════════════════ ADD RECEIVER DIALOG ═══════════════════ -->
 <div class="modal-backdrop hidden" id="add-rx-modal">

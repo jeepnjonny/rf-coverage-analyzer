@@ -156,6 +156,8 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
 
+document.getElementById('print-summary-btn').addEventListener('click', printDeploymentSummary);
+
 function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.tab === name));
@@ -1131,58 +1133,153 @@ function updateLegend() {
   if (document.getElementById('tab-hardware')?.classList.contains('active')) renderHardwareTab();
 }
 
+const ROLE_ORDER = ['wide2', 'wide1', 'igate', 'meshtastic'];
+
+function _powerLabel(dbm) {
+  const snapped = _snapPower(dbm ?? 28);
+  return (TX_POWER_OPTIONS.find(([v]) => v === snapped) || [0, `${snapped} dBm`])[1];
+}
+
+function _buildRosterGroups() {
+  const rxs      = state.receivers || [];
+  const enabled  = rxs.filter(_rxEnabled);
+  const excluded = rxs.filter(r => !_rxEnabled(r)).map(r => r.name);
+
+  const byRole = {};
+  enabled.forEach(r => {
+    const role = _rxRole(r);
+    (byRole[role] = byRole[role] || []).push(r);
+  });
+
+  const roles = Object.keys(byRole).sort((a, b) => {
+    const ia = ROLE_ORDER.indexOf(a), ib = ROLE_ORDER.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+
+  const groups = roles.map(role => ({
+    role,
+    label: ROLE_LABEL[role] || role.toUpperCase(),
+    rows: byRole[role]
+      .slice()
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+      .map(r => ({
+        name:   r.name || '(unnamed)',
+        gps:    `${parseFloat(r.latitude).toFixed(5)}, ${parseFloat(r.longitude).toFixed(5)}`,
+        height: `${r.height_agl_m ?? '?'} m`,
+        gain:   `${r.antenna_gain_dbi ?? '?'} dBi`,
+        power:  _powerLabel(r.tx_power_dbm),
+        role:   ROLE_LABEL[role] || role.toUpperCase(),
+      })),
+  }));
+
+  const counts = roles.map(role => [ROLE_LABEL[role] || role.toUpperCase(), byRole[role].length]);
+
+  return { groups, counts, total: enabled.length, excluded };
+}
+
+function _rosterTableHtml(rows) {
+  const trs = rows.map(r => `<tr>
+      <td>${r.name}</td>
+      <td>${r.gps}</td>
+      <td>${r.height}</td>
+      <td>${r.gain}</td>
+      <td>${r.power}</td>
+      <td>${r.role}</td>
+    </tr>`).join('');
+  return `<table class="results-table roster-table">
+      <thead><tr><th>Location</th><th>GPS</th><th>Height</th><th>Antenna</th><th>Power</th><th>Role</th></tr></thead>
+      <tbody>${trs}</tbody>
+    </table>`;
+}
+
 function renderHardwareTab() {
   const empty = document.getElementById('hardware-empty');
   const grid  = document.getElementById('hw-grid');
   if (!empty || !grid) return;
 
-  const rxs     = state.receivers || [];
-  const enabled = rxs.filter(_rxEnabled);
-  if (!enabled.length) {
+  const rxs = state.receivers || [];
+  const { groups, counts, excluded } = _buildRosterGroups();
+
+  if (!groups.length) {
     empty.classList.remove('hidden');
     empty.textContent = rxs.length ? 'No enabled receivers' : 'No receivers loaded';
     grid.classList.add('hidden');
     grid.innerHTML = '';
+    setPrintSummaryEnabled(false);
     return;
   }
   empty.classList.add('hidden');
   grid.classList.remove('hidden');
+  setPrintSummaryEnabled(true);
 
-  const byRole  = {}, byGain = {}, byPower = {};
-  rxs.filter(_rxEnabled).forEach(r => {
-    const role  = _rxRole(r);
-    const gain  = (parseFloat(r.antenna_gain_dbi) ?? 0).toString();
-    const power = _snapPower(r.tx_power_dbm ?? 28).toString();
-    byRole[role]   = (byRole[role]  || 0) + 1;
-    byGain[gain]   = (byGain[gain]  || 0) + 1;
-    byPower[power] = (byPower[power] || 0) + 1;
-  });
+  const sections = groups.map(g => `<div class="hw-role-section">
+      <div class="hw-section-title">${g.label} — ${g.rows.length} site${g.rows.length === 1 ? '' : 's'}</div>
+      ${_rosterTableHtml(g.rows)}
+    </div>`).join('');
 
-  const mkTable = (title, rows) => {
-    const trs = rows.map(([k, v]) =>
-      `<tr><td>${k}</td><td class="hw-count">${v}</td></tr>`).join('');
-    return `<div class="hw-section">
-      <div class="hw-section-title">${title}</div>
+  const countTrs = counts.map(([k, v]) => `<tr><td>${k}</td><td class="hw-count">${v}</td></tr>`).join('');
+  const summary = `<div class="hw-role-summary">
+      <div class="hw-section-title">Summary by Role</div>
       <table class="results-table">
         <thead><tr><th></th><th class="hw-count">Count</th></tr></thead>
-        <tbody>${trs}</tbody>
+        <tbody>${countTrs}</tbody>
       </table>
     </div>`;
-  };
 
-  const roleRows  = Object.entries(byRole).sort().map(([k, v]) => [ROLE_LABEL[k] || k, v]);
-  const gainRows  = Object.entries(byGain).sort((a, b) => +a[0] - +b[0])
-                         .map(([k, v]) => [`${k} dBi`, v]);
-  const powerRows = Object.entries(byPower).sort((a, b) => +a[0] - +b[0])
-                         .map(([k, v]) => {
-                           const label = (TX_POWER_OPTIONS.find(([vv]) => vv == +k) || [0, `${k} dBm`])[1];
-                           return [label, v];
-                         });
+  const excludedNote = excluded.length
+    ? `<div class="hw-excluded-note">Excluded (disabled) receivers: ${excluded.join(', ')}</div>`
+    : '';
 
-  grid.innerHTML = mkTable('By Role', roleRows)
-                 + mkTable('By Antenna Gain', gainRows)
-                 + mkTable('By Tx Power', powerRows);
+  grid.innerHTML = sections + summary + excludedNote;
 }
+
+function setPrintSummaryEnabled(on) {
+  const btn = document.getElementById('print-summary-btn');
+  if (btn) btn.disabled = !on;
+}
+
+function buildPrintReport() {
+  const el = document.getElementById('print-report');
+  if (!el) return;
+
+  const { groups, counts, excluded } = _buildRosterGroups();
+  if (!groups.length) { el.innerHTML = ''; return; }
+
+  const sections = groups.map(g => `<div class="hw-role-section">
+      <div class="hw-section-title">${g.label} — ${g.rows.length} site${g.rows.length === 1 ? '' : 's'}</div>
+      ${_rosterTableHtml(g.rows)}
+    </div>`).join('');
+
+  const countTrs = counts.map(([k, v]) => `<tr><td>${k}</td><td class="hw-count">${v}</td></tr>`).join('');
+  const summary = `<div class="hw-role-summary">
+      <div class="hw-section-title">Summary by Role</div>
+      <table class="results-table">
+        <thead><tr><th></th><th class="hw-count">Count</th></tr></thead>
+        <tbody>${countTrs}</tbody>
+      </table>
+    </div>`;
+
+  const excludedNote = excluded.length
+    ? `<div class="hw-excluded-note">Excluded (disabled) receivers: ${excluded.join(', ')}</div>`
+    : '';
+
+  el.innerHTML = `
+    <div class="print-report-header">
+      <h1>Deployment Summary</h1>
+      <div class="print-report-meta">Generated ${new Date().toLocaleString()}</div>
+    </div>
+    <div class="print-report-body">${sections}${summary}${excludedNote}</div>`;
+}
+
+function printDeploymentSummary() {
+  buildPrintReport();
+  window.print();
+}
+
+window.addEventListener('beforeprint', () => {
+  buildPrintReport();
+  map.invalidateSize();
+});
 
 function updateSingleRxSelect() {
   const sel = document.getElementById('single-rx-select');
