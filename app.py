@@ -32,7 +32,10 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 from collections import OrderedDict
 import functools
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait as cf_wait
+from concurrent.futures import (
+    ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait as cf_wait,
+    TimeoutError as FuturesTimeoutError,
+)
 from pathlib import Path
 
 import numpy as np
@@ -1805,6 +1808,266 @@ def get_kml_info(filename: str):
         return jsonify(parse_track_file_info(content, p.name))
     except Exception as exc:
         return jsonify({"error": f"Could not parse file: {exc}"}), 400
+
+
+# ---------------------------------------------------------------------------
+# Print map image — server-rendered PNG of the current view for printing
+#
+# The interactive Leaflet map is never touched for print (three earlier
+# attempts to resize/reframe it via JS at print time all failed silently in
+# real browsers, and a client-side canvas screenshot would hit the same wall
+# since the tile layers aren't loaded in CORS mode). Instead the frontend
+# computes the desired view with a pure, synchronous calculation
+# (L.latLngBounds + map.getBoundsZoom — neither requires rendering) and POSTs
+# it here; this renders a plain PNG that gets embedded as a normal <img>
+# before window.print() is called.
+# ---------------------------------------------------------------------------
+
+PRINT_TILE_LAYERS = {
+    "usgs-topo": {
+        "url": "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
+        "max_native_zoom": 16,
+        "attribution": "USGS Topo",
+        "concurrency": 6,
+    },
+    "usgs-sat": {
+        "url": "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+        "max_native_zoom": 16,
+        "attribution": "USGS Imagery",
+        "concurrency": 6,
+    },
+    "osm": {
+        "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "max_native_zoom": 19,
+        "attribution": "© OpenStreetMap contributors",
+        "concurrency": 2,  # OSM's tile usage policy caps bulk/automated access
+    },
+}
+
+_PRINT_TILE_PX = 256
+
+
+def _mercator_pixel(lat: float, lon: float, zoom: int) -> tuple[float, float]:
+    """Fractional Web Mercator global-pixel coords (256px tiles) at a zoom level."""
+    lat = max(-85.05112878, min(85.05112878, lat))
+    n = 2 ** zoom
+    world_px = _PRINT_TILE_PX * n
+    gx = (lon + 180.0) / 360.0 * world_px
+    lr = math.radians(lat)
+    gy = (1.0 - math.log(math.tan(lr) + 1.0 / math.cos(lr)) / math.pi) / 2.0 * world_px
+    return gx, gy
+
+
+def _draw_marker(draw, cx: float, cy: float, r: float, shape: str, fill: tuple) -> None:
+    """Draw a marker shape twice (white at r+3, then the fill color at r) so
+    every shape gets a uniform white outline, matching the live map's
+    white-bordered role markers -- whichever shape the frontend resolved."""
+    white = (255, 255, 255, 255)
+    if shape == "diamond":
+        pts = lambda rad: [(cx, cy - rad), (cx + rad, cy), (cx, cy + rad), (cx - rad, cy)]
+        draw.polygon(pts(r + 3), fill=white)
+        draw.polygon(pts(r), fill=fill)
+    elif shape == "square":
+        box = lambda rad: [cx - rad, cy - rad, cx + rad, cy + rad]
+        draw.rounded_rectangle(box(r + 3), radius=3, fill=white)
+        draw.rounded_rectangle(box(r), radius=3, fill=fill)
+    elif shape == "triangle":
+        pts = lambda rad: [(cx, cy - rad), (cx + rad, cy + rad), (cx - rad, cy + rad)]
+        draw.polygon(pts(r + 3), fill=white)
+        draw.polygon(pts(r), fill=fill)
+    else:
+        box = lambda rad: [cx - rad, cy - rad, cx + rad, cy + rad]
+        draw.ellipse(box(r + 3), fill=white)
+        draw.ellipse(box(r), fill=fill)
+
+
+class PrintTileService:
+    """Fetches/caches/stitches basemap tiles for the print-map PNG endpoint.
+
+    Deliberately separate from ElevationTileService: different URL schemes
+    (y-before-x for the USGS layers), different decode target (PIL Image, not
+    raw bytes for bilinear sampling), different volume (one-shot per print
+    click, not thousands of lookups per analysis), and different rate-limit
+    obligations (OSM's tile usage policy caps bulk/automated access).
+    """
+
+    FETCH_TIMEOUT_S = 8
+    TOTAL_BUDGET_S = 20  # soft cap on wall-clock time spent waiting on tile fetches
+
+    def __init__(self, base_dir: Path, layers: dict):
+        self.base_dir = base_dir
+        self.layers = layers
+        for key in layers:
+            (base_dir / key).mkdir(parents=True, exist_ok=True)
+
+    def _fetch_tile(self, basemap: str, z: int, x: int, y: int):
+        """Return a decoded PIL Image for this tile, or None on failure."""
+        from PIL import Image
+
+        n = 2 ** z
+        if not (0 <= x < n and 0 <= y < n):
+            return None
+
+        path = self.base_dir / basemap / f"{z}_{x}_{y}.png"
+        if path.exists() and path.stat().st_size >= 100:
+            try:
+                return Image.open(str(path)).convert("RGB")
+            except Exception:
+                path.unlink(missing_ok=True)  # corrupt cache entry -- refetch below
+
+        url = self.layers[basemap]["url"].format(z=z, x=x, y=y)
+        try:
+            r = _http.get(url, timeout=self.FETCH_TIMEOUT_S)
+            if r.status_code == 200 and r.content:
+                path.write_bytes(r.content)
+                return Image.open(io.BytesIO(r.content)).convert("RGB")
+            app.logger.warning("Print tile HTTP %d for %s z%d/%d/%d", r.status_code, basemap, z, x, y)
+        except Exception as exc:
+            app.logger.warning("Print tile fetch failed %s z%d/%d/%d: %s", basemap, z, x, y, exc)
+        return None
+
+    def render(self, basemap: str, lat: float, lon: float, zoom: int,
+               width: int, height: int, track: list, markers: list) -> tuple[bytes, int]:
+        from PIL import Image, ImageDraw, ImageFont
+
+        layer = self.layers[basemap]
+        # Clamp to native tile resolution first -- avoids partial-pixel
+        # upscale bugs and matches how Leaflet itself handles over-zoom
+        # (fetch at maxNativeZoom, scale up client-side). The practical
+        # effect here is the image shows slightly more context than an
+        # "ideal" tight fit when the live map would have over-zoomed too.
+        zoom = max(0, min(zoom, layer["max_native_zoom"]))
+
+        cx, cy = _mercator_pixel(lat, lon, zoom)
+        box_left, box_top = cx - width / 2, cy - height / 2
+
+        n = 2 ** zoom
+        world_px = _PRINT_TILE_PX * n
+        box_left = max(0.0, min(box_left, world_px - width))
+        box_top = max(0.0, min(box_top, world_px - height))
+        box_right, box_bottom = box_left + width, box_top + height
+
+        tx0, tx1 = int(box_left // _PRINT_TILE_PX), int((box_right - 1) // _PRINT_TILE_PX)
+        ty0, ty1 = int(box_top // _PRINT_TILE_PX), int((box_bottom - 1) // _PRINT_TILE_PX)
+
+        stitched = Image.new(
+            "RGB",
+            ((tx1 - tx0 + 1) * _PRINT_TILE_PX, (ty1 - ty0 + 1) * _PRINT_TILE_PX),
+            (224, 224, 224),
+        )
+        tile_coords = [(tx, ty) for tx in range(tx0, tx1 + 1) for ty in range(ty0, ty1 + 1)]
+        tiles_ok = 0
+
+        ex = ThreadPoolExecutor(max_workers=layer["concurrency"])
+        try:
+            futs = {ex.submit(self._fetch_tile, basemap, zoom, tx, ty): (tx, ty) for tx, ty in tile_coords}
+            try:
+                for fut in as_completed(futs, timeout=self.TOTAL_BUDGET_S):
+                    tx, ty = futs[fut]
+                    tile_img = fut.result()
+                    if tile_img is not None:
+                        stitched.paste(tile_img, ((tx - tx0) * _PRINT_TILE_PX, (ty - ty0) * _PRINT_TILE_PX))
+                        tiles_ok += 1
+            except FuturesTimeoutError:
+                app.logger.warning(
+                    "Print tile fetch budget (%ds) exceeded for %s -- using %d/%d tiles",
+                    self.TOTAL_BUDGET_S, basemap, tiles_ok, len(tile_coords),
+                )
+        finally:
+            # Don't block the response on slow stragglers -- pending fetches
+            # are cancelled, already-running ones finish in the background
+            # and populate the disk cache for next time regardless.
+            ex.shutdown(wait=False, cancel_futures=True)
+
+        crop_left = round(box_left - tx0 * _PRINT_TILE_PX)
+        crop_top = round(box_top - ty0 * _PRINT_TILE_PX)
+        canvas = stitched.crop((crop_left, crop_top, crop_left + width, crop_top + height)).convert("RGBA")
+
+        def to_px(pt_lat: float, pt_lon: float) -> tuple[float, float]:
+            gx, gy = _mercator_pixel(pt_lat, pt_lon, zoom)
+            return gx - box_left, gy - box_top
+
+        draw = ImageDraw.Draw(canvas, "RGBA")
+
+        if len(track) >= 2:
+            pts = [to_px(pt[0], pt[1]) for pt in track]
+            draw.line(pts, fill=(136, 136, 136, 204), width=3, joint="curve")
+
+        for m in markers:
+            try:
+                px, py = to_px(float(m["lat"]), float(m["lon"]))
+            except (KeyError, ValueError, TypeError):
+                continue
+            color = m.get("color") or "#4f8ef7"
+            try:
+                rgb = tuple(int(color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                rgb = (79, 142, 247)
+            enabled = m.get("enabled", True)
+            if enabled:
+                fill = (*rgb, 255)
+            else:
+                # Roughly match the live map's opacity:0.30 + grayscale(0.7)
+                # treatment for disabled receivers -- blend toward gray, dim.
+                fill = (
+                    round(rgb[0] * 0.4 + 160 * 0.6),
+                    round(rgb[1] * 0.4 + 160 * 0.6),
+                    round(rgb[2] * 0.4 + 160 * 0.6),
+                    90,
+                )
+            _draw_marker(draw, px, py, 8, m.get("shape", "circle"), fill)
+
+        attribution = layer["attribution"]
+        try:
+            font = ImageFont.load_default()
+            text_w = draw.textlength(attribution, font=font)
+        except Exception:
+            font = None
+            text_w = len(attribution) * 6
+        pad = 4
+        draw.rectangle([0, height - 16, text_w + pad * 2, height], fill=(255, 255, 255, 200))
+        draw.text((pad, height - 15), attribution, fill=(0, 0, 0, 255), font=font)
+
+        buf = io.BytesIO()
+        canvas.convert("RGB").save(buf, format="PNG")
+        return buf.getvalue(), tiles_ok
+
+
+_print_tiles = PrintTileService(UPLOAD_DIR / "tiles_print", PRINT_TILE_LAYERS)
+
+
+@app.route("/api/print-map-image", methods=["POST"])
+def print_map_image():
+    data = request.get_json(force=True, silent=True) or {}
+
+    basemap = data.get("basemap")
+    if basemap not in PRINT_TILE_LAYERS:
+        return jsonify({"error": "Invalid basemap"}), 400
+
+    try:
+        center = data["center"]
+        lat, lon = float(center[0]), float(center[1])
+        zoom = int(data["zoom"])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return jsonify({"error": "Invalid center/zoom"}), 400
+
+    width = max(200, min(3000, int(data.get("width", 1600))))
+    height = max(200, min(3000, int(data.get("height", 960))))
+    track = data.get("track") or []
+    markers = data.get("markers") or []
+
+    try:
+        png_bytes, tiles_ok = _print_tiles.render(basemap, lat, lon, zoom, width, height, track, markers)
+    except Exception as exc:
+        app.logger.warning("print-map-image render error: %s", exc)
+        return jsonify({"error": "Map render failed"}), 502
+
+    if tiles_ok == 0:
+        return jsonify({"error": "Could not reach tile server"}), 502
+
+    resp = Response(png_bytes, mimetype="image/png")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ---------------------------------------------------------------------------
