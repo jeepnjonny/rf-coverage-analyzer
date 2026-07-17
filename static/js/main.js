@@ -16,6 +16,21 @@ function rxColor(idx) {
   return `hsl(${h.toFixed(1)},75%,50%)`;
 }
 
+// Same hue formula as rxColor(), converted to hex -- the print-map PNG is
+// rendered server-side by Pillow, which doesn't take CSS hsl() strings.
+function _hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const toHex = x => Math.round(255 * x).toString(16).padStart(2, '0');
+  return `#${toHex(f(0))}${toHex(f(8))}${toHex(f(4))}`;
+}
+function rxColorHex(idx) {
+  const total = Math.max(state.receivers?.length ?? 1, 1);
+  return _hslToHex(45 + (idx % total) * (270 / total), 75, 50);
+}
+
 const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled','role'];
 
 const ROLE_LABEL  = { wide1: 'WIDE1 fill-in', wide2: 'WIDE2 backbone', igate: 'iGate', meshtastic: 'Meshtastic Router' };
@@ -1268,70 +1283,114 @@ function buildPrintReport() {
       <h1>Deployment Summary</h1>
       <div class="print-report-meta">Generated ${new Date().toLocaleString()}</div>
     </div>
+    <div class="print-map-frame">
+      <img id="print-map-img" class="print-map-image hidden" alt="Map view" />
+      <div id="print-map-fallback" class="print-map-fallback hidden"></div>
+    </div>
     <div class="print-report-body">${sections}${summary}${excludedNote}</div>`;
 }
 
-function printDeploymentSummary() {
-  buildPrintReport();
-  window.print();
+const PRINT_MAP_W = 1600, PRINT_MAP_H = 960;
+
+// Three earlier attempts tried to resize/reframe the LIVE interactive map at
+// print time (beforeprint handlers, then a ResizeObserver) -- both passed
+// testing here but had no effect on real printed/PDF output, and a
+// client-side canvas screenshot would hit the same wall since the tile
+// layers aren't loaded in CORS mode (canvas.toBlob() would throw on a
+// tainted canvas). Instead: render a plain PNG server-side and embed it as
+// a normal <img> before window.print() -- this never touches the live map,
+// so there's no print-event-timing dependency to get wrong.
+//
+// L.latLngBounds(...) and map.project(...) are pure calculations -- neither
+// requires the map to be resized, rendered, or even visible -- so this can
+// run in a normal click handler. (map.getBoundsZoom() was tried first, but
+// its padding argument subtracts from the map's CURRENT on-screen container
+// size rather than accepting an arbitrary target size -- not what's needed
+// here, since the whole point is to be independent of the live viewport.
+// map.project(latlng, zoom) instead does a pure CRS coordinate transform.)
+function _boundsZoomForSize(bounds, width, height, maxZoom) {
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  for (let z = maxZoom; z >= 0; z--) {
+    const p1 = map.project(sw, z), p2 = map.project(ne, z);
+    if (Math.abs(p2.x - p1.x) <= width && Math.abs(p2.y - p1.y) <= height) return z;
+  }
+  return 0;
 }
 
-let _preprintView = null;
-let _printLayoutActive = false;
-
-// Same "fit everything relevant into view" pattern used after an analysis
-// run (see the allPts/fitBounds block above) -- the print page has a fixed,
-// very different aspect ratio than the live viewport, so reproducing the
-// on-screen pan/zoom isn't the goal; showing the whole loaded track and
-// every receiver, uncropped, is.
-function _fitMapToContent() {
+// Same "fit everything into view" content (track + receivers) as the app
+// already uses elsewhere.
+function _buildPrintMapPayload() {
   const allPts = [
     ...(state.kmlCoords || []),
     ...(state.receivers || []).map(rx => [parseFloat(rx.latitude), parseFloat(rx.longitude)]),
   ].filter(([lat, lon]) => isFinite(lat) && isFinite(lon));
-  if (allPts.length) map.fitBounds(L.latLngBounds(allPts).pad(0.1), { animate: false });
+  if (!allPts.length) return null;
+
+  const bounds = L.latLngBounds(allPts).pad(0.1);
+  const zoom   = _boundsZoomForSize(bounds, PRINT_MAP_W, PRINT_MAP_H, 19);
+  const center = bounds.getCenter();
+
+  return {
+    basemap: document.getElementById('basemap-select').value,
+    center: [center.lat, center.lng],
+    zoom, width: PRINT_MAP_W, height: PRINT_MAP_H,
+    track: (state.kmlCoords || []).filter(([lat, lon]) => isFinite(lat) && isFinite(lon)),
+    markers: (state.receivers || [])
+      .map((rx, i) => ({
+        lat: parseFloat(rx.latitude), lon: parseFloat(rx.longitude),
+        color: rxColorHex(i),
+        shape: { wide2: 'diamond', igate: 'square', meshtastic: 'triangle' }[_rxRole(rx)] || 'circle',
+        enabled: _rxEnabled(rx),
+      }))
+      .filter(m => isFinite(m.lat) && isFinite(m.lon)),
+  };
 }
 
-function _enterPrintLayout() {
-  // Only capture the view to restore later once -- but keep re-fitting on
-  // every call. ResizeObserver can fire more than once while the browser's
-  // print layout is still settling into its final size, and a one-shot fit
-  // risks locking onto an intermediate, not-yet-final container size.
-  if (!_printLayoutActive) {
-    _printLayoutActive = true;
-    _preprintView = { center: map.getCenter(), zoom: map.getZoom() };
+let _printMapObjectUrl = null;
+
+async function _renderPrintMapImage() {
+  const img = document.getElementById('print-map-img');
+  const fallback = document.getElementById('print-map-fallback');
+  if (!img || !fallback) return;
+
+  const payload = _buildPrintMapPayload();
+  if (!payload) {
+    img.classList.add('hidden');
+    fallback.textContent = 'No track or receivers loaded -- nothing to show on map.';
+    fallback.classList.remove('hidden');
+    return;
   }
-  map.invalidateSize({ animate: false, pan: false });
-  _fitMapToContent();
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 15000);
+  try {
+    const resp = await fetch('/api/print-map-image', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    if (_printMapObjectUrl) URL.revokeObjectURL(_printMapObjectUrl);
+    _printMapObjectUrl = URL.createObjectURL(blob);
+    img.src = _printMapObjectUrl;
+    img.classList.remove('hidden');
+    fallback.classList.add('hidden');
+  } catch (err) {
+    console.error('Print map image failed:', err);
+    img.classList.add('hidden');
+    fallback.textContent = 'Map image unavailable (network error) -- roster data below is still accurate.';
+    fallback.classList.remove('hidden');
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function _exitPrintLayout() {
-  if (!_printLayoutActive) return;
-  _printLayoutActive = false;
-  map.invalidateSize({ animate: false, pan: false });
-  if (_preprintView) {
-    map.setView(_preprintView.center, _preprintView.zoom, { animate: false });
-    _preprintView = null;
-  }
+async function printDeploymentSummary() {
+  buildPrintReport();
+  await _renderPrintMapImage();
+  window.print();
 }
-
-window.addEventListener('beforeprint', buildPrintReport);
-
-// The real resize/refit is driven by ResizeObserver rather than the
-// beforeprint/afterprint events: JS run inside those handlers is not
-// reliably reflected in the actual print/PDF output across browsers --
-// some browsers capture the print snapshot on their own schedule,
-// independent of when a beforeprint handler finishes running. ResizeObserver
-// instead reacts to the browser's own layout engine actually changing
-// #map's rendered box (which @media print's CSS does), so it fires at a
-// moment guaranteed to reflect the real print-time size.
-new ResizeObserver(() => {
-  if (window.matchMedia('print').matches) {
-    _enterPrintLayout();
-  } else {
-    _exitPrintLayout();
-  }
-}).observe(document.getElementById('map'));
 
 function updateSingleRxSelect() {
   const sel = document.getElementById('single-rx-select');
