@@ -1084,9 +1084,9 @@ html, body {
 .print-only { display: none; }
 
 @media print {
-  @page { margin: 0.5in; }
+  @page { size: letter portrait; margin: 0.5in; }
 
-  body { overflow: visible; background: #fff; color: #000; }
+  html, body { overflow: visible; background: #fff; color: #000; }
 
   .app-header .header-right,
   .sidebar,
