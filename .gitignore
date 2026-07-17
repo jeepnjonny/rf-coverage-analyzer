@@ -16,10 +16,6 @@ env/
 # Runtime data — never commit uploads or cached tiles
 uploads/
 
-# Deploy runtime state (written by install.sh / update.sh on the server)
-gunicorn.pid
-.last_reload_sha
-
 # OS / editor
 .DS_Store
 Thumbs.db

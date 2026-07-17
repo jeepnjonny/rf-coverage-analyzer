@@ -40,35 +40,26 @@ Track coverage analysis
 
 ## Quick install (Debian / Ubuntu server)
 
-Install is split into two scripts with different privilege levels:
-
-- **`install.sh`** -- one-time, needs `sudo`. Installs OS packages, clones the app to `/srv/rfanalysis`, sets up the Python venv, wires nginx, installs the systemd service, and registers `update.sh` in cron.
-- **`update.sh`** -- routine updates, no `sudo` ever. Runs as `www-data` (which already owns the checkout), pulls from GitHub, and gracefully reloads gunicorn. Installed to run automatically every 15 minutes by `install.sh`, or run it by hand.
-
 ```bash
-# install.sh clones the repo itself -- you don't need a local checkout first
-curl -fsSL https://raw.githubusercontent.com/jeepnjonny/rf-coverage-analyzer/master/install.sh -o install.sh
-chmod +x install.sh
-sudo ./install.sh
+# 1. Clone the repository
+git clone https://github.com/jeepnjonny/rf-coverage-analyzer.git
+cd rf-coverage-analyzer
+
+# 2. Run the setup script as root
+chmod +x setup.sh
+sudo ./setup.sh
 ```
 
-After install, the app is available at:
+The script installs Python 3, nginx, and rsync; sets up a Python virtual environment; installs the app as a set of `location` blocks inside nginx's existing default server; and starts the app as a systemd service.
+
+After setup, the app is available at:
 ```
 http://<server-ip>/rf-analyzer/index.html
 ```
 
-`install.sh` installs `nginx.conf` as `/etc/nginx/snippets/rf-coverage-analyzer.conf` and injects `include snippets/rf-coverage-analyzer.conf;` into the active nginx server block automatically; the injection is skipped if already present, so it's safe to re-run `install.sh` later (e.g. after a manual nginx/systemd config change).
+The setup script installs `nginx.conf` as `/etc/nginx/snippets/rf-coverage-analyzer.conf` and injects `include snippets/rf-coverage-analyzer.conf;` into the active nginx server block automatically. On re-deploy (`git pull && sudo ./setup.sh`) the injection is skipped if already present.
 
 > **Path note:** The app uses top-level paths `/static/` and `/api/`. If your nginx server already serves content at those paths they will conflict.
-
-Environment variables `install.sh` reads (all optional):
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `RF_ANALYZER_HOST` | `apps.k7swi.org` | nginx `server_name` to attach the app to |
-| `RF_ANALYZER_REPO` | this repo's URL | git remote to clone |
-| `RF_ANALYZER_BRANCH` | `master` | branch both scripts track |
-| `RF_ANALYZER_CRON` | `*/15 * * * *` | auto-update schedule; set to `off` to disable cron entirely |
 
 ## Verify the installation
 
@@ -76,20 +67,16 @@ Environment variables `install.sh` reads (all optional):
 sudo bash verify.sh
 ```
 
-Checks services, port bindings, nginx config, directory permissions, cron registration, and HTTP endpoints. Prints PASS / WARN / FAIL for each item with corrective hints for any failures.
+Checks services, port bindings, nginx config, directory permissions, and HTTP endpoints. Prints PASS / WARN / FAIL for each item with corrective hints for any failures.
 
-## Updating
+## Update an existing install
 
-Once installed, code updates are automatic: cron runs `update.sh` as `www-data` every 15 minutes (configurable via `RF_ANALYZER_CRON` at install time, or by editing `/etc/cron.d/rf-coverage-analyzer-update` directly). It no-ops quietly when there's nothing new; when there is, it fast-forwards the checkout, reinstalls Python deps if `requirements.txt` changed, and sends `SIGHUP` to gunicorn for a zero-downtime code reload. Logs go to `/var/log/rf-coverage-update.log`.
+Re-run `setup.sh` from the cloned repo. It uses `rsync --delete` to sync code files while preserving `uploads/` (cached elevation tiles, KML/CSV files, saved analyses).
 
-To update immediately instead of waiting for cron:
 ```bash
-sudo -u www-data /srv/rfanalysis/update.sh
+git pull
+sudo ./setup.sh
 ```
-
-`update.sh` refuses to run if the checkout has local modifications (protects against clobbering manual server-side debugging) and refuses a merge that isn't a clean fast-forward -- both cases need a human to look at `/srv/rfanalysis` directly.
-
-**`update.sh` cannot apply nginx or systemd changes** (that needs root). If a change to `nginx.conf`, `rf-coverage-analyzer.service`, or `install.sh` itself lands on `master`, `update.sh` still deploys the app code but logs a warning -- re-run `sudo ./install.sh` to pick up the infra change.
 
 ## Input file formats
 

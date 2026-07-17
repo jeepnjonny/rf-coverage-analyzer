@@ -99,27 +99,6 @@ case "$active" in
                 ;;
 esac
 
-# ── 4b. Auto-update (update.sh via cron) ──────────────────────────────────────
-section "Auto-update"
-
-PIDFILE="$INSTALL_DIR/gunicorn.pid"
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    pass "gunicorn.pid present and process alive -- update.sh can send SIGHUP to reload"
-else
-    fail "gunicorn.pid missing or stale at $PIDFILE -- update.sh cannot reload the app"
-    echo "         Fix: confirm rf-coverage-analyzer.service has --pid $PIDFILE, then restart the service"
-fi
-
-CRON_FILE="/etc/cron.d/$SERVICE_NAME-update"
-if [ -f "$CRON_FILE" ]; then
-    pass "Cron auto-update installed: $CRON_FILE"
-elif command -v crontab &>/dev/null && crontab -u www-data -l 2>/dev/null | grep -q update.sh; then
-    pass "Cron auto-update found in www-data's crontab"
-else
-    warn "No auto-update cron job found -- code updates require running update.sh manually"
-    echo "         Fix: re-run install.sh, or set RF_ANALYZER_CRON explicitly"
-fi
-
 # ── 5. Port binding ───────────────────────────────────────────────────────────
 section "Network / port binding"
 
