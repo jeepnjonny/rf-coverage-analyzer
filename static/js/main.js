@@ -1277,14 +1277,7 @@ function printDeploymentSummary() {
 }
 
 let _preprintView = null;
-
-// `getBoundingClientRect()` forces a synchronous layout flush so
-// invalidateSize reads the print CSS's real dimensions instead of a stale
-// pre-print size.
-function _reflowMap() {
-  map.getContainer().getBoundingClientRect();
-  map.invalidateSize({ animate: false, pan: false });
-}
+let _printLayoutActive = false;
 
 // Same "fit everything relevant into view" pattern used after an analysis
 // run (see the allPts/fitBounds block above) -- the print page has a fixed,
@@ -1299,20 +1292,46 @@ function _fitMapToContent() {
   if (allPts.length) map.fitBounds(L.latLngBounds(allPts).pad(0.1), { animate: false });
 }
 
-window.addEventListener('beforeprint', () => {
-  buildPrintReport();
-  _preprintView = { center: map.getCenter(), zoom: map.getZoom() };
-  _reflowMap();
+function _enterPrintLayout() {
+  // Only capture the view to restore later once -- but keep re-fitting on
+  // every call. ResizeObserver can fire more than once while the browser's
+  // print layout is still settling into its final size, and a one-shot fit
+  // risks locking onto an intermediate, not-yet-final container size.
+  if (!_printLayoutActive) {
+    _printLayoutActive = true;
+    _preprintView = { center: map.getCenter(), zoom: map.getZoom() };
+  }
+  map.invalidateSize({ animate: false, pan: false });
   _fitMapToContent();
-});
+}
 
-window.addEventListener('afterprint', () => {
-  _reflowMap();
+function _exitPrintLayout() {
+  if (!_printLayoutActive) return;
+  _printLayoutActive = false;
+  map.invalidateSize({ animate: false, pan: false });
   if (_preprintView) {
     map.setView(_preprintView.center, _preprintView.zoom, { animate: false });
     _preprintView = null;
   }
-});
+}
+
+window.addEventListener('beforeprint', buildPrintReport);
+
+// The real resize/refit is driven by ResizeObserver rather than the
+// beforeprint/afterprint events: JS run inside those handlers is not
+// reliably reflected in the actual print/PDF output across browsers --
+// some browsers capture the print snapshot on their own schedule,
+// independent of when a beforeprint handler finishes running. ResizeObserver
+// instead reacts to the browser's own layout engine actually changing
+// #map's rendered box (which @media print's CSS does), so it fires at a
+// moment guaranteed to reflect the real print-time size.
+new ResizeObserver(() => {
+  if (window.matchMedia('print').matches) {
+    _enterPrintLayout();
+  } else {
+    _exitPrintLayout();
+  }
+}).observe(document.getElementById('map'));
 
 function updateSingleRxSelect() {
   const sel = document.getElementById('single-rx-select');
