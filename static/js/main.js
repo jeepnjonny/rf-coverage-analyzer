@@ -1276,21 +1276,23 @@ function printDeploymentSummary() {
   window.print();
 }
 
-let _preprintView = null;
+// Resize the map to fit the print container itself (not an attempt to
+// reproduce the on-screen pan/zoom -- the page has a fixed, very different
+// aspect ratio than the live viewport, so "same view" isn't a coherent goal;
+// "properly sized to the page" is). `getBoundingClientRect()` forces a
+// synchronous layout flush so invalidateSize reads the print CSS's real
+// dimensions instead of a stale pre-print size.
+function _resizeMapForContainer() {
+  map.getContainer().getBoundingClientRect();
+  map.invalidateSize({ animate: false, pan: false });
+}
 
 window.addEventListener('beforeprint', () => {
   buildPrintReport();
-  _preprintView = { center: map.getCenter(), zoom: map.getZoom(), bounds: map.getBounds() };
-  map.invalidateSize({ animate: false });
-  map.fitBounds(_preprintView.bounds, { animate: false });
+  _resizeMapForContainer();
 });
 
-window.addEventListener('afterprint', () => {
-  if (!_preprintView) return;
-  map.invalidateSize({ animate: false });
-  map.setView(_preprintView.center, _preprintView.zoom, { animate: false });
-  _preprintView = null;
-});
+window.addEventListener('afterprint', _resizeMapForContainer);
 
 function updateSingleRxSelect() {
   const sel = document.getElementById('single-rx-select');
