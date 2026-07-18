@@ -1172,9 +1172,7 @@ function _buildRosterGroups() {
       })),
   }));
 
-  const counts = roles.map(role => [ROLE_LABEL[role] || role.toUpperCase(), byRole[role].length]);
-
-  return { groups, counts, total: enabled.length, excluded };
+  return { groups, total: enabled.length, excluded };
 }
 
 function _rosterTableHtml(rows) {
@@ -1184,10 +1182,15 @@ function _rosterTableHtml(rows) {
       <td>${r.height}</td>
       <td>${r.gain}</td>
       <td>${r.power}</td>
-      <td>${r.role}</td>
+      <td></td>
+      <td></td>
     </tr>`).join('');
   return `<table class="results-table roster-table">
-      <thead><tr><th>Location</th><th>GPS</th><th>Height</th><th>Antenna</th><th>Power</th><th>Role</th></tr></thead>
+      <colgroup>
+        <col style="width:14ch"><col style="width:20ch"><col style="width:8ch">
+        <col style="width:8ch"><col style="width:14ch"><col style="width:15ch"><col style="width:15ch">
+      </colgroup>
+      <thead><tr><th>Location</th><th>GPS</th><th>Height</th><th>Antenna</th><th>Power</th><th>Who</th><th>Tactical</th></tr></thead>
       <tbody>${trs}</tbody>
     </table>`;
 }
@@ -1198,7 +1201,7 @@ function renderHardwareTab() {
   if (!empty || !grid) return;
 
   const rxs = state.receivers || [];
-  const { groups, counts, excluded } = _buildRosterGroups();
+  const { groups, excluded } = _buildRosterGroups();
 
   if (!groups.length) {
     empty.classList.remove('hidden');
@@ -1217,20 +1220,11 @@ function renderHardwareTab() {
       ${_rosterTableHtml(g.rows)}
     </div>`).join('');
 
-  const countTrs = counts.map(([k, v]) => `<tr><td>${k}</td><td class="hw-count">${v}</td></tr>`).join('');
-  const summary = `<div class="hw-role-summary">
-      <div class="hw-section-title">Summary by Role</div>
-      <table class="results-table">
-        <thead><tr><th></th><th class="hw-count">Count</th></tr></thead>
-        <tbody>${countTrs}</tbody>
-      </table>
-    </div>`;
-
   const excludedNote = excluded.length
     ? `<div class="hw-excluded-note">Excluded (disabled) receivers: ${excluded.join(', ')}</div>`
     : '';
 
-  grid.innerHTML = sections + summary + excludedNote;
+  grid.innerHTML = sections + excludedNote;
 }
 
 function setPrintSummaryEnabled(on) {
@@ -1242,22 +1236,13 @@ function buildPrintReport() {
   const el = document.getElementById('print-report');
   if (!el) return;
 
-  const { groups, counts, excluded } = _buildRosterGroups();
+  const { groups, excluded } = _buildRosterGroups();
   if (!groups.length) { el.innerHTML = ''; return; }
 
   const sections = groups.map(g => `<div class="hw-role-section">
       <div class="hw-section-title">${g.label} — ${g.rows.length} site${g.rows.length === 1 ? '' : 's'}</div>
       ${_rosterTableHtml(g.rows)}
     </div>`).join('');
-
-  const countTrs = counts.map(([k, v]) => `<tr><td>${k}</td><td class="hw-count">${v}</td></tr>`).join('');
-  const summary = `<div class="hw-role-summary">
-      <div class="hw-section-title">Summary by Role</div>
-      <table class="results-table">
-        <thead><tr><th></th><th class="hw-count">Count</th></tr></thead>
-        <tbody>${countTrs}</tbody>
-      </table>
-    </div>`;
 
   const excludedNote = excluded.length
     ? `<div class="hw-excluded-note">Excluded (disabled) receivers: ${excluded.join(', ')}</div>`
@@ -1268,7 +1253,7 @@ function buildPrintReport() {
       <h1>Deployment Summary</h1>
       <div class="print-report-meta">Generated ${new Date().toLocaleString()}</div>
     </div>
-    <div class="print-report-body">${sections}${summary}${excludedNote}</div>`;
+    <div class="print-report-body">${sections}${excludedNote}</div>`;
 }
 
 function printDeploymentSummary() {
