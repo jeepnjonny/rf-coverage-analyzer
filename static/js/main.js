@@ -32,6 +32,15 @@ const COORD_DP    = 6;   // decimal places — matches server _rc()
 
 function rc(v) { return parseFloat(v.toFixed(COORD_DP)); }
 
+// Escape user-supplied strings (receiver names, KML placemark/track names,
+// saved-analysis names) before interpolating into innerHTML/bindTooltip —
+// those values round-trip through uploaded files or free-text inputs and
+// are never HTML-safe by construction.
+const _ESC_HTML_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, ch => _ESC_HTML_MAP[ch]);
+}
+
 // ---------------------------------------------------------------------------
 // Map
 // ---------------------------------------------------------------------------
@@ -179,12 +188,21 @@ let _elevTimer       = null;
 let _signalHideTimer = null;
 const _elevMemo = {};   // simple memo: "lat,lon" -> elevation_m
 
+// Browsers fire mousemove far more often than paint (especially with a high
+// polling-rate mouse), and onCursorMove does real work (nearest-point scans +
+// several DOM writes) — rAF-gate it so at most one update runs per frame.
+let _cursorMoveRaf     = null;
+let _pendingCursorLatLng = null;
 map.on('mousemove', e => {
-  const lat = rc(e.latlng.lat);
-  const lon = rc(e.latlng.lng);
-  onCursorMove(lat, lon);
+  _pendingCursorLatLng = e.latlng;
+  if (_cursorMoveRaf !== null) return;
+  _cursorMoveRaf = requestAnimationFrame(() => {
+    _cursorMoveRaf = null;
+    onCursorMove(rc(_pendingCursorLatLng.lat), rc(_pendingCursorLatLng.lng));
+  });
 });
 map.on('mouseout', () => {
+  if (_cursorMoveRaf !== null) { cancelAnimationFrame(_cursorMoveRaf); _cursorMoveRaf = null; }
   document.getElementById('info-gps').textContent         = '—';
   document.getElementById('info-elev').textContent        = '—';
   document.getElementById('info-signal').textContent      = '—';
@@ -290,7 +308,7 @@ function _updateSignalPanel(nr) {
   for (const rr of nr.rx_results) {
     const rxIdx = rr.rx_idx ?? -1;
     const rx    = rxIdx >= 0 ? state.receivers[rxIdx] : null;
-    const name  = rx?.name || (rxIdx >= 0 ? `RX${rxIdx + 1}` : 'RX?');
+    const name  = escapeHtml(rx?.name || (rxIdx >= 0 ? `RX${rxIdx + 1}` : 'RX?'));
     const color = rxIdx >= 0 ? rxColor(rxIdx) : '#888';
 
     const sensitivity = parseFloat(document.getElementById('rx-sens').value) || -135;
@@ -320,24 +338,61 @@ function _updateSignalPanel(nr) {
   });
 }
 
+// Spatial hash grid for nearest-point lookups, keyed off array identity/length
+// so it's only rebuilt when the underlying array actually changes (both
+// pathResults and heatMapResults are always either reassigned to [] or grown
+// via push(), never mutated in place — see call sites of each). Cell size
+// (0.01°) is comfortably larger than either caller's search cutoff, so a
+// plain 3×3-neighborhood scan around the query cell is guaranteed to find
+// the true nearest point without falling back to a full linear scan.
+const _GRID_CELL_DEG = 0.01;
+function _gridCellKey(lat, lon) {
+  return `${Math.floor(lat / _GRID_CELL_DEG)},${Math.floor(lon / _GRID_CELL_DEG)}`;
+}
+function _buildSpatialGrid(points) {
+  const grid = new Map();
+  for (const p of points) {
+    const key = _gridCellKey(p.lat, p.lon);
+    let cell = grid.get(key);
+    if (!cell) { cell = []; grid.set(key, cell); }
+    cell.push(p);
+  }
+  return grid;
+}
+function _nearestViaGrid(points, cache, lat, lon) {
+  if (cache.ref !== points || cache.len !== points.length) {
+    cache.ref  = points;
+    cache.len  = points.length;
+    cache.grid = _buildSpatialGrid(points);
+  }
+  const cx = Math.floor(lat / _GRID_CELL_DEG);
+  const cy = Math.floor(lon / _GRID_CELL_DEG);
+  let best = null, bestD = Infinity;
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const cell = cache.grid.get(`${cx + dx},${cy + dy}`);
+      if (!cell) continue;
+      for (const p of cell) {
+        const d = (p.lat - lat) ** 2 + (p.lon - lon) ** 2;
+        if (d < bestD) { bestD = d; best = p; }
+      }
+    }
+  }
+  return { best, bestD };
+}
+
+const _pathResultGridCache = { ref: null, len: -1, grid: null };
 function findNearestResult(lat, lon) {
   if (!state.pathResults.length) return null;
-  let best = null, bestD = Infinity;
-  for (const r of state.pathResults) {
-    const d = (r.lat - lat) ** 2 + (r.lon - lon) ** 2;
-    if (d < bestD) { bestD = d; best = r; }
-  }
+  const { best, bestD } = _nearestViaGrid(state.pathResults, _pathResultGridCache, lat, lon);
   // Only show if cursor is within ~500 m (≈ 0.005°)
   return bestD < 2.5e-5 ? best : null;
 }
 
+const _heatCellGridCache = { ref: null, len: -1, grid: null };
 function findNearestHeatCell(lat, lon) {
   if (!state.heatMapResults.length) return null;
-  let best = null, bestD = Infinity;
-  for (const c of state.heatMapResults) {
-    const d = (c.lat - lat) ** 2 + (c.lon - lon) ** 2;
-    if (d < bestD) { bestD = d; best = c; }
-  }
+  const { best, bestD } = _nearestViaGrid(state.heatMapResults, _heatCellGridCache, lat, lon);
   // Cutoff scales with the grid spacing (roughly one cell's footprint) rather
   // than a fixed distance -- heat map spacing ranges from 25 m to 400 m across
   // resolution tiers, unlike the ~fixed spacing of interpolated track points.
@@ -473,7 +528,7 @@ async function showKmlDetail(name) {
     } else if (info.linestrings.length === 1) {
       const ls = info.linestrings[0];
       html += '<div class="fm-kml-info">';
-      html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Name</span><span>${ls.name}</span></div>`;
+      html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Name</span><span>${escapeHtml(ls.name)}</span></div>`;
       html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Points</span><span>${ls.point_count.toLocaleString()}</span></div>`;
       if (!track.error) {
         html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Bounds SW</span><span>${track.bounds[0][0].toFixed(5)}, ${track.bounds[0][1].toFixed(5)}</span></div>`;
@@ -483,9 +538,10 @@ async function showKmlDetail(name) {
     } else {
       // Multiple LineStrings — radio group
       info.linestrings.forEach((ls, i) => {
+        const lsName = escapeHtml(ls.name);
         html += `<label class="fm-track-radio">
-          <input type="radio" name="fm-track-sel" value="${ls.name}" ${i === 0 ? 'checked' : ''}/>
-          <span>${ls.name}</span>
+          <input type="radio" name="fm-track-sel" value="${lsName}" ${i === 0 ? 'checked' : ''}/>
+          <span>${lsName}</span>
           <span class="fm-dim">&nbsp;(${ls.point_count.toLocaleString()} pts)</span>
         </label>`;
       });
@@ -504,7 +560,7 @@ async function showKmlDetail(name) {
         html += `<label class="fm-pm-row">
           <input type="checkbox" class="fm-pm-cb" data-idx="${i}" ${precheck ? 'checked' : ''}/>
           <span class="fm-pm-icon">${icon}</span>
-          <span class="fm-pm-name">${pm.name || '(unnamed)'}</span>
+          <span class="fm-pm-name">${escapeHtml(pm.name || '(unnamed)')}</span>
           <span class="fm-pm-coords">${pm.lat.toFixed(4)}, ${pm.lon.toFixed(4)}</span>
         </label>`;
       });
@@ -512,7 +568,7 @@ async function showKmlDetail(name) {
 
       const defName = name.replace(/\.(kml|gpx)$/i, '') + '-receivers.csv';
       html += `<div class="fm-save-rx-row">
-        <input id="fm-rx-csv-name" class="ctrl-input" type="text" value="${defName}" />
+        <input id="fm-rx-csv-name" class="ctrl-input" type="text" value="${escapeHtml(defName)}" />
         <button class="btn btn-primary btn-sm" id="fm-save-rx-btn">Save as CSV</button>
       </div>`;
     }
@@ -871,7 +927,7 @@ function _rxEnabled(rx) { return (rx.enabled ?? '1') !== '0'; }
 function _rxRole(rx) { return (rx.role || 'wide1').toLowerCase(); }
 
 function _rxTooltip(rx, i) {
-  const name      = rx.name || `RX${i + 1}`;
+  const name      = escapeHtml(rx.name || `RX${i + 1}`);
   const enabled   = _rxEnabled(rx);
   const roleLabel = ROLE_LABEL[_rxRole(rx)] || _rxRole(rx).toUpperCase();
   const badge     = enabled ? '' : '<br><span style="color:#e05252;font-size:10px">⊘ disabled — excluded from analysis</span>';
@@ -1143,7 +1199,7 @@ function _powerLabel(dbm) {
 function _buildRosterGroups() {
   const rxs      = state.receivers || [];
   const enabled  = rxs.filter(_rxEnabled);
-  const excluded = rxs.filter(r => !_rxEnabled(r)).map(r => r.name);
+  const excluded = rxs.filter(r => !_rxEnabled(r)).map(r => escapeHtml(r.name));
 
   const byRole = {};
   enabled.forEach(r => {
@@ -1163,7 +1219,7 @@ function _buildRosterGroups() {
       .slice()
       .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
       .map(r => ({
-        name:   r.name || '(unnamed)',
+        name:   escapeHtml(r.name || '(unnamed)'),
         gps:    `${parseFloat(r.latitude).toFixed(5)}, ${parseFloat(r.longitude).toFixed(5)}`,
         height: `${r.height_agl_m ?? '?'} m`,
         gain:   `${r.antenna_gain_dbi ?? '?'} dBi`,
@@ -1391,8 +1447,15 @@ document.getElementById('analyze-links-btn').addEventListener('click', () => {
 });
 
 
+// Bumped by every startAnalysis() call; segment-layer flushes deferred to a
+// requestAnimationFrame (see flushSeg below) check this so a straggling
+// flush from an aborted/superseded run can never draw onto a layer that a
+// newer run has already cleared and started repopulating.
+let _analysisRunId = 0;
+
 function startAnalysis(mode, opts = {}) {
   if (state.analysisRunning) return;
+  const runId = ++_analysisRunId;
 
   // Clear only the layer(s) this mode will repopulate.
   // skipClear=true lets a caller pre-clear selectively (e.g. receiver drag).
@@ -1472,6 +1535,26 @@ function startAnalysis(mode, opts = {}) {
   // Segment drawing state
   let segColor = null;
   let segPts   = [];
+
+  // SSE 'points_batch' events can carry many points, each of which may end a
+  // segment; adding each finished polyline to the map synchronously as it's
+  // built can cause layout thrashing when a batch has several color changes.
+  // Collect finished polylines and add them to resultLayer at most once per
+  // animation frame instead. Guarded by runId so a flush left over from an
+  // aborted/superseded run never lands on a layer a newer run already owns.
+  let _pendingSegLayers = [];
+  let _flushLayersRaf   = null;
+  const _schedulePendingLayerFlush = () => {
+    if (_flushLayersRaf !== null) return;
+    _flushLayersRaf = requestAnimationFrame(() => {
+      _flushLayersRaf = null;
+      const pending = _pendingSegLayers;
+      _pendingSegLayers = [];
+      if (runId !== _analysisRunId) return;
+      pending.forEach(poly => poly.addTo(resultLayer));
+    });
+  };
+
   const flushSeg = nextPt => {
     if (segPts.length > 1) {
       const poly = L.polyline(segPts, { color: segColor, weight: 5, opacity: 0.85 });
@@ -1479,7 +1562,8 @@ function startAnalysis(mode, opts = {}) {
         const nr = findNearestResult(rc(e.latlng.lat), rc(e.latlng.lng));
         if (nr && nr.best_rx_idx >= 0) showPathPointProfile(nr);
       });
-      poly.addTo(resultLayer);
+      _pendingSegLayers.push(poly);
+      _schedulePendingLayerFlush();
     }
     segPts = nextPt ? [nextPt] : [];
   };
@@ -1625,9 +1709,10 @@ function handleSSE(evt, ctx) {
       if (isBackbone) opts.dashArray = '9 5';
 
       const roleDesc = r => (ROLE_LABEL[r] || r.toUpperCase());
+      const rx1Name = escapeHtml(rx1.name), rx2Name = escapeHtml(rx2.name);
       const linkLabel = isBackbone
-        ? `Backbone: ${rx1.name} (${roleDesc(r1)}) ↔ ${rx2.name} (${roleDesc(r2)})`
-        : `${rx1.name} ↔ ${rx2.name}`;
+        ? `Backbone: ${rx1Name} (${roleDesc(r1)}) ↔ ${rx2Name} (${roleDesc(r2)})`
+        : `${rx1Name} ↔ ${rx2Name}`;
 
       const pl = L.polyline(
         [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
@@ -1803,9 +1888,10 @@ function _drawInterRxResults(results, receivers) {
                      rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx };
     if (isBackbone) opts.dashArray = '9 5';
     const roleDesc = r => (ROLE_LABEL[r] || r.toUpperCase());
+    const rx1Name = escapeHtml(rx1.name), rx2Name = escapeHtml(rx2.name);
     const linkLabel = isBackbone
-      ? `Backbone: ${rx1.name} (${roleDesc(r1)}) ↔ ${rx2.name} (${roleDesc(r2)})`
-      : `${rx1.name} ↔ ${rx2.name}`;
+      ? `Backbone: ${rx1Name} (${roleDesc(r1)}) ↔ ${rx2Name} (${roleDesc(r2)})`
+      : `${rx1Name} ↔ ${rx2Name}`;
     const pl = L.polyline(
       [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
        [parseFloat(rx2.latitude), parseFloat(rx2.longitude)]],
@@ -1851,12 +1937,12 @@ function renderFmSavedList() {
       : '';
 
     div.innerHTML = `
-      <div class="fm-saved-item-name">${a.name || 'Unnamed'}</div>
+      <div class="fm-saved-item-name">${escapeHtml(a.name || 'Unnamed')}</div>
       <div class="fm-saved-item-meta">
         <span>${date}</span>
         ${modeBadge}${covBadge}
-        ${a.kml_file ? `<span class="fm-saved-item-badge">📍 ${a.kml_file}</span>` : ''}
-        ${a.csv_file ? `<span class="fm-saved-item-badge">📋 ${a.csv_file}</span>` : ''}
+        ${a.kml_file ? `<span class="fm-saved-item-badge">📍 ${escapeHtml(a.kml_file)}</span>` : ''}
+        ${a.csv_file ? `<span class="fm-saved-item-badge">📋 ${escapeHtml(a.csv_file)}</span>` : ''}
       </div>`;
     div.addEventListener('click', () => {
       fm.selAnalysis = a.id;
@@ -1991,7 +2077,7 @@ function renderResults(stats, totalPct, doSwitchTab = true, trackDistM = 0) {
     const distMi  = distM !== null ? (distM * 0.000621371).toFixed(2) : null;
     const tr      = document.createElement('tr');
     tr.innerHTML = `
-      <td><span class="rx-swatch" style="background:${color}"></span>${s.name}</td>
+      <td><span class="rx-swatch" style="background:${color}"></span>${escapeHtml(s.name)}</td>
       <td>${s.coverage_pct}%</td>
       <td>${s.avg_rssi !== null ? s.avg_rssi + ' dBm' : '—'}</td>
       <td>${distM !== null ? distM.toLocaleString() : '—'}</td>
@@ -3483,7 +3569,7 @@ function _showRxContextMenu(domEvent, rxIdx) {
   div.style.left = domEvent.clientX + 'px';
   div.style.top  = domEvent.clientY + 'px';
   div.innerHTML =
-    `<div class="ia-test-coords">${rx.name || `RX${rxIdx + 1}`}</div>` +
+    `<div class="ia-test-coords">${escapeHtml(rx.name || `RX${rxIdx + 1}`)}</div>` +
     `<button class="btn btn-primary" id="rx-ctx-edit">✏️ Edit parameters</button>` +
     (canFocus
       ? `<button class="btn btn-primary" id="rx-ctx-focus">📡 Focus analysis</button>`
