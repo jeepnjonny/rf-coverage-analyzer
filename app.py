@@ -21,6 +21,7 @@ import csv
 import io
 import json
 import math
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -28,6 +29,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from urllib.parse import unquote
 from collections import OrderedDict
@@ -185,6 +187,30 @@ def _pt_uncached(points: list[tuple[float, float]]) -> list[tuple[float, float]]
     return [p for p, k in zip(rounded, keys) if k not in cached_set]
 
 
+# Row-count cap for the point-elevation fallback cache. Each row is small
+# (~40 bytes) so this is a generous ceiling; it exists so a long-lived
+# deployment covering many disjoint regions doesn't grow elev_pts forever.
+# INSERT OR REPLACE deletes+reinserts on conflict, so rowid order is a
+# reasonable recency proxy without the write-on-read cost a real LRU would add.
+ELEV_DB_MAX_ROWS = int(os.environ.get("ELEV_DB_MAX_ROWS", "3000000"))
+
+
+def _evict_elev_db_if_needed() -> None:
+    with _db_lock:
+        count = _db_conn.execute("SELECT COUNT(*) FROM elev_pts").fetchone()[0]
+        if count <= ELEV_DB_MAX_ROWS:
+            return
+        excess = count - int(ELEV_DB_MAX_ROWS * 0.9)
+        _db_conn.execute(
+            "DELETE FROM elev_pts WHERE rowid IN "
+            "(SELECT rowid FROM elev_pts ORDER BY rowid ASC LIMIT ?)",
+            (excess,),
+        )
+        _db_conn.commit()
+        app.logger.info("Elevation point cache: evicted %d oldest row(s) (%d → %d)",
+                         excess, count, count - excess)
+
+
 # ---------------------------------------------------------------------------
 # AWS Terrarium elevation tile service
 # Encoding: elev_m = R*256 + G + B/256 − 32768
@@ -334,7 +360,8 @@ class ElevationTileService:
                 e = self._elev_from_pixels(pixels, px, py)
                 if -500 <= e <= 9000:
                     return e
-            except Exception:
+            except Exception as exc:
+                app.logger.debug("Pixel decode failed at z%d (%.5f,%.5f): %s", zoom, lat, lon, exc)
                 continue
         return None
 
@@ -392,8 +419,84 @@ class ElevationTileService:
 
         return total
 
+    # -- Disk cache eviction --
+    #
+    # Tiles on disk are re-downloadable at any time (they're just an AWS S3
+    # mirror cache), so unlike the in-memory LRU there was previously no cap
+    # at all here — a long-lived deployment covering many regions would grow
+    # uploads/tiles/ forever. Evict oldest-by-mtime files once the on-disk
+    # total exceeds DISK_CACHE_MAX_BYTES, down to a lower watermark so this
+    # doesn't re-trigger on every single new tile.
+    DISK_CACHE_MAX_BYTES = int(os.environ.get("TILE_DISK_CACHE_MAX_MB", "4096")) * 1024 * 1024
+    DISK_CACHE_LOW_WATERMARK = 0.9  # evict down to 90% of the cap
+
+    def evict_disk_cache(self) -> None:
+        try:
+            entries = [(p, p.stat().st_size, p.stat().st_mtime)
+                       for p in self.tile_dir.glob("t*.png")]
+        except OSError as exc:
+            app.logger.warning("Tile disk cache scan failed: %s", exc)
+            return
+        before = total = sum(size for _, size, _ in entries)
+        if total <= self.DISK_CACHE_MAX_BYTES:
+            return
+        target = int(self.DISK_CACHE_MAX_BYTES * self.DISK_CACHE_LOW_WATERMARK)
+        entries.sort(key=lambda e: e[2])  # oldest-accessed first
+        evicted = 0
+        for path, size, _ in entries:
+            if total <= target:
+                break
+            try:
+                path.unlink()
+                total -= size
+                evicted += 1
+            except OSError:
+                pass  # already removed by a concurrent worker/process
+        if evicted:
+            app.logger.info(
+                "Tile disk cache: evicted %d file(s), %.0f MB → %.0f MB",
+                evicted, before / 1e6, total / 1e6,
+            )
+
 
 _tiles = ElevationTileService(TILE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Periodic cache eviction — keeps uploads/tiles/ and elevation_cache.db from
+# growing without bound over a long-lived deployment. Runs once at import
+# (covers short-lived/dev runs) and then on an interval for long-lived
+# gunicorn workers. Cheap enough (one disk scan, one SQL count) that running
+# it redundantly across a few gunicorn workers is not worth coordinating.
+# ---------------------------------------------------------------------------
+
+_CACHE_EVICTION_INTERVAL_S = int(os.environ.get("CACHE_EVICTION_INTERVAL_S", str(6 * 3600)))
+
+
+def _run_cache_eviction() -> None:
+    try:
+        _tiles.evict_disk_cache()
+    except Exception as exc:
+        app.logger.warning("Tile disk cache eviction failed: %s", exc)
+    try:
+        _evict_elev_db_if_needed()
+    except Exception as exc:
+        app.logger.warning("Elevation point cache eviction failed: %s", exc)
+
+
+def _cache_eviction_loop() -> None:
+    while True:
+        time.sleep(_CACHE_EVICTION_INTERVAL_S)
+        _run_cache_eviction()
+
+
+if multiprocessing.current_process().name == "MainProcess":
+    # Guard against re-running on the `spawn` start method (Windows / explicit
+    # config), where pool workers re-import this module from scratch. Under
+    # `fork` (the Linux/prod default) this guard is a no-op — the pool never
+    # re-executes module top-level code in the child anyway.
+    _run_cache_eviction()
+    threading.Thread(target=_cache_eviction_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +525,8 @@ def _fetch_opentopodata(chunk: list[tuple[float, float]]) -> bool:
                             kvs.append((_elev_key(la, lo), float(elev)))
                     _pt_put_many(kvs)
                     return True
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("OpenTopoData fetch failed for %d pts: %s", len(chunk), exc)
     return False
 
 
@@ -447,8 +550,8 @@ def _fetch_open_elevation(chunk: list[tuple[float, float]]) -> bool:
                         kvs.append((_elev_key(la, lo), float(elev)))
                 _pt_put_many(kvs)
                 return True
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("Open-Elevation fetch failed for %d pts: %s", len(chunk), exc)
     return False
 
 
@@ -464,8 +567,8 @@ def _fetch_usgs_single(lat_lon: tuple[float, float]) -> tuple[float, float, floa
             val = resp.json().get("value")
             if val is not None and float(val) != -1_000_000:
                 return la, lo, float(val)
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("USGS EPQS fetch failed for (%.5f,%.5f): %s", la, lo, exc)
     return la, lo, None  # failure — caller must NOT store this in the cache
 
 
@@ -1015,8 +1118,8 @@ def _shutdown_pool_safely(pool: "ProcessPoolExecutor | None") -> None:
         return
     try:
         pool.shutdown(wait=False, cancel_futures=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("Pool shutdown raised (likely already broken): %s", exc)
 
 
 def _cancel_futures(futures) -> None:
@@ -1125,7 +1228,8 @@ def _terrain_check_task(args: tuple) -> dict:
         ):
             return {"ci": ci, "ok": False, "reason": "excl"}
         return {"ci": ci, "ok": True}
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("Terrain check failed for candidate %s (%.5f,%.5f): %s", ci, clat, clon, exc)
         return {"ci": ci, "ok": True}
 
 
@@ -1138,7 +1242,8 @@ def _coarse_task(args: tuple) -> dict:
             clat, clon, c_agl, track_pts, freq_mhz,
             tx_power_dbm, tx_gain_dbi, sensitivity_dbm, fade_margin_db,
         )
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("Coarse score failed for candidate %s (%.5f,%.5f): %s", ci, clat, clon, exc)
         score = 0.0
     return {"ci": ci, "score": score}
 
@@ -1149,7 +1254,8 @@ def _los_check_task(args: tuple) -> dict:
     try:
         ok = any(terrain_los_clear(clat, clon, agl, lat, lon)
                  for lat, lon in check_pts)
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("LOS check failed for candidate %s (%.5f,%.5f): %s", ci, clat, clon, exc)
         ok = True
     return {"ci": ci, "ok": ok}
 
@@ -1252,6 +1358,12 @@ GPX_NS = [
     "",
 ]
 
+# Google's KML extension namespace — fixed (unlike KML_NS, gx: doesn't vary
+# across producers), used by <gx:Track>/<gx:MultiTrack> for timestamped
+# tracks. Common from Google Earth "Save Place As", GPS Visualizer, and
+# various GPS-to-KML converters that don't use plain <LineString>.
+GX_NS = "http://www.google.com/kml/ext/2.2"
+
 CSV_COLUMNS = ["name", "longitude", "latitude", "height_agl_m", "antenna_gain_dbi", "tx_power_dbm", "enabled", "role"]
 
 
@@ -1266,6 +1378,58 @@ def _parse_coord_text(text: str) -> list[tuple[float, float]]:
             except ValueError:
                 pass
     return result
+
+
+def _parse_gx_coord_text(text: str) -> tuple[float, float] | None:
+    """Convert one <gx:coord> text value ('lon lat alt', space-separated) to (lat, lon)."""
+    parts = (text or "").strip().split()
+    if len(parts) >= 2:
+        try:
+            return (_rc(float(parts[1])), _rc(float(parts[0])))
+        except ValueError:
+            pass
+    return None
+
+
+def _kml_geometry_points(pm, np: str) -> list[tuple[float, float]]:
+    """
+    Collect (lat, lon) points from every geometry inside a Placemark,
+    concatenated in document order:
+      • <LineString> — including multiple LineStrings wrapped in a
+        <MultiGeometry> (a split/multi-part track exported as one Placemark),
+        since Element.iter() finds them at any nesting depth.
+      • <gx:Track> / <gx:MultiTrack> — Google's timestamped-track extension.
+    """
+    pts: list[tuple[float, float]] = []
+    for ls in pm.iter(f"{np}LineString"):
+        ce = ls.find(f"{np}coordinates")
+        if ce is not None:
+            pts.extend(_parse_coord_text(ce.text or ""))
+    for trk in pm.iter(f"{{{GX_NS}}}Track"):
+        for coord_el in trk.findall(f"{{{GX_NS}}}coord"):
+            pt = _parse_gx_coord_text(coord_el.text)
+            if pt is not None:
+                pts.append(pt)
+    return pts
+
+
+def _extract_kml_from_kmz(data: bytes) -> bytes:
+    """
+    Extract the primary KML document's bytes from a KMZ (zip) archive.
+
+    Raises ValueError with a human-readable message on a bad/empty archive.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Not a valid KMZ (zip) file: {exc}") from exc
+    kml_names = [n for n in zf.namelist() if n.lower().endswith(".kml")]
+    if not kml_names:
+        raise ValueError("KMZ archive does not contain a .kml file")
+    # KML spec convention: the root document is usually named doc.kml.
+    preferred = next((n for n in kml_names if n.lower() == "doc.kml"), None)
+    name = preferred or min(kml_names, key=lambda n: n.count("/"))
+    return zf.read(name)
 
 
 def _validate_track_content(data: bytes, ext: str) -> str | None:
@@ -1295,9 +1459,12 @@ def parse_kml(content: str, track_name: str | None = None) -> list[tuple[float, 
     """
     Parse track coordinates from a KML file.
 
-    If track_name is given, returns only the named LineString's coordinates.
-    Otherwise returns the first LineString found (ignores Point placemarks so
-    aid-station coordinates no longer pollute the track).
+    If track_name is given, returns only the named track's coordinates.
+    Otherwise returns the first track found (ignores Point placemarks so
+    aid-station coordinates no longer pollute the track). A "track" here is
+    any combination of <LineString> (including multiple wrapped in a
+    <MultiGeometry> — concatenated in order) and <gx:Track>/<gx:MultiTrack>
+    within one Placemark; see _kml_geometry_points().
     Falls back to any <coordinates> element for bare KMLs with no Placemark wrapper.
     """
     try:
@@ -1312,24 +1479,14 @@ def parse_kml(content: str, track_name: str | None = None) -> list[tuple[float, 
                 name_el = pm.find(f"{np}name")
                 if name_el is None or (name_el.text or "").strip() != track_name:
                     continue
-                ls = pm.find(f".//{np}LineString")
-                if ls is None:
-                    continue
-                ce = ls.find(f"{np}coordinates")
-                if ce is not None:
-                    pts = _parse_coord_text(ce.text or "")
-                    if pts:
-                        return pts
+                pts = _kml_geometry_points(pm, np)
+                if pts:
+                    return pts
         else:
             for pm in root.iter(f"{np}Placemark"):
-                ls = pm.find(f".//{np}LineString")
-                if ls is None:
-                    continue
-                ce = ls.find(f"{np}coordinates")
-                if ce is not None:
-                    pts = _parse_coord_text(ce.text or "")
-                    if pts:
-                        return pts
+                pts = _kml_geometry_points(pm, np)
+                if pts:
+                    return pts
             # Fallback: bare <coordinates> element (legacy / simple KMLs)
             for el in root.iter(f"{np}coordinates"):
                 pts = _parse_coord_text(el.text or "")
@@ -1354,7 +1511,8 @@ def _kml_icon_type(href: str) -> str:
 def parse_kml_info(content: str) -> dict:
     """
     Return structured metadata for a KML file:
-      linestrings — [{name, point_count}] for each named LineString Placemark
+      linestrings — [{name, point_count}] for each Placemark with track geometry
+                    (LineString/MultiGeometry/gx:Track — see _kml_geometry_points())
       placemarks  — [{name, lat, lon, description, icon_type}] for each Point Placemark
     """
     try:
@@ -1377,16 +1535,13 @@ def parse_kml_info(content: str) -> dict:
             href_el = pm.find(f".//{np}href")
             icon_href = (href_el.text or "") if href_el is not None else ""
 
-            # LineString?
-            ls = pm.find(f".//{np}LineString")
-            if ls is not None:
-                ce = ls.find(f"{np}coordinates")
-                if ce is not None:
-                    pts = _parse_coord_text(ce.text or "")
-                    label = name or f"Track {len(linestrings) + 1}"
-                    if pts and label not in seen_ls:
-                        linestrings.append({"name": label, "point_count": len(pts)})
-                        seen_ls.add(label)
+            # Track geometry? (LineString, MultiGeometry of LineStrings, gx:Track)
+            geom_pts = _kml_geometry_points(pm, np)
+            if geom_pts:
+                label = name or f"Track {len(linestrings) + 1}"
+                if label not in seen_ls:
+                    linestrings.append({"name": label, "point_count": len(geom_pts)})
+                    seen_ls.add(label)
                 continue
 
             # Point?
@@ -1606,12 +1761,21 @@ def upload_file(filetype: str):
     data = f.read()
     if not data:
         return jsonify({"error": "Uploaded file is empty"}), 400
+    fname = secure_filename(f.filename)
+    # KMZ is a zip archive wrapping a KML document — unwrap it here so every
+    # downstream code path can keep treating files in KML_DIR as plain KML XML.
+    if ext == "kmz":
+        try:
+            data = _extract_kml_from_kmz(data)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        ext = "kml"
+        fname = str(Path(fname).with_suffix(".kml"))
     # Validate content before saving
     if filetype == "kml":
         err = _validate_track_content(data, ext)
         if err:
             return jsonify({"error": err}), 400
-    fname = secure_filename(f.filename)
     (KML_DIR if filetype == "kml" else CSV_DIR).joinpath(fname).write_bytes(data)
     return jsonify({"filename": fname})
 
