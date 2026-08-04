@@ -710,12 +710,17 @@ function renderFmEditorTable() {
         sel.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.value; });
         td.appendChild(sel);
       } else if (col === 'role') {
+        // A blank/missing role displays as "WIDE1 fill-in" (the fallback used
+        // everywhere else in the UI, see _rxRole()) — persist that default into
+        // the row immediately so an untouched dropdown doesn't save back an
+        // empty role that chain-mode analysis can't recognize as WIDE1.
+        if (!row[col]) row[col] = 'wide1';
         const sel = document.createElement('select');
         sel.className = 'editor-select';
         [['wide1', 'WIDE1 fill-in'], ['wide2', 'WIDE2 backbone'], ['igate', 'iGate'], ['meshtastic', 'Meshtastic Router']].forEach(([v, label]) => {
           const opt = document.createElement('option');
           opt.value = v; opt.textContent = label;
-          if ((row[col] || 'wide1') === v) opt.selected = true;
+          if (row[col] === v) opt.selected = true;
           sel.appendChild(opt);
         });
         sel.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.value; });
@@ -2045,7 +2050,11 @@ async function loadSavedAnalysis() {
     state.csvFile            = data.csv_file || null;
     state.kmlCoords          = data.kml_coords || [];
     state.lastFreqMhz        = p.freq_mhz || 915;
-    state.receivers          = (data.receivers || []).map(r => ({ enabled: '1', ...r }));
+    state.receivers          = (data.receivers || []).map(r => {
+      const rx = { enabled: '1', ...r };
+      rx.role  = (rx.role || 'wide1').toLowerCase();   // legacy saves may have a blank role
+      return rx;
+    });
     state.pathResults        = data.path_results   || [];
     state.interRxResults     = data.inter_rx_results || [];
     state.lastAnalysisStats    = data.stats || [];
@@ -2752,6 +2761,7 @@ document.getElementById('add-rx-confirm').addEventListener('click', async () => 
     height_agl_m:     document.getElementById('add-rx-height').value || '5',
     antenna_gain_dbi: document.getElementById('add-rx-gain').value   || '0',
     tx_power_dbm:     document.getElementById('add-rx-power').value  || '22',
+    role:             document.getElementById('add-rx-role').value   || 'wide1',
     enabled:          document.getElementById('add-rx-enabled').checked ? '1' : '0',
   };
 

@@ -915,6 +915,17 @@ def _dominant_obstacle(
 ObstacleInfo = dict  # {"d_m", "eff_m", "v", "loss_db", "level"}
 
 
+#   Deygout's method is well documented to overestimate total loss for
+#   multi-edge paths — most notably when a secondary obstacle's individual
+#   loss is comparable to the dominant obstacle's (Millington et al. 1962
+#   first characterised this "close, similar-height hills" over-count; it's
+#   why later formulations such as Causebrook's add a correction term).
+#   We don't reproduce that correction formula exactly, but we do discount
+#   the secondary-edge contributions modestly to bring 2-level-Deygout
+#   totals closer to measured field results instead of the raw over-count.
+DEYGOUT_SECONDARY_RELIEF = 0.85
+
+
 def deygout_detail(
     profile: list[ProfileEntry],
     from_total: float,
@@ -966,7 +977,7 @@ def deygout_detail(
     if len(left) >= 2:
         v2, idx2 = _dominant_obstacle(left, from_total, eff1, d1_main, freq_mhz)
         if v2 > -0.7 and idx2 >= 0:
-            loss2 = knife_edge_loss_db(v2)
+            loss2 = knife_edge_loss_db(v2) * DEYGOUT_SECONDARY_RELIEF
             total_loss += loss2
             # Use original-profile eff_m so it aligns with the drawn terrain
             oi = left_orig[idx2]
@@ -992,7 +1003,7 @@ def deygout_detail(
     if len(right) >= 2:
         v2, idx2 = _dominant_obstacle(right, eff1, to_total, d2_main, freq_mhz)
         if v2 > -0.7 and idx2 >= 0:
-            loss2 = knife_edge_loss_db(v2)
+            loss2 = knife_edge_loss_db(v2) * DEYGOUT_SECONDARY_RELIEF
             total_loss += loss2
             oi = right_orig[idx2]
             _, d_orig, _, eff_orig = profile[oi]
@@ -1055,13 +1066,26 @@ VEG_PROFILES: dict[str, dict] = {
 }
 
 # Hard-fail threshold: if either diffraction OR vegetation loss exceeds this,
-# the path is considered unworkable regardless of the computed RSSI.
-HARD_FAIL_DB = 30.0
+# the path is considered unworkable regardless of the computed RSSI. Field
+# reports show some paths the model hard-fails still close a real link —
+# spread-spectrum/FEC-coded radios (LoRa, packet with retries) tolerate more
+# obstruction than a naive "no more energy gets through" cutoff assumes.
+# Raised from the original 30 dB for a bit more headroom.
+HARD_FAIL_DB = 35.0
 
 # Roles that satisfy the WIDE1 relay requirement in APRS chain mode.
 # A WIDE1 is viable when it has a good RF link to any receiver with one of these roles.
 # Meshtastic is intentionally excluded — it is a separate protocol, not part of the APRS chain.
 W1_RELAY_ROLES: frozenset[str] = frozenset(("wide2", "igate"))
+
+
+def _rx_role(rx: dict) -> str:
+    """Receiver role, defaulting missing/blank to 'wide1' — mirrors the frontend's
+    static/js/main.js:_rxRole(). A receiver added via the "+ Add Receiver" modal or
+    an untouched CSV-editor row has no role key at all; the UI displays it as WIDE1
+    everywhere, so chain-mode logic must treat it the same way rather than silently
+    excluding it."""
+    return (rx.get("role") or "wide1").strip().lower()
 
 # ---------------------------------------------------------------------------
 # Infrastructure Location Advisor — OSM + greedy site selection
@@ -2418,8 +2442,8 @@ def _run_link_analysis(receivers, freq_mhz, sensitivity_dbm, fade_margin_db,
             if _res.get("hard_fail"):
                 continue
             _i, _j = _res["rx1_idx"], _res["rx2_idx"]
-            _r1 = (receivers[_i].get("role") or "").strip().lower()
-            _r2 = (receivers[_j].get("role") or "").strip().lower()
+            _r1 = _rx_role(receivers[_i])
+            _r2 = _rx_role(receivers[_j])
 
             # Case A: WIDE1 is rx1 (lower index) — link was evaluated WIDE1→terminal ✓
             if _r1 == "wide1" and _r2 in W1_RELAY_ROLES and _res.get("good_link"):
@@ -2440,7 +2464,7 @@ def _run_link_analysis(receivers, freq_mhz, sensitivity_dbm, fade_margin_db,
 
         viable_w1_idxs = frozenset(_w1)
         if not any(
-            (rx.get("role") or "").strip().lower() in W1_RELAY_ROLES
+            _rx_role(rx) in W1_RELAY_ROLES
             for rx in receivers
             if str(rx.get("enabled", "1")).strip() != "0"
         ):
@@ -2513,7 +2537,7 @@ def _point_task(args: tuple) -> dict:
         for rr in rx_results:
             if rr["hard_fail"]: continue
             if rr["rssi"] < (sensitivity_dbm + fade_margin_db): continue
-            rx_role = (receivers[rr["rx_idx"]].get("role") or "").strip().lower()
+            rx_role = _rx_role(receivers[rr["rx_idx"]])
             viable  = (rr["rx_idx"] in viable_w1_idxs) or rx_role in W1_RELAY_ROLES
             if viable and rr["rssi"] > chain_best_rssi:
                 chain_best_rssi = rr["rssi"]
@@ -3586,7 +3610,7 @@ def suggest_locations():
             if tier_hint in ("wide1", "wide2") and existing_receivers:
                 backbone_rxs = [
                     r for r in existing_receivers
-                    if str(r.get("role", "wide1")).lower() in ("wide2", "igate")
+                    if _rx_role(r) in W1_RELAY_ROLES
                 ]
                 if backbone_rxs:
                     backbone_pts = tuple(
@@ -3660,7 +3684,7 @@ def suggest_locations():
                     # Use the CSV value; fall back to WIDE_APRS_RX_GAIN_DBI for
                     # WIDE1/WIDE2/iGate when the CSV entry was left at zero.
                     raw = float(r.get("antenna_gain_dbi") or 0)
-                    if raw == 0.0 and str(r.get("role", "")).lower() in ("wide1", "wide2", "igate"):
+                    if raw == 0.0 and _rx_role(r) in ("wide1", "wide2", "igate"):
                         return WIDE_APRS_RX_GAIN_DBI
                     return raw
 
