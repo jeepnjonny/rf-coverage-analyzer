@@ -77,7 +77,12 @@ NGINX_SITE=""
 # normal "no vhost yet -- create one" case handled below. Under `set -e
 # -o pipefail` an unguarded grep failure here would abort the whole script
 # silently (stderr is redirected to /dev/null) before that fallback ever runs.
-MATCH=$(grep -rl "server_name[[:space:]].*${TARGET_HOST}" /etc/nginx/sites-enabled/ 2>/dev/null | head -1) || true
+# -R (not -r) is required, not just style: /etc/nginx/sites-enabled/ is
+# populated with symlinks into sites-available/. Plain `-r` does not follow
+# symlinks encountered during traversal, so it would silently see zero
+# vhosts, always fall through to the "create a new site" branch below, and
+# duplicate the server block on every run.
+MATCH=$(grep -Rl "server_name[[:space:]].*${TARGET_HOST}" /etc/nginx/sites-enabled/ 2>/dev/null | head -1) || true
 if [ -n "$MATCH" ]; then
     NGINX_SITE="$(realpath "$MATCH")"
 fi
