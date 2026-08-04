@@ -915,6 +915,17 @@ def _dominant_obstacle(
 ObstacleInfo = dict  # {"d_m", "eff_m", "v", "loss_db", "level"}
 
 
+#   Deygout's method is well documented to overestimate total loss for
+#   multi-edge paths — most notably when a secondary obstacle's individual
+#   loss is comparable to the dominant obstacle's (Millington et al. 1962
+#   first characterised this "close, similar-height hills" over-count; it's
+#   why later formulations such as Causebrook's add a correction term).
+#   We don't reproduce that correction formula exactly, but we do discount
+#   the secondary-edge contributions modestly to bring 2-level-Deygout
+#   totals closer to measured field results instead of the raw over-count.
+DEYGOUT_SECONDARY_RELIEF = 0.85
+
+
 def deygout_detail(
     profile: list[ProfileEntry],
     from_total: float,
@@ -966,7 +977,7 @@ def deygout_detail(
     if len(left) >= 2:
         v2, idx2 = _dominant_obstacle(left, from_total, eff1, d1_main, freq_mhz)
         if v2 > -0.7 and idx2 >= 0:
-            loss2 = knife_edge_loss_db(v2)
+            loss2 = knife_edge_loss_db(v2) * DEYGOUT_SECONDARY_RELIEF
             total_loss += loss2
             # Use original-profile eff_m so it aligns with the drawn terrain
             oi = left_orig[idx2]
@@ -992,7 +1003,7 @@ def deygout_detail(
     if len(right) >= 2:
         v2, idx2 = _dominant_obstacle(right, eff1, to_total, d2_main, freq_mhz)
         if v2 > -0.7 and idx2 >= 0:
-            loss2 = knife_edge_loss_db(v2)
+            loss2 = knife_edge_loss_db(v2) * DEYGOUT_SECONDARY_RELIEF
             total_loss += loss2
             oi = right_orig[idx2]
             _, d_orig, _, eff_orig = profile[oi]
@@ -1055,8 +1066,12 @@ VEG_PROFILES: dict[str, dict] = {
 }
 
 # Hard-fail threshold: if either diffraction OR vegetation loss exceeds this,
-# the path is considered unworkable regardless of the computed RSSI.
-HARD_FAIL_DB = 30.0
+# the path is considered unworkable regardless of the computed RSSI. Field
+# reports show some paths the model hard-fails still close a real link —
+# spread-spectrum/FEC-coded radios (LoRa, packet with retries) tolerate more
+# obstruction than a naive "no more energy gets through" cutoff assumes.
+# Raised from the original 30 dB for a bit more headroom.
+HARD_FAIL_DB = 35.0
 
 # Roles that satisfy the WIDE1 relay requirement in APRS chain mode.
 # A WIDE1 is viable when it has a good RF link to any receiver with one of these roles.
