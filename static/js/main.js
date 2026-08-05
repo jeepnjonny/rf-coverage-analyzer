@@ -1569,6 +1569,8 @@ function startAnalysis(mode, opts = {}) {
     veg_type:        document.getElementById('veg-loss').value,
     fade_margin_db:  parseFloat(document.getElementById('fade-margin').value) || 0,
     mode,
+    chain_mode:      document.getElementById('chain-mode-toggle').checked,
+    single_rx:       mode === 'track' ? (document.getElementById('single-rx-select').value || null) : null,
   };
 
   checkReady();
@@ -1878,6 +1880,8 @@ async function saveAnalysis() {
     if (data.error) throw new Error(data.error);
     document.getElementById('save-analysis-row').classList.add('hidden');
     setStatus(`Analysis saved as "${name}".`);
+    fm.selAnalysis = data.id;
+    _syncUrlForAnalysis(data.id);
     // Refresh analyses list in case file manager is open
     fm.analyses = await fetch('/api/analyses').then(r => r.json());
     renderFmSavedList();
@@ -1885,6 +1889,43 @@ async function saveAnalysis() {
     setStatus(`Save failed: ${err.message}`);
   } finally {
     hideTransferSpinner();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shareable links — a saved analysis's id round-trips through ?analysis=<id>
+// ---------------------------------------------------------------------------
+
+/** Absolute URL that reloads a given saved analysis (path only, no stray query params). */
+function _analysisShareUrl(aid) {
+  const url = new URL(window.location.origin + window.location.pathname);
+  url.searchParams.set('analysis', aid);
+  return url.toString();
+}
+
+/** Reflect the loaded/saved analysis in the address bar without a page reload. */
+function _syncUrlForAnalysis(aid) {
+  history.replaceState(null, '', _analysisShareUrl(aid));
+}
+
+/** Clipboard write with a fallback for non-secure (plain http) deployments,
+ *  where navigator.clipboard is unavailable. */
+async function _copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity  = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    if (!document.execCommand('copy')) throw new Error('Copy command was denied');
+  } finally {
+    document.body.removeChild(ta);
   }
 }
 
@@ -2011,22 +2052,32 @@ function renderFmSavedList() {
     div.addEventListener('click', () => {
       fm.selAnalysis = a.id;
       renderFmSavedList();
-      _setSavedBtns(true);
     });
     el.appendChild(div);
   });
+
+  // Also covers selections made outside a click (e.g. fm.selAnalysis pre-set
+  // from a ?analysis=<id> shared link before the modal was ever opened).
+  _setSavedBtns(fm.analyses.some(a => a.id === fm.selAnalysis));
 }
 
 function _setSavedBtns(enabled) {
-  document.getElementById('fm-saved-load-btn').disabled   = !enabled;
-  document.getElementById('fm-saved-delete-btn').disabled = !enabled;
+  document.getElementById('fm-saved-load-btn').disabled     = !enabled;
+  document.getElementById('fm-saved-delete-btn').disabled   = !enabled;
+  document.getElementById('fm-saved-copylink-btn').disabled = !enabled;
 }
 
 async function loadSavedAnalysis() {
   if (!fm.selAnalysis) return;
+  if (await loadAnalysisById(fm.selAnalysis)) closeFmModal();
+}
+
+/** Fetch a saved analysis by id and restore it into the map/form/state.
+ *  Shared by the "Load into Map" button and the ?analysis=<id> URL bootstrap. */
+async function loadAnalysisById(aid) {
   showTransferSpinner('Loading analysis…');
   try {
-    const res  = await fetch(`/api/analyses/${encodeURIComponent(fm.selAnalysis)}`);
+    const res  = await fetch(`/api/analyses/${encodeURIComponent(aid)}`);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
 
@@ -2044,6 +2095,7 @@ async function loadSavedAnalysis() {
     }
     if (p.veg_type        != null) document.getElementById('veg-loss').value     = p.veg_type;
     if (p.fade_margin_db  != null) document.getElementById('fade-margin').value  = p.fade_margin_db;
+    if (p.chain_mode      != null) document.getElementById('chain-mode-toggle').checked = !!p.chain_mode;
 
     // ── Restore app state ───────────────────────────────────
     state.kmlFile            = data.kml_file || null;
@@ -2104,10 +2156,17 @@ async function loadSavedAnalysis() {
 
     updateSidebarBtns();
     checkReady();
-    closeFmModal();
+    // single-rx-select's options are rebuilt by checkReady() -> updateSingleRxSelect(),
+    // so the focused receiver can only be restored after that call.
+    if (p.single_rx) document.getElementById('single-rx-select').value = p.single_rx;
+
+    fm.selAnalysis = aid;
+    _syncUrlForAnalysis(aid);
     setStatus(`Loaded "${data.name || 'analysis'}".`);
+    return true;
   } catch (err) {
     alert(`Load failed: ${err.message}`);
+    return false;
   } finally {
     hideTransferSpinner();
   }
@@ -2913,6 +2972,15 @@ document.getElementById('saved-mgr-btn').addEventListener('click',      () => op
 document.getElementById('fm-saved-load-btn').addEventListener('click',  loadSavedAnalysis);
 document.getElementById('fm-saved-delete-btn').addEventListener('click', deleteSavedAnalysis);
 document.getElementById('fm-close-saved').addEventListener('click',     closeFmModal);
+document.getElementById('fm-saved-copylink-btn').addEventListener('click', async () => {
+  if (!fm.selAnalysis) return;
+  try {
+    await _copyToClipboard(_analysisShareUrl(fm.selAnalysis));
+    setStatus('Link copied to clipboard.');
+  } catch (err) {
+    setStatus(`Copy failed: ${err.message}`);
+  }
+});
 
 // Save-analysis row (shown after a successful analysis)
 document.getElementById('save-analysis-btn').addEventListener('click',  saveAnalysis);
@@ -2922,6 +2990,15 @@ document.getElementById('save-analysis-btn').addEventListener('click',  saveAnal
 // ---------------------------------------------------------------------------
 
 refreshFmFileLists();
+
+// A ?analysis=<id> query param (a shared link) loads that saved analysis
+// automatically instead of requiring the user to open "Saved Analyses" and
+// pick it manually.
+const _sharedAnalysisId = new URLSearchParams(window.location.search).get('analysis');
+if (_sharedAnalysisId) {
+  fm.selAnalysis = _sharedAnalysisId;
+  loadAnalysisById(_sharedAnalysisId);
+}
 
 // ---------------------------------------------------------------------------
 // Infrastructure Location Advisor
