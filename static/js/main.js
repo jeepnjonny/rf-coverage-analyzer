@@ -16,6 +16,21 @@ function rxColor(idx) {
   return `hsl(${h.toFixed(1)},75%,50%)`;
 }
 
+// Same hue formula as rxColor(), converted to hex -- the print-map PNG is
+// rendered server-side by Pillow, which doesn't take CSS hsl() strings.
+function _hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const toHex = x => Math.round(255 * x).toString(16).padStart(2, '0');
+  return `#${toHex(f(0))}${toHex(f(8))}${toHex(f(4))}`;
+}
+function rxColorHex(idx) {
+  const total = Math.max(state.receivers?.length ?? 1, 1);
+  return _hslToHex(45 + (idx % total) * (270 / total), 75, 50);
+}
+
 const CSV_COLS    = ['name','longitude','latitude','height_agl_m','antenna_gain_dbi','tx_power_dbm','enabled','role'];
 
 const ROLE_LABEL  = { wide1: 'WIDE1 fill-in', wide2: 'WIDE2 backbone', igate: 'iGate', meshtastic: 'Meshtastic Router' };
@@ -31,6 +46,15 @@ function _snapPower(dbm) {
 const COORD_DP    = 6;   // decimal places — matches server _rc()
 
 function rc(v) { return parseFloat(v.toFixed(COORD_DP)); }
+
+// Escape user-supplied strings (receiver names, KML placemark/track names,
+// saved-analysis names) before interpolating into innerHTML/bindTooltip —
+// those values round-trip through uploaded files or free-text inputs and
+// are never HTML-safe by construction.
+const _ESC_HTML_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, ch => _ESC_HTML_MAP[ch]);
+}
 
 // ---------------------------------------------------------------------------
 // Map
@@ -179,12 +203,21 @@ let _elevTimer       = null;
 let _signalHideTimer = null;
 const _elevMemo = {};   // simple memo: "lat,lon" -> elevation_m
 
+// Browsers fire mousemove far more often than paint (especially with a high
+// polling-rate mouse), and onCursorMove does real work (nearest-point scans +
+// several DOM writes) — rAF-gate it so at most one update runs per frame.
+let _cursorMoveRaf     = null;
+let _pendingCursorLatLng = null;
 map.on('mousemove', e => {
-  const lat = rc(e.latlng.lat);
-  const lon = rc(e.latlng.lng);
-  onCursorMove(lat, lon);
+  _pendingCursorLatLng = e.latlng;
+  if (_cursorMoveRaf !== null) return;
+  _cursorMoveRaf = requestAnimationFrame(() => {
+    _cursorMoveRaf = null;
+    onCursorMove(rc(_pendingCursorLatLng.lat), rc(_pendingCursorLatLng.lng));
+  });
 });
 map.on('mouseout', () => {
+  if (_cursorMoveRaf !== null) { cancelAnimationFrame(_cursorMoveRaf); _cursorMoveRaf = null; }
   document.getElementById('info-gps').textContent         = '—';
   document.getElementById('info-elev').textContent        = '—';
   document.getElementById('info-signal').textContent      = '—';
@@ -290,7 +323,7 @@ function _updateSignalPanel(nr) {
   for (const rr of nr.rx_results) {
     const rxIdx = rr.rx_idx ?? -1;
     const rx    = rxIdx >= 0 ? state.receivers[rxIdx] : null;
-    const name  = rx?.name || (rxIdx >= 0 ? `RX${rxIdx + 1}` : 'RX?');
+    const name  = escapeHtml(rx?.name || (rxIdx >= 0 ? `RX${rxIdx + 1}` : 'RX?'));
     const color = rxIdx >= 0 ? rxColor(rxIdx) : '#888';
 
     const sensitivity = parseFloat(document.getElementById('rx-sens').value) || -135;
@@ -320,24 +353,61 @@ function _updateSignalPanel(nr) {
   });
 }
 
+// Spatial hash grid for nearest-point lookups, keyed off array identity/length
+// so it's only rebuilt when the underlying array actually changes (both
+// pathResults and heatMapResults are always either reassigned to [] or grown
+// via push(), never mutated in place — see call sites of each). Cell size
+// (0.01°) is comfortably larger than either caller's search cutoff, so a
+// plain 3×3-neighborhood scan around the query cell is guaranteed to find
+// the true nearest point without falling back to a full linear scan.
+const _GRID_CELL_DEG = 0.01;
+function _gridCellKey(lat, lon) {
+  return `${Math.floor(lat / _GRID_CELL_DEG)},${Math.floor(lon / _GRID_CELL_DEG)}`;
+}
+function _buildSpatialGrid(points) {
+  const grid = new Map();
+  for (const p of points) {
+    const key = _gridCellKey(p.lat, p.lon);
+    let cell = grid.get(key);
+    if (!cell) { cell = []; grid.set(key, cell); }
+    cell.push(p);
+  }
+  return grid;
+}
+function _nearestViaGrid(points, cache, lat, lon) {
+  if (cache.ref !== points || cache.len !== points.length) {
+    cache.ref  = points;
+    cache.len  = points.length;
+    cache.grid = _buildSpatialGrid(points);
+  }
+  const cx = Math.floor(lat / _GRID_CELL_DEG);
+  const cy = Math.floor(lon / _GRID_CELL_DEG);
+  let best = null, bestD = Infinity;
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const cell = cache.grid.get(`${cx + dx},${cy + dy}`);
+      if (!cell) continue;
+      for (const p of cell) {
+        const d = (p.lat - lat) ** 2 + (p.lon - lon) ** 2;
+        if (d < bestD) { bestD = d; best = p; }
+      }
+    }
+  }
+  return { best, bestD };
+}
+
+const _pathResultGridCache = { ref: null, len: -1, grid: null };
 function findNearestResult(lat, lon) {
   if (!state.pathResults.length) return null;
-  let best = null, bestD = Infinity;
-  for (const r of state.pathResults) {
-    const d = (r.lat - lat) ** 2 + (r.lon - lon) ** 2;
-    if (d < bestD) { bestD = d; best = r; }
-  }
+  const { best, bestD } = _nearestViaGrid(state.pathResults, _pathResultGridCache, lat, lon);
   // Only show if cursor is within ~500 m (≈ 0.005°)
   return bestD < 2.5e-5 ? best : null;
 }
 
+const _heatCellGridCache = { ref: null, len: -1, grid: null };
 function findNearestHeatCell(lat, lon) {
   if (!state.heatMapResults.length) return null;
-  let best = null, bestD = Infinity;
-  for (const c of state.heatMapResults) {
-    const d = (c.lat - lat) ** 2 + (c.lon - lon) ** 2;
-    if (d < bestD) { bestD = d; best = c; }
-  }
+  const { best, bestD } = _nearestViaGrid(state.heatMapResults, _heatCellGridCache, lat, lon);
   // Cutoff scales with the grid spacing (roughly one cell's footprint) rather
   // than a fixed distance -- heat map spacing ranges from 25 m to 400 m across
   // resolution tiers, unlike the ~fixed spacing of interpolated track points.
@@ -473,7 +543,7 @@ async function showKmlDetail(name) {
     } else if (info.linestrings.length === 1) {
       const ls = info.linestrings[0];
       html += '<div class="fm-kml-info">';
-      html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Name</span><span>${ls.name}</span></div>`;
+      html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Name</span><span>${escapeHtml(ls.name)}</span></div>`;
       html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Points</span><span>${ls.point_count.toLocaleString()}</span></div>`;
       if (!track.error) {
         html += `<div class="fm-kml-info-row"><span class="fm-kml-info-label">Bounds SW</span><span>${track.bounds[0][0].toFixed(5)}, ${track.bounds[0][1].toFixed(5)}</span></div>`;
@@ -483,9 +553,10 @@ async function showKmlDetail(name) {
     } else {
       // Multiple LineStrings — radio group
       info.linestrings.forEach((ls, i) => {
+        const lsName = escapeHtml(ls.name);
         html += `<label class="fm-track-radio">
-          <input type="radio" name="fm-track-sel" value="${ls.name}" ${i === 0 ? 'checked' : ''}/>
-          <span>${ls.name}</span>
+          <input type="radio" name="fm-track-sel" value="${lsName}" ${i === 0 ? 'checked' : ''}/>
+          <span>${lsName}</span>
           <span class="fm-dim">&nbsp;(${ls.point_count.toLocaleString()} pts)</span>
         </label>`;
       });
@@ -504,7 +575,7 @@ async function showKmlDetail(name) {
         html += `<label class="fm-pm-row">
           <input type="checkbox" class="fm-pm-cb" data-idx="${i}" ${precheck ? 'checked' : ''}/>
           <span class="fm-pm-icon">${icon}</span>
-          <span class="fm-pm-name">${pm.name || '(unnamed)'}</span>
+          <span class="fm-pm-name">${escapeHtml(pm.name || '(unnamed)')}</span>
           <span class="fm-pm-coords">${pm.lat.toFixed(4)}, ${pm.lon.toFixed(4)}</span>
         </label>`;
       });
@@ -512,7 +583,7 @@ async function showKmlDetail(name) {
 
       const defName = name.replace(/\.(kml|gpx)$/i, '') + '-receivers.csv';
       html += `<div class="fm-save-rx-row">
-        <input id="fm-rx-csv-name" class="ctrl-input" type="text" value="${defName}" />
+        <input id="fm-rx-csv-name" class="ctrl-input" type="text" value="${escapeHtml(defName)}" />
         <button class="btn btn-primary btn-sm" id="fm-save-rx-btn">Save as CSV</button>
       </div>`;
     }
@@ -639,12 +710,17 @@ function renderFmEditorTable() {
         sel.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.value; });
         td.appendChild(sel);
       } else if (col === 'role') {
+        // A blank/missing role displays as "WIDE1 fill-in" (the fallback used
+        // everywhere else in the UI, see _rxRole()) — persist that default into
+        // the row immediately so an untouched dropdown doesn't save back an
+        // empty role that chain-mode analysis can't recognize as WIDE1.
+        if (!row[col]) row[col] = 'wide1';
         const sel = document.createElement('select');
         sel.className = 'editor-select';
         [['wide1', 'WIDE1 fill-in'], ['wide2', 'WIDE2 backbone'], ['igate', 'iGate'], ['meshtastic', 'Meshtastic Router']].forEach(([v, label]) => {
           const opt = document.createElement('option');
           opt.value = v; opt.textContent = label;
-          if ((row[col] || 'wide1') === v) opt.selected = true;
+          if (row[col] === v) opt.selected = true;
           sel.appendChild(opt);
         });
         sel.addEventListener('change', e => { fm.editorRows[ri][col] = e.target.value; });
@@ -871,7 +947,7 @@ function _rxEnabled(rx) { return (rx.enabled ?? '1') !== '0'; }
 function _rxRole(rx) { return (rx.role || 'wide1').toLowerCase(); }
 
 function _rxTooltip(rx, i) {
-  const name      = rx.name || `RX${i + 1}`;
+  const name      = escapeHtml(rx.name || `RX${i + 1}`);
   const enabled   = _rxEnabled(rx);
   const roleLabel = ROLE_LABEL[_rxRole(rx)] || _rxRole(rx).toUpperCase();
   const badge     = enabled ? '' : '<br><span style="color:#e05252;font-size:10px">⊘ disabled — excluded from analysis</span>';
@@ -1143,7 +1219,7 @@ function _powerLabel(dbm) {
 function _buildRosterGroups() {
   const rxs      = state.receivers || [];
   const enabled  = rxs.filter(_rxEnabled);
-  const excluded = rxs.filter(r => !_rxEnabled(r)).map(r => r.name);
+  const excluded = rxs.filter(r => !_rxEnabled(r)).map(r => escapeHtml(r.name));
 
   const byRole = {};
   enabled.forEach(r => {
@@ -1163,7 +1239,7 @@ function _buildRosterGroups() {
       .slice()
       .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
       .map(r => ({
-        name:   r.name || '(unnamed)',
+        name:   escapeHtml(r.name || '(unnamed)'),
         gps:    `${parseFloat(r.latitude).toFixed(5)}, ${parseFloat(r.longitude).toFixed(5)}`,
         height: `${r.height_agl_m ?? '?'} m`,
         gain:   `${r.antenna_gain_dbi ?? '?'} dBi`,
@@ -1253,70 +1329,114 @@ function buildPrintReport() {
       <h1>Deployment Summary</h1>
       <div class="print-report-meta">Generated ${new Date().toLocaleString()}</div>
     </div>
-    <div class="print-report-body">${sections}${excludedNote}</div>`;
+    <div class="print-map-frame">
+      <img id="print-map-img" class="print-map-image hidden" alt="Map view" />
+      <div id="print-map-fallback" class="print-map-fallback hidden"></div>
+    </div>
+    <div class="print-report-body">${sections}${summary}${excludedNote}</div>`;
 }
 
-function printDeploymentSummary() {
-  buildPrintReport();
-  window.print();
+const PRINT_MAP_W = 1600, PRINT_MAP_H = 960;
+
+// Three earlier attempts tried to resize/reframe the LIVE interactive map at
+// print time (beforeprint handlers, then a ResizeObserver) -- both passed
+// testing here but had no effect on real printed/PDF output, and a
+// client-side canvas screenshot would hit the same wall since the tile
+// layers aren't loaded in CORS mode (canvas.toBlob() would throw on a
+// tainted canvas). Instead: render a plain PNG server-side and embed it as
+// a normal <img> before window.print() -- this never touches the live map,
+// so there's no print-event-timing dependency to get wrong.
+//
+// L.latLngBounds(...) and map.project(...) are pure calculations -- neither
+// requires the map to be resized, rendered, or even visible -- so this can
+// run in a normal click handler. (map.getBoundsZoom() was tried first, but
+// its padding argument subtracts from the map's CURRENT on-screen container
+// size rather than accepting an arbitrary target size -- not what's needed
+// here, since the whole point is to be independent of the live viewport.
+// map.project(latlng, zoom) instead does a pure CRS coordinate transform.)
+function _boundsZoomForSize(bounds, width, height, maxZoom) {
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  for (let z = maxZoom; z >= 0; z--) {
+    const p1 = map.project(sw, z), p2 = map.project(ne, z);
+    if (Math.abs(p2.x - p1.x) <= width && Math.abs(p2.y - p1.y) <= height) return z;
+  }
+  return 0;
 }
 
-let _preprintView = null;
-let _printLayoutActive = false;
-
-// Same "fit everything relevant into view" pattern used after an analysis
-// run (see the allPts/fitBounds block above) -- the print page has a fixed,
-// very different aspect ratio than the live viewport, so reproducing the
-// on-screen pan/zoom isn't the goal; showing the whole loaded track and
-// every receiver, uncropped, is.
-function _fitMapToContent() {
+// Same "fit everything into view" content (track + receivers) as the app
+// already uses elsewhere.
+function _buildPrintMapPayload() {
   const allPts = [
     ...(state.kmlCoords || []),
     ...(state.receivers || []).map(rx => [parseFloat(rx.latitude), parseFloat(rx.longitude)]),
   ].filter(([lat, lon]) => isFinite(lat) && isFinite(lon));
-  if (allPts.length) map.fitBounds(L.latLngBounds(allPts).pad(0.1), { animate: false });
+  if (!allPts.length) return null;
+
+  const bounds = L.latLngBounds(allPts).pad(0.1);
+  const zoom   = _boundsZoomForSize(bounds, PRINT_MAP_W, PRINT_MAP_H, 19);
+  const center = bounds.getCenter();
+
+  return {
+    basemap: document.getElementById('basemap-select').value,
+    center: [center.lat, center.lng],
+    zoom, width: PRINT_MAP_W, height: PRINT_MAP_H,
+    track: (state.kmlCoords || []).filter(([lat, lon]) => isFinite(lat) && isFinite(lon)),
+    markers: (state.receivers || [])
+      .map((rx, i) => ({
+        lat: parseFloat(rx.latitude), lon: parseFloat(rx.longitude),
+        color: rxColorHex(i),
+        shape: { wide2: 'diamond', igate: 'square', meshtastic: 'triangle' }[_rxRole(rx)] || 'circle',
+        enabled: _rxEnabled(rx),
+      }))
+      .filter(m => isFinite(m.lat) && isFinite(m.lon)),
+  };
 }
 
-function _enterPrintLayout() {
-  // Only capture the view to restore later once -- but keep re-fitting on
-  // every call. ResizeObserver can fire more than once while the browser's
-  // print layout is still settling into its final size, and a one-shot fit
-  // risks locking onto an intermediate, not-yet-final container size.
-  if (!_printLayoutActive) {
-    _printLayoutActive = true;
-    _preprintView = { center: map.getCenter(), zoom: map.getZoom() };
+let _printMapObjectUrl = null;
+
+async function _renderPrintMapImage() {
+  const img = document.getElementById('print-map-img');
+  const fallback = document.getElementById('print-map-fallback');
+  if (!img || !fallback) return;
+
+  const payload = _buildPrintMapPayload();
+  if (!payload) {
+    img.classList.add('hidden');
+    fallback.textContent = 'No track or receivers loaded -- nothing to show on map.';
+    fallback.classList.remove('hidden');
+    return;
   }
-  map.invalidateSize({ animate: false, pan: false });
-  _fitMapToContent();
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 15000);
+  try {
+    const resp = await fetch('/api/print-map-image', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    if (_printMapObjectUrl) URL.revokeObjectURL(_printMapObjectUrl);
+    _printMapObjectUrl = URL.createObjectURL(blob);
+    img.src = _printMapObjectUrl;
+    img.classList.remove('hidden');
+    fallback.classList.add('hidden');
+  } catch (err) {
+    console.error('Print map image failed:', err);
+    img.classList.add('hidden');
+    fallback.textContent = 'Map image unavailable (network error) -- roster data below is still accurate.';
+    fallback.classList.remove('hidden');
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function _exitPrintLayout() {
-  if (!_printLayoutActive) return;
-  _printLayoutActive = false;
-  map.invalidateSize({ animate: false, pan: false });
-  if (_preprintView) {
-    map.setView(_preprintView.center, _preprintView.zoom, { animate: false });
-    _preprintView = null;
-  }
+async function printDeploymentSummary() {
+  buildPrintReport();
+  await _renderPrintMapImage();
+  window.print();
 }
-
-window.addEventListener('beforeprint', buildPrintReport);
-
-// The real resize/refit is driven by ResizeObserver rather than the
-// beforeprint/afterprint events: JS run inside those handlers is not
-// reliably reflected in the actual print/PDF output across browsers --
-// some browsers capture the print snapshot on their own schedule,
-// independent of when a beforeprint handler finishes running. ResizeObserver
-// instead reacts to the browser's own layout engine actually changing
-// #map's rendered box (which @media print's CSS does), so it fires at a
-// moment guaranteed to reflect the real print-time size.
-new ResizeObserver(() => {
-  if (window.matchMedia('print').matches) {
-    _enterPrintLayout();
-  } else {
-    _exitPrintLayout();
-  }
-}).observe(document.getElementById('map'));
 
 function updateSingleRxSelect() {
   const sel = document.getElementById('single-rx-select');
@@ -1376,8 +1496,15 @@ document.getElementById('analyze-links-btn').addEventListener('click', () => {
 });
 
 
+// Bumped by every startAnalysis() call; segment-layer flushes deferred to a
+// requestAnimationFrame (see flushSeg below) check this so a straggling
+// flush from an aborted/superseded run can never draw onto a layer that a
+// newer run has already cleared and started repopulating.
+let _analysisRunId = 0;
+
 function startAnalysis(mode, opts = {}) {
   if (state.analysisRunning) return;
+  const runId = ++_analysisRunId;
 
   // Clear only the layer(s) this mode will repopulate.
   // skipClear=true lets a caller pre-clear selectively (e.g. receiver drag).
@@ -1427,6 +1554,8 @@ function startAnalysis(mode, opts = {}) {
     veg_type:        document.getElementById('veg-loss').value,
     fade_margin_db:  parseFloat(document.getElementById('fade-margin').value) || 0,
     mode,
+    chain_mode:      document.getElementById('chain-mode-toggle').checked,
+    single_rx:       mode === 'track' ? (document.getElementById('single-rx-select').value || null) : null,
   };
 
   checkReady();
@@ -1457,6 +1586,26 @@ function startAnalysis(mode, opts = {}) {
   // Segment drawing state
   let segColor = null;
   let segPts   = [];
+
+  // SSE 'points_batch' events can carry many points, each of which may end a
+  // segment; adding each finished polyline to the map synchronously as it's
+  // built can cause layout thrashing when a batch has several color changes.
+  // Collect finished polylines and add them to resultLayer at most once per
+  // animation frame instead. Guarded by runId so a flush left over from an
+  // aborted/superseded run never lands on a layer a newer run already owns.
+  let _pendingSegLayers = [];
+  let _flushLayersRaf   = null;
+  const _schedulePendingLayerFlush = () => {
+    if (_flushLayersRaf !== null) return;
+    _flushLayersRaf = requestAnimationFrame(() => {
+      _flushLayersRaf = null;
+      const pending = _pendingSegLayers;
+      _pendingSegLayers = [];
+      if (runId !== _analysisRunId) return;
+      pending.forEach(poly => poly.addTo(resultLayer));
+    });
+  };
+
   const flushSeg = nextPt => {
     if (segPts.length > 1) {
       const poly = L.polyline(segPts, { color: segColor, weight: 5, opacity: 0.85 });
@@ -1464,7 +1613,8 @@ function startAnalysis(mode, opts = {}) {
         const nr = findNearestResult(rc(e.latlng.lat), rc(e.latlng.lng));
         if (nr && nr.best_rx_idx >= 0) showPathPointProfile(nr);
       });
-      poly.addTo(resultLayer);
+      _pendingSegLayers.push(poly);
+      _schedulePendingLayerFlush();
     }
     segPts = nextPt ? [nextPt] : [];
   };
@@ -1610,9 +1760,10 @@ function handleSSE(evt, ctx) {
       if (isBackbone) opts.dashArray = '9 5';
 
       const roleDesc = r => (ROLE_LABEL[r] || r.toUpperCase());
+      const rx1Name = escapeHtml(rx1.name), rx2Name = escapeHtml(rx2.name);
       const linkLabel = isBackbone
-        ? `Backbone: ${rx1.name} (${roleDesc(r1)}) ↔ ${rx2.name} (${roleDesc(r2)})`
-        : `${rx1.name} ↔ ${rx2.name}`;
+        ? `Backbone: ${rx1Name} (${roleDesc(r1)}) ↔ ${rx2Name} (${roleDesc(r2)})`
+        : `${rx1Name} ↔ ${rx2Name}`;
 
       const pl = L.polyline(
         [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
@@ -1714,6 +1865,8 @@ async function saveAnalysis() {
     if (data.error) throw new Error(data.error);
     document.getElementById('save-analysis-row').classList.add('hidden');
     setStatus(`Analysis saved as "${name}".`);
+    fm.selAnalysis = data.id;
+    _syncUrlForAnalysis(data.id);
     // Refresh analyses list in case file manager is open
     fm.analyses = await fetch('/api/analyses').then(r => r.json());
     renderFmSavedList();
@@ -1721,6 +1874,43 @@ async function saveAnalysis() {
     setStatus(`Save failed: ${err.message}`);
   } finally {
     hideTransferSpinner();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shareable links — a saved analysis's id round-trips through ?analysis=<id>
+// ---------------------------------------------------------------------------
+
+/** Absolute URL that reloads a given saved analysis (path only, no stray query params). */
+function _analysisShareUrl(aid) {
+  const url = new URL(window.location.origin + window.location.pathname);
+  url.searchParams.set('analysis', aid);
+  return url.toString();
+}
+
+/** Reflect the loaded/saved analysis in the address bar without a page reload. */
+function _syncUrlForAnalysis(aid) {
+  history.replaceState(null, '', _analysisShareUrl(aid));
+}
+
+/** Clipboard write with a fallback for non-secure (plain http) deployments,
+ *  where navigator.clipboard is unavailable. */
+async function _copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity  = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    if (!document.execCommand('copy')) throw new Error('Copy command was denied');
+  } finally {
+    document.body.removeChild(ta);
   }
 }
 
@@ -1788,9 +1978,10 @@ function _drawInterRxResults(results, receivers) {
                      rx1_idx: evt.rx1_idx, rx2_idx: evt.rx2_idx };
     if (isBackbone) opts.dashArray = '9 5';
     const roleDesc = r => (ROLE_LABEL[r] || r.toUpperCase());
+    const rx1Name = escapeHtml(rx1.name), rx2Name = escapeHtml(rx2.name);
     const linkLabel = isBackbone
-      ? `Backbone: ${rx1.name} (${roleDesc(r1)}) ↔ ${rx2.name} (${roleDesc(r2)})`
-      : `${rx1.name} ↔ ${rx2.name}`;
+      ? `Backbone: ${rx1Name} (${roleDesc(r1)}) ↔ ${rx2Name} (${roleDesc(r2)})`
+      : `${rx1Name} ↔ ${rx2Name}`;
     const pl = L.polyline(
       [[parseFloat(rx1.latitude), parseFloat(rx1.longitude)],
        [parseFloat(rx2.latitude), parseFloat(rx2.longitude)]],
@@ -1836,32 +2027,42 @@ function renderFmSavedList() {
       : '';
 
     div.innerHTML = `
-      <div class="fm-saved-item-name">${a.name || 'Unnamed'}</div>
+      <div class="fm-saved-item-name">${escapeHtml(a.name || 'Unnamed')}</div>
       <div class="fm-saved-item-meta">
         <span>${date}</span>
         ${modeBadge}${covBadge}
-        ${a.kml_file ? `<span class="fm-saved-item-badge">📍 ${a.kml_file}</span>` : ''}
-        ${a.csv_file ? `<span class="fm-saved-item-badge">📋 ${a.csv_file}</span>` : ''}
+        ${a.kml_file ? `<span class="fm-saved-item-badge">📍 ${escapeHtml(a.kml_file)}</span>` : ''}
+        ${a.csv_file ? `<span class="fm-saved-item-badge">📋 ${escapeHtml(a.csv_file)}</span>` : ''}
       </div>`;
     div.addEventListener('click', () => {
       fm.selAnalysis = a.id;
       renderFmSavedList();
-      _setSavedBtns(true);
     });
     el.appendChild(div);
   });
+
+  // Also covers selections made outside a click (e.g. fm.selAnalysis pre-set
+  // from a ?analysis=<id> shared link before the modal was ever opened).
+  _setSavedBtns(fm.analyses.some(a => a.id === fm.selAnalysis));
 }
 
 function _setSavedBtns(enabled) {
-  document.getElementById('fm-saved-load-btn').disabled   = !enabled;
-  document.getElementById('fm-saved-delete-btn').disabled = !enabled;
+  document.getElementById('fm-saved-load-btn').disabled     = !enabled;
+  document.getElementById('fm-saved-delete-btn').disabled   = !enabled;
+  document.getElementById('fm-saved-copylink-btn').disabled = !enabled;
 }
 
 async function loadSavedAnalysis() {
   if (!fm.selAnalysis) return;
+  if (await loadAnalysisById(fm.selAnalysis)) closeFmModal();
+}
+
+/** Fetch a saved analysis by id and restore it into the map/form/state.
+ *  Shared by the "Load into Map" button and the ?analysis=<id> URL bootstrap. */
+async function loadAnalysisById(aid) {
   showTransferSpinner('Loading analysis…');
   try {
-    const res  = await fetch(`/api/analyses/${encodeURIComponent(fm.selAnalysis)}`);
+    const res  = await fetch(`/api/analyses/${encodeURIComponent(aid)}`);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
 
@@ -1879,13 +2080,18 @@ async function loadSavedAnalysis() {
     }
     if (p.veg_type        != null) document.getElementById('veg-loss').value     = p.veg_type;
     if (p.fade_margin_db  != null) document.getElementById('fade-margin').value  = p.fade_margin_db;
+    if (p.chain_mode      != null) document.getElementById('chain-mode-toggle').checked = !!p.chain_mode;
 
     // ── Restore app state ───────────────────────────────────
     state.kmlFile            = data.kml_file || null;
     state.csvFile            = data.csv_file || null;
     state.kmlCoords          = data.kml_coords || [];
     state.lastFreqMhz        = p.freq_mhz || 915;
-    state.receivers          = (data.receivers || []).map(r => ({ enabled: '1', ...r }));
+    state.receivers          = (data.receivers || []).map(r => {
+      const rx = { enabled: '1', ...r };
+      rx.role  = (rx.role || 'wide1').toLowerCase();   // legacy saves may have a blank role
+      return rx;
+    });
     state.pathResults        = data.path_results   || [];
     state.interRxResults     = data.inter_rx_results || [];
     state.lastAnalysisStats    = data.stats || [];
@@ -1935,10 +2141,17 @@ async function loadSavedAnalysis() {
 
     updateSidebarBtns();
     checkReady();
-    closeFmModal();
+    // single-rx-select's options are rebuilt by checkReady() -> updateSingleRxSelect(),
+    // so the focused receiver can only be restored after that call.
+    if (p.single_rx) document.getElementById('single-rx-select').value = p.single_rx;
+
+    fm.selAnalysis = aid;
+    _syncUrlForAnalysis(aid);
     setStatus(`Loaded "${data.name || 'analysis'}".`);
+    return true;
   } catch (err) {
     alert(`Load failed: ${err.message}`);
+    return false;
   } finally {
     hideTransferSpinner();
   }
@@ -1976,7 +2189,7 @@ function renderResults(stats, totalPct, doSwitchTab = true, trackDistM = 0) {
     const distMi  = distM !== null ? (distM * 0.000621371).toFixed(2) : null;
     const tr      = document.createElement('tr');
     tr.innerHTML = `
-      <td><span class="rx-swatch" style="background:${color}"></span>${s.name}</td>
+      <td><span class="rx-swatch" style="background:${color}"></span>${escapeHtml(s.name)}</td>
       <td>${s.coverage_pct}%</td>
       <td>${s.avg_rssi !== null ? s.avg_rssi + ' dBm' : '—'}</td>
       <td>${distM !== null ? distM.toLocaleString() : '—'}</td>
@@ -2592,6 +2805,7 @@ document.getElementById('add-rx-confirm').addEventListener('click', async () => 
     height_agl_m:     document.getElementById('add-rx-height').value || '5',
     antenna_gain_dbi: document.getElementById('add-rx-gain').value   || '0',
     tx_power_dbm:     document.getElementById('add-rx-power').value  || '22',
+    role:             document.getElementById('add-rx-role').value   || 'wide1',
     enabled:          document.getElementById('add-rx-enabled').checked ? '1' : '0',
   };
 
@@ -2743,6 +2957,15 @@ document.getElementById('saved-mgr-btn').addEventListener('click',      () => op
 document.getElementById('fm-saved-load-btn').addEventListener('click',  loadSavedAnalysis);
 document.getElementById('fm-saved-delete-btn').addEventListener('click', deleteSavedAnalysis);
 document.getElementById('fm-close-saved').addEventListener('click',     closeFmModal);
+document.getElementById('fm-saved-copylink-btn').addEventListener('click', async () => {
+  if (!fm.selAnalysis) return;
+  try {
+    await _copyToClipboard(_analysisShareUrl(fm.selAnalysis));
+    setStatus('Link copied to clipboard.');
+  } catch (err) {
+    setStatus(`Copy failed: ${err.message}`);
+  }
+});
 
 // Save-analysis row (shown after a successful analysis)
 document.getElementById('save-analysis-btn').addEventListener('click',  saveAnalysis);
@@ -2752,6 +2975,15 @@ document.getElementById('save-analysis-btn').addEventListener('click',  saveAnal
 // ---------------------------------------------------------------------------
 
 refreshFmFileLists();
+
+// A ?analysis=<id> query param (a shared link) loads that saved analysis
+// automatically instead of requiring the user to open "Saved Analyses" and
+// pick it manually.
+const _sharedAnalysisId = new URLSearchParams(window.location.search).get('analysis');
+if (_sharedAnalysisId) {
+  fm.selAnalysis = _sharedAnalysisId;
+  loadAnalysisById(_sharedAnalysisId);
+}
 
 // ---------------------------------------------------------------------------
 // Infrastructure Location Advisor
@@ -3468,7 +3700,7 @@ function _showRxContextMenu(domEvent, rxIdx) {
   div.style.left = domEvent.clientX + 'px';
   div.style.top  = domEvent.clientY + 'px';
   div.innerHTML =
-    `<div class="ia-test-coords">${rx.name || `RX${rxIdx + 1}`}</div>` +
+    `<div class="ia-test-coords">${escapeHtml(rx.name || `RX${rxIdx + 1}`)}</div>` +
     `<button class="btn btn-primary" id="rx-ctx-edit">✏️ Edit parameters</button>` +
     (canFocus
       ? `<button class="btn btn-primary" id="rx-ctx-focus">📡 Focus analysis</button>`

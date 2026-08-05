@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RF Path Coverage Analyzer</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+  <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
+  <script src="/static/vendor/leaflet/leaflet.js"></script>
+  <script src="/static/vendor/leaflet/leaflet-heat.js"></script>
   <link rel="stylesheet" href="/static/css/style.css" />
 </head>
 <body>
@@ -419,6 +419,15 @@
         </select>
       </div>
       <div class="param-group">
+        <label class="param-label">Role</label>
+        <select id="add-rx-role" class="ctrl-input full-width">
+          <option value="wide1" selected>WIDE1 fill-in</option>
+          <option value="wide2">WIDE2 backbone</option>
+          <option value="igate">iGate</option>
+          <option value="meshtastic">Meshtastic Router</option>
+        </select>
+      </div>
+      <div class="param-group">
         <label class="param-label">Enabled</label>
         <div class="param-row">
           <input id="add-rx-enabled" type="checkbox" checked />
@@ -588,8 +597,9 @@
         </div>
       </div>
       <div class="fm-footer">
-        <button class="btn btn-primary"   id="fm-saved-load-btn"   disabled>▶ Load into Map</button>
-        <button class="btn btn-danger"    id="fm-saved-delete-btn" disabled>Delete</button>
+        <button class="btn btn-primary"   id="fm-saved-load-btn"     disabled>▶ Load into Map</button>
+        <button class="btn btn-secondary" id="fm-saved-copylink-btn" disabled>🔗 Copy Link</button>
+        <button class="btn btn-danger"    id="fm-saved-delete-btn"   disabled>Delete</button>
         <span class="tab-sep"></span>
         <button class="btn btn-secondary" id="fm-close-saved">Close</button>
       </div>

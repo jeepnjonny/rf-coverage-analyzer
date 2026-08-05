@@ -21,6 +21,7 @@ import csv
 import io
 import json
 import math
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -28,11 +29,15 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from urllib.parse import unquote
 from collections import OrderedDict
 import functools
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait as cf_wait
+from concurrent.futures import (
+    ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait as cf_wait,
+    TimeoutError as FuturesTimeoutError,
+)
 from pathlib import Path
 
 import numpy as np
@@ -180,6 +185,30 @@ def _pt_uncached(points: list[tuple[float, float]]) -> list[tuple[float, float]]
         cached_set.update(r[0] for r in rows)
 
     return [p for p, k in zip(rounded, keys) if k not in cached_set]
+
+
+# Row-count cap for the point-elevation fallback cache. Each row is small
+# (~40 bytes) so this is a generous ceiling; it exists so a long-lived
+# deployment covering many disjoint regions doesn't grow elev_pts forever.
+# INSERT OR REPLACE deletes+reinserts on conflict, so rowid order is a
+# reasonable recency proxy without the write-on-read cost a real LRU would add.
+ELEV_DB_MAX_ROWS = int(os.environ.get("ELEV_DB_MAX_ROWS", "3000000"))
+
+
+def _evict_elev_db_if_needed() -> None:
+    with _db_lock:
+        count = _db_conn.execute("SELECT COUNT(*) FROM elev_pts").fetchone()[0]
+        if count <= ELEV_DB_MAX_ROWS:
+            return
+        excess = count - int(ELEV_DB_MAX_ROWS * 0.9)
+        _db_conn.execute(
+            "DELETE FROM elev_pts WHERE rowid IN "
+            "(SELECT rowid FROM elev_pts ORDER BY rowid ASC LIMIT ?)",
+            (excess,),
+        )
+        _db_conn.commit()
+        app.logger.info("Elevation point cache: evicted %d oldest row(s) (%d → %d)",
+                         excess, count, count - excess)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +360,8 @@ class ElevationTileService:
                 e = self._elev_from_pixels(pixels, px, py)
                 if -500 <= e <= 9000:
                     return e
-            except Exception:
+            except Exception as exc:
+                app.logger.debug("Pixel decode failed at z%d (%.5f,%.5f): %s", zoom, lat, lon, exc)
                 continue
         return None
 
@@ -389,8 +419,84 @@ class ElevationTileService:
 
         return total
 
+    # -- Disk cache eviction --
+    #
+    # Tiles on disk are re-downloadable at any time (they're just an AWS S3
+    # mirror cache), so unlike the in-memory LRU there was previously no cap
+    # at all here — a long-lived deployment covering many regions would grow
+    # uploads/tiles/ forever. Evict oldest-by-mtime files once the on-disk
+    # total exceeds DISK_CACHE_MAX_BYTES, down to a lower watermark so this
+    # doesn't re-trigger on every single new tile.
+    DISK_CACHE_MAX_BYTES = int(os.environ.get("TILE_DISK_CACHE_MAX_MB", "4096")) * 1024 * 1024
+    DISK_CACHE_LOW_WATERMARK = 0.9  # evict down to 90% of the cap
+
+    def evict_disk_cache(self) -> None:
+        try:
+            entries = [(p, p.stat().st_size, p.stat().st_mtime)
+                       for p in self.tile_dir.glob("t*.png")]
+        except OSError as exc:
+            app.logger.warning("Tile disk cache scan failed: %s", exc)
+            return
+        before = total = sum(size for _, size, _ in entries)
+        if total <= self.DISK_CACHE_MAX_BYTES:
+            return
+        target = int(self.DISK_CACHE_MAX_BYTES * self.DISK_CACHE_LOW_WATERMARK)
+        entries.sort(key=lambda e: e[2])  # oldest-accessed first
+        evicted = 0
+        for path, size, _ in entries:
+            if total <= target:
+                break
+            try:
+                path.unlink()
+                total -= size
+                evicted += 1
+            except OSError:
+                pass  # already removed by a concurrent worker/process
+        if evicted:
+            app.logger.info(
+                "Tile disk cache: evicted %d file(s), %.0f MB → %.0f MB",
+                evicted, before / 1e6, total / 1e6,
+            )
+
 
 _tiles = ElevationTileService(TILE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Periodic cache eviction — keeps uploads/tiles/ and elevation_cache.db from
+# growing without bound over a long-lived deployment. Runs once at import
+# (covers short-lived/dev runs) and then on an interval for long-lived
+# gunicorn workers. Cheap enough (one disk scan, one SQL count) that running
+# it redundantly across a few gunicorn workers is not worth coordinating.
+# ---------------------------------------------------------------------------
+
+_CACHE_EVICTION_INTERVAL_S = int(os.environ.get("CACHE_EVICTION_INTERVAL_S", str(6 * 3600)))
+
+
+def _run_cache_eviction() -> None:
+    try:
+        _tiles.evict_disk_cache()
+    except Exception as exc:
+        app.logger.warning("Tile disk cache eviction failed: %s", exc)
+    try:
+        _evict_elev_db_if_needed()
+    except Exception as exc:
+        app.logger.warning("Elevation point cache eviction failed: %s", exc)
+
+
+def _cache_eviction_loop() -> None:
+    while True:
+        time.sleep(_CACHE_EVICTION_INTERVAL_S)
+        _run_cache_eviction()
+
+
+if multiprocessing.current_process().name == "MainProcess":
+    # Guard against re-running on the `spawn` start method (Windows / explicit
+    # config), where pool workers re-import this module from scratch. Under
+    # `fork` (the Linux/prod default) this guard is a no-op — the pool never
+    # re-executes module top-level code in the child anyway.
+    _run_cache_eviction()
+    threading.Thread(target=_cache_eviction_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +525,8 @@ def _fetch_opentopodata(chunk: list[tuple[float, float]]) -> bool:
                             kvs.append((_elev_key(la, lo), float(elev)))
                     _pt_put_many(kvs)
                     return True
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("OpenTopoData fetch failed for %d pts: %s", len(chunk), exc)
     return False
 
 
@@ -444,8 +550,8 @@ def _fetch_open_elevation(chunk: list[tuple[float, float]]) -> bool:
                         kvs.append((_elev_key(la, lo), float(elev)))
                 _pt_put_many(kvs)
                 return True
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("Open-Elevation fetch failed for %d pts: %s", len(chunk), exc)
     return False
 
 
@@ -461,8 +567,8 @@ def _fetch_usgs_single(lat_lon: tuple[float, float]) -> tuple[float, float, floa
             val = resp.json().get("value")
             if val is not None and float(val) != -1_000_000:
                 return la, lo, float(val)
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("USGS EPQS fetch failed for (%.5f,%.5f): %s", la, lo, exc)
     return la, lo, None  # failure — caller must NOT store this in the cache
 
 
@@ -809,6 +915,17 @@ def _dominant_obstacle(
 ObstacleInfo = dict  # {"d_m", "eff_m", "v", "loss_db", "level"}
 
 
+#   Deygout's method is well documented to overestimate total loss for
+#   multi-edge paths — most notably when a secondary obstacle's individual
+#   loss is comparable to the dominant obstacle's (Millington et al. 1962
+#   first characterised this "close, similar-height hills" over-count; it's
+#   why later formulations such as Causebrook's add a correction term).
+#   We don't reproduce that correction formula exactly, but we do discount
+#   the secondary-edge contributions modestly to bring 2-level-Deygout
+#   totals closer to measured field results instead of the raw over-count.
+DEYGOUT_SECONDARY_RELIEF = 0.85
+
+
 def deygout_detail(
     profile: list[ProfileEntry],
     from_total: float,
@@ -860,7 +977,7 @@ def deygout_detail(
     if len(left) >= 2:
         v2, idx2 = _dominant_obstacle(left, from_total, eff1, d1_main, freq_mhz)
         if v2 > -0.7 and idx2 >= 0:
-            loss2 = knife_edge_loss_db(v2)
+            loss2 = knife_edge_loss_db(v2) * DEYGOUT_SECONDARY_RELIEF
             total_loss += loss2
             # Use original-profile eff_m so it aligns with the drawn terrain
             oi = left_orig[idx2]
@@ -886,7 +1003,7 @@ def deygout_detail(
     if len(right) >= 2:
         v2, idx2 = _dominant_obstacle(right, eff1, to_total, d2_main, freq_mhz)
         if v2 > -0.7 and idx2 >= 0:
-            loss2 = knife_edge_loss_db(v2)
+            loss2 = knife_edge_loss_db(v2) * DEYGOUT_SECONDARY_RELIEF
             total_loss += loss2
             oi = right_orig[idx2]
             _, d_orig, _, eff_orig = profile[oi]
@@ -949,13 +1066,26 @@ VEG_PROFILES: dict[str, dict] = {
 }
 
 # Hard-fail threshold: if either diffraction OR vegetation loss exceeds this,
-# the path is considered unworkable regardless of the computed RSSI.
-HARD_FAIL_DB = 30.0
+# the path is considered unworkable regardless of the computed RSSI. Field
+# reports show some paths the model hard-fails still close a real link —
+# spread-spectrum/FEC-coded radios (LoRa, packet with retries) tolerate more
+# obstruction than a naive "no more energy gets through" cutoff assumes.
+# Raised from the original 30 dB for a bit more headroom.
+HARD_FAIL_DB = 35.0
 
 # Roles that satisfy the WIDE1 relay requirement in APRS chain mode.
 # A WIDE1 is viable when it has a good RF link to any receiver with one of these roles.
 # Meshtastic is intentionally excluded — it is a separate protocol, not part of the APRS chain.
 W1_RELAY_ROLES: frozenset[str] = frozenset(("wide2", "igate"))
+
+
+def _rx_role(rx: dict) -> str:
+    """Receiver role, defaulting missing/blank to 'wide1' — mirrors the frontend's
+    static/js/main.js:_rxRole(). A receiver added via the "+ Add Receiver" modal or
+    an untouched CSV-editor row has no role key at all; the UI displays it as WIDE1
+    everywhere, so chain-mode logic must treat it the same way rather than silently
+    excluding it."""
+    return (rx.get("role") or "wide1").strip().lower()
 
 # ---------------------------------------------------------------------------
 # Infrastructure Location Advisor — OSM + greedy site selection
@@ -1012,8 +1142,8 @@ def _shutdown_pool_safely(pool: "ProcessPoolExecutor | None") -> None:
         return
     try:
         pool.shutdown(wait=False, cancel_futures=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        app.logger.debug("Pool shutdown raised (likely already broken): %s", exc)
 
 
 def _cancel_futures(futures) -> None:
@@ -1122,7 +1252,8 @@ def _terrain_check_task(args: tuple) -> dict:
         ):
             return {"ci": ci, "ok": False, "reason": "excl"}
         return {"ci": ci, "ok": True}
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("Terrain check failed for candidate %s (%.5f,%.5f): %s", ci, clat, clon, exc)
         return {"ci": ci, "ok": True}
 
 
@@ -1135,7 +1266,8 @@ def _coarse_task(args: tuple) -> dict:
             clat, clon, c_agl, track_pts, freq_mhz,
             tx_power_dbm, tx_gain_dbi, sensitivity_dbm, fade_margin_db,
         )
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("Coarse score failed for candidate %s (%.5f,%.5f): %s", ci, clat, clon, exc)
         score = 0.0
     return {"ci": ci, "score": score}
 
@@ -1146,7 +1278,8 @@ def _los_check_task(args: tuple) -> dict:
     try:
         ok = any(terrain_los_clear(clat, clon, agl, lat, lon)
                  for lat, lon in check_pts)
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("LOS check failed for candidate %s (%.5f,%.5f): %s", ci, clat, clon, exc)
         ok = True
     return {"ci": ci, "ok": ok}
 
@@ -1249,6 +1382,12 @@ GPX_NS = [
     "",
 ]
 
+# Google's KML extension namespace — fixed (unlike KML_NS, gx: doesn't vary
+# across producers), used by <gx:Track>/<gx:MultiTrack> for timestamped
+# tracks. Common from Google Earth "Save Place As", GPS Visualizer, and
+# various GPS-to-KML converters that don't use plain <LineString>.
+GX_NS = "http://www.google.com/kml/ext/2.2"
+
 CSV_COLUMNS = ["name", "longitude", "latitude", "height_agl_m", "antenna_gain_dbi", "tx_power_dbm", "enabled", "role"]
 
 
@@ -1263,6 +1402,58 @@ def _parse_coord_text(text: str) -> list[tuple[float, float]]:
             except ValueError:
                 pass
     return result
+
+
+def _parse_gx_coord_text(text: str) -> tuple[float, float] | None:
+    """Convert one <gx:coord> text value ('lon lat alt', space-separated) to (lat, lon)."""
+    parts = (text or "").strip().split()
+    if len(parts) >= 2:
+        try:
+            return (_rc(float(parts[1])), _rc(float(parts[0])))
+        except ValueError:
+            pass
+    return None
+
+
+def _kml_geometry_points(pm, np: str) -> list[tuple[float, float]]:
+    """
+    Collect (lat, lon) points from every geometry inside a Placemark,
+    concatenated in document order:
+      • <LineString> — including multiple LineStrings wrapped in a
+        <MultiGeometry> (a split/multi-part track exported as one Placemark),
+        since Element.iter() finds them at any nesting depth.
+      • <gx:Track> / <gx:MultiTrack> — Google's timestamped-track extension.
+    """
+    pts: list[tuple[float, float]] = []
+    for ls in pm.iter(f"{np}LineString"):
+        ce = ls.find(f"{np}coordinates")
+        if ce is not None:
+            pts.extend(_parse_coord_text(ce.text or ""))
+    for trk in pm.iter(f"{{{GX_NS}}}Track"):
+        for coord_el in trk.findall(f"{{{GX_NS}}}coord"):
+            pt = _parse_gx_coord_text(coord_el.text)
+            if pt is not None:
+                pts.append(pt)
+    return pts
+
+
+def _extract_kml_from_kmz(data: bytes) -> bytes:
+    """
+    Extract the primary KML document's bytes from a KMZ (zip) archive.
+
+    Raises ValueError with a human-readable message on a bad/empty archive.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Not a valid KMZ (zip) file: {exc}") from exc
+    kml_names = [n for n in zf.namelist() if n.lower().endswith(".kml")]
+    if not kml_names:
+        raise ValueError("KMZ archive does not contain a .kml file")
+    # KML spec convention: the root document is usually named doc.kml.
+    preferred = next((n for n in kml_names if n.lower() == "doc.kml"), None)
+    name = preferred or min(kml_names, key=lambda n: n.count("/"))
+    return zf.read(name)
 
 
 def _validate_track_content(data: bytes, ext: str) -> str | None:
@@ -1292,9 +1483,12 @@ def parse_kml(content: str, track_name: str | None = None) -> list[tuple[float, 
     """
     Parse track coordinates from a KML file.
 
-    If track_name is given, returns only the named LineString's coordinates.
-    Otherwise returns the first LineString found (ignores Point placemarks so
-    aid-station coordinates no longer pollute the track).
+    If track_name is given, returns only the named track's coordinates.
+    Otherwise returns the first track found (ignores Point placemarks so
+    aid-station coordinates no longer pollute the track). A "track" here is
+    any combination of <LineString> (including multiple wrapped in a
+    <MultiGeometry> — concatenated in order) and <gx:Track>/<gx:MultiTrack>
+    within one Placemark; see _kml_geometry_points().
     Falls back to any <coordinates> element for bare KMLs with no Placemark wrapper.
     """
     try:
@@ -1309,24 +1503,14 @@ def parse_kml(content: str, track_name: str | None = None) -> list[tuple[float, 
                 name_el = pm.find(f"{np}name")
                 if name_el is None or (name_el.text or "").strip() != track_name:
                     continue
-                ls = pm.find(f".//{np}LineString")
-                if ls is None:
-                    continue
-                ce = ls.find(f"{np}coordinates")
-                if ce is not None:
-                    pts = _parse_coord_text(ce.text or "")
-                    if pts:
-                        return pts
+                pts = _kml_geometry_points(pm, np)
+                if pts:
+                    return pts
         else:
             for pm in root.iter(f"{np}Placemark"):
-                ls = pm.find(f".//{np}LineString")
-                if ls is None:
-                    continue
-                ce = ls.find(f"{np}coordinates")
-                if ce is not None:
-                    pts = _parse_coord_text(ce.text or "")
-                    if pts:
-                        return pts
+                pts = _kml_geometry_points(pm, np)
+                if pts:
+                    return pts
             # Fallback: bare <coordinates> element (legacy / simple KMLs)
             for el in root.iter(f"{np}coordinates"):
                 pts = _parse_coord_text(el.text or "")
@@ -1351,7 +1535,8 @@ def _kml_icon_type(href: str) -> str:
 def parse_kml_info(content: str) -> dict:
     """
     Return structured metadata for a KML file:
-      linestrings — [{name, point_count}] for each named LineString Placemark
+      linestrings — [{name, point_count}] for each Placemark with track geometry
+                    (LineString/MultiGeometry/gx:Track — see _kml_geometry_points())
       placemarks  — [{name, lat, lon, description, icon_type}] for each Point Placemark
     """
     try:
@@ -1374,16 +1559,13 @@ def parse_kml_info(content: str) -> dict:
             href_el = pm.find(f".//{np}href")
             icon_href = (href_el.text or "") if href_el is not None else ""
 
-            # LineString?
-            ls = pm.find(f".//{np}LineString")
-            if ls is not None:
-                ce = ls.find(f"{np}coordinates")
-                if ce is not None:
-                    pts = _parse_coord_text(ce.text or "")
-                    label = name or f"Track {len(linestrings) + 1}"
-                    if pts and label not in seen_ls:
-                        linestrings.append({"name": label, "point_count": len(pts)})
-                        seen_ls.add(label)
+            # Track geometry? (LineString, MultiGeometry of LineStrings, gx:Track)
+            geom_pts = _kml_geometry_points(pm, np)
+            if geom_pts:
+                label = name or f"Track {len(linestrings) + 1}"
+                if label not in seen_ls:
+                    linestrings.append({"name": label, "point_count": len(geom_pts)})
+                    seen_ls.add(label)
                 continue
 
             # Point?
@@ -1603,12 +1785,21 @@ def upload_file(filetype: str):
     data = f.read()
     if not data:
         return jsonify({"error": "Uploaded file is empty"}), 400
+    fname = secure_filename(f.filename)
+    # KMZ is a zip archive wrapping a KML document — unwrap it here so every
+    # downstream code path can keep treating files in KML_DIR as plain KML XML.
+    if ext == "kmz":
+        try:
+            data = _extract_kml_from_kmz(data)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        ext = "kml"
+        fname = str(Path(fname).with_suffix(".kml"))
     # Validate content before saving
     if filetype == "kml":
         err = _validate_track_content(data, ext)
         if err:
             return jsonify({"error": err}), 400
-    fname = secure_filename(f.filename)
     (KML_DIR if filetype == "kml" else CSV_DIR).joinpath(fname).write_bytes(data)
     return jsonify({"filename": fname})
 
@@ -1808,6 +1999,266 @@ def get_kml_info(filename: str):
 
 
 # ---------------------------------------------------------------------------
+# Print map image — server-rendered PNG of the current view for printing
+#
+# The interactive Leaflet map is never touched for print (three earlier
+# attempts to resize/reframe it via JS at print time all failed silently in
+# real browsers, and a client-side canvas screenshot would hit the same wall
+# since the tile layers aren't loaded in CORS mode). Instead the frontend
+# computes the desired view with a pure, synchronous calculation
+# (L.latLngBounds + map.getBoundsZoom — neither requires rendering) and POSTs
+# it here; this renders a plain PNG that gets embedded as a normal <img>
+# before window.print() is called.
+# ---------------------------------------------------------------------------
+
+PRINT_TILE_LAYERS = {
+    "usgs-topo": {
+        "url": "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
+        "max_native_zoom": 16,
+        "attribution": "USGS Topo",
+        "concurrency": 6,
+    },
+    "usgs-sat": {
+        "url": "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+        "max_native_zoom": 16,
+        "attribution": "USGS Imagery",
+        "concurrency": 6,
+    },
+    "osm": {
+        "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "max_native_zoom": 19,
+        "attribution": "© OpenStreetMap contributors",
+        "concurrency": 2,  # OSM's tile usage policy caps bulk/automated access
+    },
+}
+
+_PRINT_TILE_PX = 256
+
+
+def _mercator_pixel(lat: float, lon: float, zoom: int) -> tuple[float, float]:
+    """Fractional Web Mercator global-pixel coords (256px tiles) at a zoom level."""
+    lat = max(-85.05112878, min(85.05112878, lat))
+    n = 2 ** zoom
+    world_px = _PRINT_TILE_PX * n
+    gx = (lon + 180.0) / 360.0 * world_px
+    lr = math.radians(lat)
+    gy = (1.0 - math.log(math.tan(lr) + 1.0 / math.cos(lr)) / math.pi) / 2.0 * world_px
+    return gx, gy
+
+
+def _draw_marker(draw, cx: float, cy: float, r: float, shape: str, fill: tuple) -> None:
+    """Draw a marker shape twice (white at r+3, then the fill color at r) so
+    every shape gets a uniform white outline, matching the live map's
+    white-bordered role markers -- whichever shape the frontend resolved."""
+    white = (255, 255, 255, 255)
+    if shape == "diamond":
+        pts = lambda rad: [(cx, cy - rad), (cx + rad, cy), (cx, cy + rad), (cx - rad, cy)]
+        draw.polygon(pts(r + 3), fill=white)
+        draw.polygon(pts(r), fill=fill)
+    elif shape == "square":
+        box = lambda rad: [cx - rad, cy - rad, cx + rad, cy + rad]
+        draw.rounded_rectangle(box(r + 3), radius=3, fill=white)
+        draw.rounded_rectangle(box(r), radius=3, fill=fill)
+    elif shape == "triangle":
+        pts = lambda rad: [(cx, cy - rad), (cx + rad, cy + rad), (cx - rad, cy + rad)]
+        draw.polygon(pts(r + 3), fill=white)
+        draw.polygon(pts(r), fill=fill)
+    else:
+        box = lambda rad: [cx - rad, cy - rad, cx + rad, cy + rad]
+        draw.ellipse(box(r + 3), fill=white)
+        draw.ellipse(box(r), fill=fill)
+
+
+class PrintTileService:
+    """Fetches/caches/stitches basemap tiles for the print-map PNG endpoint.
+
+    Deliberately separate from ElevationTileService: different URL schemes
+    (y-before-x for the USGS layers), different decode target (PIL Image, not
+    raw bytes for bilinear sampling), different volume (one-shot per print
+    click, not thousands of lookups per analysis), and different rate-limit
+    obligations (OSM's tile usage policy caps bulk/automated access).
+    """
+
+    FETCH_TIMEOUT_S = 8
+    TOTAL_BUDGET_S = 20  # soft cap on wall-clock time spent waiting on tile fetches
+
+    def __init__(self, base_dir: Path, layers: dict):
+        self.base_dir = base_dir
+        self.layers = layers
+        for key in layers:
+            (base_dir / key).mkdir(parents=True, exist_ok=True)
+
+    def _fetch_tile(self, basemap: str, z: int, x: int, y: int):
+        """Return a decoded PIL Image for this tile, or None on failure."""
+        from PIL import Image
+
+        n = 2 ** z
+        if not (0 <= x < n and 0 <= y < n):
+            return None
+
+        path = self.base_dir / basemap / f"{z}_{x}_{y}.png"
+        if path.exists() and path.stat().st_size >= 100:
+            try:
+                return Image.open(str(path)).convert("RGB")
+            except Exception:
+                path.unlink(missing_ok=True)  # corrupt cache entry -- refetch below
+
+        url = self.layers[basemap]["url"].format(z=z, x=x, y=y)
+        try:
+            r = _http.get(url, timeout=self.FETCH_TIMEOUT_S)
+            if r.status_code == 200 and r.content:
+                path.write_bytes(r.content)
+                return Image.open(io.BytesIO(r.content)).convert("RGB")
+            app.logger.warning("Print tile HTTP %d for %s z%d/%d/%d", r.status_code, basemap, z, x, y)
+        except Exception as exc:
+            app.logger.warning("Print tile fetch failed %s z%d/%d/%d: %s", basemap, z, x, y, exc)
+        return None
+
+    def render(self, basemap: str, lat: float, lon: float, zoom: int,
+               width: int, height: int, track: list, markers: list) -> tuple[bytes, int]:
+        from PIL import Image, ImageDraw, ImageFont
+
+        layer = self.layers[basemap]
+        # Clamp to native tile resolution first -- avoids partial-pixel
+        # upscale bugs and matches how Leaflet itself handles over-zoom
+        # (fetch at maxNativeZoom, scale up client-side). The practical
+        # effect here is the image shows slightly more context than an
+        # "ideal" tight fit when the live map would have over-zoomed too.
+        zoom = max(0, min(zoom, layer["max_native_zoom"]))
+
+        cx, cy = _mercator_pixel(lat, lon, zoom)
+        box_left, box_top = cx - width / 2, cy - height / 2
+
+        n = 2 ** zoom
+        world_px = _PRINT_TILE_PX * n
+        box_left = max(0.0, min(box_left, world_px - width))
+        box_top = max(0.0, min(box_top, world_px - height))
+        box_right, box_bottom = box_left + width, box_top + height
+
+        tx0, tx1 = int(box_left // _PRINT_TILE_PX), int((box_right - 1) // _PRINT_TILE_PX)
+        ty0, ty1 = int(box_top // _PRINT_TILE_PX), int((box_bottom - 1) // _PRINT_TILE_PX)
+
+        stitched = Image.new(
+            "RGB",
+            ((tx1 - tx0 + 1) * _PRINT_TILE_PX, (ty1 - ty0 + 1) * _PRINT_TILE_PX),
+            (224, 224, 224),
+        )
+        tile_coords = [(tx, ty) for tx in range(tx0, tx1 + 1) for ty in range(ty0, ty1 + 1)]
+        tiles_ok = 0
+
+        ex = ThreadPoolExecutor(max_workers=layer["concurrency"])
+        try:
+            futs = {ex.submit(self._fetch_tile, basemap, zoom, tx, ty): (tx, ty) for tx, ty in tile_coords}
+            try:
+                for fut in as_completed(futs, timeout=self.TOTAL_BUDGET_S):
+                    tx, ty = futs[fut]
+                    tile_img = fut.result()
+                    if tile_img is not None:
+                        stitched.paste(tile_img, ((tx - tx0) * _PRINT_TILE_PX, (ty - ty0) * _PRINT_TILE_PX))
+                        tiles_ok += 1
+            except FuturesTimeoutError:
+                app.logger.warning(
+                    "Print tile fetch budget (%ds) exceeded for %s -- using %d/%d tiles",
+                    self.TOTAL_BUDGET_S, basemap, tiles_ok, len(tile_coords),
+                )
+        finally:
+            # Don't block the response on slow stragglers -- pending fetches
+            # are cancelled, already-running ones finish in the background
+            # and populate the disk cache for next time regardless.
+            ex.shutdown(wait=False, cancel_futures=True)
+
+        crop_left = round(box_left - tx0 * _PRINT_TILE_PX)
+        crop_top = round(box_top - ty0 * _PRINT_TILE_PX)
+        canvas = stitched.crop((crop_left, crop_top, crop_left + width, crop_top + height)).convert("RGBA")
+
+        def to_px(pt_lat: float, pt_lon: float) -> tuple[float, float]:
+            gx, gy = _mercator_pixel(pt_lat, pt_lon, zoom)
+            return gx - box_left, gy - box_top
+
+        draw = ImageDraw.Draw(canvas, "RGBA")
+
+        if len(track) >= 2:
+            pts = [to_px(pt[0], pt[1]) for pt in track]
+            draw.line(pts, fill=(136, 136, 136, 204), width=3, joint="curve")
+
+        for m in markers:
+            try:
+                px, py = to_px(float(m["lat"]), float(m["lon"]))
+            except (KeyError, ValueError, TypeError):
+                continue
+            color = m.get("color") or "#4f8ef7"
+            try:
+                rgb = tuple(int(color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                rgb = (79, 142, 247)
+            enabled = m.get("enabled", True)
+            if enabled:
+                fill = (*rgb, 255)
+            else:
+                # Roughly match the live map's opacity:0.30 + grayscale(0.7)
+                # treatment for disabled receivers -- blend toward gray, dim.
+                fill = (
+                    round(rgb[0] * 0.4 + 160 * 0.6),
+                    round(rgb[1] * 0.4 + 160 * 0.6),
+                    round(rgb[2] * 0.4 + 160 * 0.6),
+                    90,
+                )
+            _draw_marker(draw, px, py, 8, m.get("shape", "circle"), fill)
+
+        attribution = layer["attribution"]
+        try:
+            font = ImageFont.load_default()
+            text_w = draw.textlength(attribution, font=font)
+        except Exception:
+            font = None
+            text_w = len(attribution) * 6
+        pad = 4
+        draw.rectangle([0, height - 16, text_w + pad * 2, height], fill=(255, 255, 255, 200))
+        draw.text((pad, height - 15), attribution, fill=(0, 0, 0, 255), font=font)
+
+        buf = io.BytesIO()
+        canvas.convert("RGB").save(buf, format="PNG")
+        return buf.getvalue(), tiles_ok
+
+
+_print_tiles = PrintTileService(UPLOAD_DIR / "tiles_print", PRINT_TILE_LAYERS)
+
+
+@app.route("/api/print-map-image", methods=["POST"])
+def print_map_image():
+    data = request.get_json(force=True, silent=True) or {}
+
+    basemap = data.get("basemap")
+    if basemap not in PRINT_TILE_LAYERS:
+        return jsonify({"error": "Invalid basemap"}), 400
+
+    try:
+        center = data["center"]
+        lat, lon = float(center[0]), float(center[1])
+        zoom = int(data["zoom"])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return jsonify({"error": "Invalid center/zoom"}), 400
+
+    width = max(200, min(3000, int(data.get("width", 1600))))
+    height = max(200, min(3000, int(data.get("height", 960))))
+    track = data.get("track") or []
+    markers = data.get("markers") or []
+
+    try:
+        png_bytes, tiles_ok = _print_tiles.render(basemap, lat, lon, zoom, width, height, track, markers)
+    except Exception as exc:
+        app.logger.warning("print-map-image render error: %s", exc)
+        return jsonify({"error": "Map render failed"}), 502
+
+    if tiles_ok == 0:
+        return jsonify({"error": "Could not reach tile server"}), 502
+
+    resp = Response(png_bytes, mimetype="image/png")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Route – single-point elevation lookup (used by the map cursor info bar)
 # ---------------------------------------------------------------------------
 
@@ -1991,8 +2442,8 @@ def _run_link_analysis(receivers, freq_mhz, sensitivity_dbm, fade_margin_db,
             if _res.get("hard_fail"):
                 continue
             _i, _j = _res["rx1_idx"], _res["rx2_idx"]
-            _r1 = (receivers[_i].get("role") or "").strip().lower()
-            _r2 = (receivers[_j].get("role") or "").strip().lower()
+            _r1 = _rx_role(receivers[_i])
+            _r2 = _rx_role(receivers[_j])
 
             # Case A: WIDE1 is rx1 (lower index) — link was evaluated WIDE1→terminal ✓
             if _r1 == "wide1" and _r2 in W1_RELAY_ROLES and _res.get("good_link"):
@@ -2013,7 +2464,7 @@ def _run_link_analysis(receivers, freq_mhz, sensitivity_dbm, fade_margin_db,
 
         viable_w1_idxs = frozenset(_w1)
         if not any(
-            (rx.get("role") or "").strip().lower() in W1_RELAY_ROLES
+            _rx_role(rx) in W1_RELAY_ROLES
             for rx in receivers
             if str(rx.get("enabled", "1")).strip() != "0"
         ):
@@ -2086,7 +2537,7 @@ def _point_task(args: tuple) -> dict:
         for rr in rx_results:
             if rr["hard_fail"]: continue
             if rr["rssi"] < (sensitivity_dbm + fade_margin_db): continue
-            rx_role = (receivers[rr["rx_idx"]].get("role") or "").strip().lower()
+            rx_role = _rx_role(receivers[rr["rx_idx"]])
             viable  = (rr["rx_idx"] in viable_w1_idxs) or rx_role in W1_RELAY_ROLES
             if viable and rr["rssi"] > chain_best_rssi:
                 chain_best_rssi = rr["rssi"]
@@ -3159,7 +3610,7 @@ def suggest_locations():
             if tier_hint in ("wide1", "wide2") and existing_receivers:
                 backbone_rxs = [
                     r for r in existing_receivers
-                    if str(r.get("role", "wide1")).lower() in ("wide2", "igate")
+                    if _rx_role(r) in W1_RELAY_ROLES
                 ]
                 if backbone_rxs:
                     backbone_pts = tuple(
@@ -3233,7 +3684,7 @@ def suggest_locations():
                     # Use the CSV value; fall back to WIDE_APRS_RX_GAIN_DBI for
                     # WIDE1/WIDE2/iGate when the CSV entry was left at zero.
                     raw = float(r.get("antenna_gain_dbi") or 0)
-                    if raw == 0.0 and str(r.get("role", "")).lower() in ("wide1", "wide2", "igate"):
+                    if raw == 0.0 and _rx_role(r) in ("wide1", "wide2", "igate"):
                         return WIDE_APRS_RX_GAIN_DBI
                     return raw
 
